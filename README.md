@@ -80,6 +80,12 @@ Pick a single upstream commit:
 isb pick a8aebe93a4938c0ca1941eeaae821738f869be3d
 ```
 
+Reset to an earlier backport commit and resume from there:
+
+```sh
+isb reset abc123def456
+```
+
 Override a session value for one run:
 
 ```sh

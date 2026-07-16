@@ -89,6 +89,17 @@ Cherry-pick a single upstream commit (by its full 40-character hash)
 onto the current HEAD with conflict resolution and a RH Kernel Work
 Flow specified commit message.
 Skips the normal multi-commit workflow phases.
+.TP
+.BI "reset " HASH
+Hard-reset the backport branch to an earlier commit and update saved
+state so the next run resumes from the commit after
+.IR HASH .
+The commit must be in the range between the session base commit and
+HEAD.
+Also available interactively via the
+.B r
+key in the confirmation menu, which presents a numbered list of
+applied commits.
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to
@@ -260,6 +271,10 @@ will refuse and list what is missing.
 Press
 .B q
 to abort.
+Press
+.B r
+to reset the branch to an earlier backport commit; a numbered
+list of applied commits is shown for selection.
 .PP
 When editing a field, type a new value and press Enter.
 Press Enter on an empty line to keep the current value,
@@ -285,7 +300,7 @@ as defaults in the interactive menu.
 .B \-\-divergence
 are per-invocation and never saved to the session.
 The
-.BR continue ", " pick ", and " status
+.BR continue ", " pick ", " reset ", and " status
 commands are also per-invocation.
 .SH EXAMPLES
 First run (prompts for session parameters):

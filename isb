@@ -274,6 +274,7 @@ def parse_args():
               isb status                   show progress and exit
               isb continue                 resume from saved state
               isb pick <HASH>              cherry-pick one upstream commit
+              isb reset <HASH>             reset to an earlier commit
 
             examples:
               cd ~/kernels/centos-9
@@ -339,13 +340,16 @@ def parse_args():
     p.add_argument("--status", action="store_true",
                     help=argparse.SUPPRESS)
 
-    # Subcommands: continue, status, pick
+    # Subcommands: continue, status, pick, reset
     sub = p.add_subparsers(dest="command")
     sub.add_parser("continue", help="Resume from saved state")
     sub.add_parser("status", help="Show backport progress and exit")
     pick_p = sub.add_parser("pick",
                             help="Cherry-pick a single upstream commit")
     pick_p.add_argument("hash", help="Full 40-char upstream commit hash")
+    reset_p = sub.add_parser("reset",
+                             help="Reset backport to an earlier commit")
+    reset_p.add_argument("hash", help="Commit hash to reset to")
 
     return p.parse_args()
 
@@ -942,9 +946,10 @@ def show_confirmation_menu(params):
         print(f"  {CAU}*{OFF} changing invalidates cached results")
         print(f"  {MNU}s{OFF}  Edit scope paths   "
               f"{MNU}N{OFF}  New session (edit all)")
-        print(f"  {MNU}g{OFF}  Go / proceed       "
-              f"{MNU}q{OFF}  Quit        "
+        print(f"  {MNU}r{OFF}  Reset to commit    "
               f"{MNU}h{OFF}  Help")
+        print(f"  {MNU}g{OFF}  Go / proceed       "
+              f"{MNU}q{OFF}  Quit")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -967,6 +972,18 @@ def show_confirmation_menu(params):
 
         elif ch in ('h', 'H'):
             _show_manpage()
+            continue
+
+        elif ch in ('r', 'R'):
+            cached = _session.get("_cached")
+            base_commit = _session.get("_base_commit")
+            if not cached or not base_commit:
+                warn("  No backport in progress -- nothing to reset.")
+                continue
+            keep_list = cached.get("keep", [])
+            out_dir = params.get("output_dir", "")
+            interactive_reset(_session_repo, out_dir,
+                              base_commit, keep_list)
             continue
 
         elif ch == 'N':
@@ -2735,6 +2752,84 @@ def show_status(rhel_repo):
     print(f"{MNU}{SEP}{OFF}\n")
 
 
+def do_reset(rhel_repo, target_hash, output_dir, base_commit, keep):
+    """Hard-reset the branch to target_hash and update saved state.
+
+    The target must be in the range base_commit..HEAD.  After reset,
+    the cherry-pick loop state is updated so the next run resumes from
+    the commit after target_hash.
+    """
+    r = git(f"rev-parse {target_hash}", cwd=rhel_repo, check=False)
+    if r.returncode != 0:
+        die(f"Commit {target_hash} not found in this repo.")
+    full_hash = r.stdout.strip()
+
+    log_r = git(f"log --format=%H --reverse {base_commit}..HEAD",
+                cwd=rhel_repo, check=False)
+    applied_hashes = [h for h in log_r.stdout.strip().split("\n") if h]
+
+    if full_hash not in applied_hashes:
+        die(f"{target_hash} is not in the range {base_commit[:12]}..HEAD.")
+
+    target_pos = applied_hashes.index(full_hash)
+    new_next_idx = target_pos + 1
+
+    subject = git(f"log --format=%s -1 {full_hash}",
+                  cwd=rhel_repo, check=False).stdout.strip()
+
+    git(f"reset --hard {full_hash}", cwd=rhel_repo)
+    save_state(output_dir, {
+        "next_idx": new_next_idx,
+        "base_commit": base_commit,
+    })
+    _session.pop("_completed_head", None)
+    _save()
+
+    total = len(keep) if keep else "?"
+    status(f"Reset to {full_hash[:12]} {subject}")
+    info(f"  Next run will resume from commit [{new_next_idx + 1}/{total}].")
+
+
+def interactive_reset(rhel_repo, output_dir, base_commit, keep):
+    """Present a numbered list of applied commits and let the user pick one."""
+    log_r = git(f"log --format=%h\\ %s {base_commit}..HEAD",
+                cwd=rhel_repo, check=False)
+    lines = [ln for ln in log_r.stdout.strip().split("\n") if ln]
+    if not lines:
+        warn("  No commits applied yet -- nothing to reset.")
+        return
+
+    print(f"\n{MNU}    Applied commits (newest first){OFF}")
+    print(f"    {'─' * 50}")
+    for i, ln in enumerate(lines, 1):
+        print(f"    {MNU}{i:3d}{OFF}  {INF}{ln}{OFF}")
+    print(f"    {'─' * 50}")
+    print(f"  Enter number to reset to (or {MNU}q{OFF} to cancel): ",
+          end="", flush=True)
+
+    raw = input().strip()
+    if raw.lower() in ('q', ''):
+        return
+
+    try:
+        idx = int(raw)
+    except ValueError:
+        warn(f"  Invalid input: '{raw}'")
+        return
+    if idx < 1 or idx > len(lines):
+        warn(f"  Number out of range (1-{len(lines)}).")
+        return
+
+    short_hash = lines[idx - 1].split()[0]
+    full_r = git(f"rev-parse {short_hash}", cwd=rhel_repo, check=False)
+    if full_r.returncode != 0:
+        warn(f"  Could not resolve {short_hash}.")
+        return
+
+    do_reset(rhel_repo, full_r.stdout.strip(), output_dir,
+             base_commit, keep)
+
+
 # ---------------------------------------------------------------------------
 # Phase 5: output generation
 # ---------------------------------------------------------------------------
@@ -2819,6 +2914,25 @@ def main():
 
     if args.command == "status":
         show_status(rhel_repo)
+        return
+
+    if args.command == "reset":
+        cached = _session.get("_cached")
+        base_commit = _session.get("_base_commit")
+        if not cached or not base_commit:
+            die("No backport in progress (no cached state). "
+                "Run isb first.")
+        keep = cached.get("keep", [])
+        output_dir = _session.get("output_dir")
+        if not output_dir:
+            sub = _session.get("subsystem", "unknown")
+            rhel_ver = _session.get("rhel", "0")
+            output_dir = os.path.join(
+                os.path.dirname(rhel_repo), "backports",
+                str(rhel_ver),
+                os.path.basename(sub.rstrip("/")),
+            )
+        do_reset(rhel_repo, args.hash, output_dir, base_commit, keep)
         return
 
     # -- Branch drift check --
