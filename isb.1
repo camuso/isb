@@ -1,16 +1,16 @@
-.\" Man page for backport-subsystem
-.TH BACKPORT-SUBSYSTEM 1 "June 2026" "backport-subsystem" "User Commands"
+.\" Man page for isb
+.TH ISB 1 "June 2026" "isb" "User Commands"
 .SH NAME
-backport-subsystem \- automated RHEL kernel subsystem backport
+isb \- Intelligent Subsystem Backport for RHEL kernels
 .SH SYNOPSIS
-.B backport-subsystem
+.B isb
 .RI [ OPTIONS ]
 .PP
 Must be run from inside a RHEL kernel git repository.
 Session parameters are prompted interactively on first run and
 reused automatically on subsequent runs.
 .SH DESCRIPTION
-.B backport-subsystem
+.B isb
 cherry-picks upstream Linux kernel commits for a given subsystem into a
 RHEL or CentOS Stream kernel tree.
 It discovers relevant scope paths (source directories, headers,
@@ -229,7 +229,7 @@ Requires
 .B \-\-subsystem
 for scope-path context.
 .SH SESSIONS
-.B backport-subsystem
+.B isb
 automatically manages a session file at
 .I .backport/session.json
 in the current repository.
@@ -285,7 +285,7 @@ First run (prompts for session parameters):
 .RS
 .nf
 cd ~/kernels/centos\-9
-backport-subsystem \-\-dry\-run
+isb \-\-dry\-run
 .fi
 .RE
 .PP
@@ -293,8 +293,8 @@ Subsequent runs reuse the session automatically:
 .PP
 .RS
 .nf
-backport-subsystem
-backport-subsystem \-\-dry\-run
+isb
+isb \-\-dry\-run
 .fi
 .RE
 .PP
@@ -302,7 +302,7 @@ Pick a single upstream commit (session provides the rest):
 .PP
 .RS
 .nf
-backport-subsystem \-\-pick a8aebe93a4938c0ca1941eeaae821738f869be3d
+isb \-\-pick a8aebe93a4938c0ca1941eeaae821738f869be3d
 .fi
 .RE
 .PP
@@ -310,7 +310,7 @@ Interactive conflict resolution with patchpal:
 .PP
 .RS
 .nf
-backport-subsystem \-\-conflict\-policy patchpal
+isb \-\-conflict\-policy patchpal
 .fi
 .RE
 .PP
@@ -318,7 +318,7 @@ Override a session value for one run:
 .PP
 .RS
 .nf
-backport-subsystem \-\-upstream\-version v7.2
+isb \-\-upstream\-version v7.2
 .fi
 .RE
 .SH EXIT STATUS

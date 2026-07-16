@@ -1,8 +1,8 @@
-# backport-subsystem
+# isb — Intelligent Subsystem Backport
 
 Automated RHEL kernel subsystem backport tool.
 
-`backport-subsystem` cherry-picks upstream Linux kernel commits for a given
+`isb` cherry-picks upstream Linux kernel commits for a given
 subsystem into a RHEL or CentOS Stream kernel tree. It discovers relevant
 scope paths (source directories, headers, documentation, device-tree
 bindings), finds the divergence point between upstream and RHEL, filters
@@ -49,13 +49,13 @@ RHEL-compliant commit messages suitable for merge requests.
 Copy or symlink the script to a directory on your `$PATH`:
 
 ```sh
-ln -s "$PWD/backport-subsystem" ~/bin/backport-subsystem
+ln -s "$PWD/isb" ~/bin/isb
 ```
 
 Install the man page:
 
 ```sh
-sudo cp backport-subsystem.1 /usr/local/share/man/man1/
+sudo cp isb.1 /usr/local/share/man/man1/
 ```
 
 ## Usage
@@ -65,29 +65,28 @@ interactive menu prompts for session parameters:
 
 ```sh
 cd ~/kernels/centos-10
-backport-subsystem --dry-run
+isb --dry-run
 ```
 
 Subsequent runs reuse the saved session:
 
 ```sh
-backport-subsystem
+isb
 ```
 
 Pick a single upstream commit:
 
 ```sh
-backport-subsystem --pick a8aebe93a4938c0ca1941eeaae821738f869be3d
+isb --pick a8aebe93a4938c0ca1941eeaae821738f869be3d
 ```
 
 Override a session value for one run:
 
 ```sh
-backport-subsystem --upstream-version v7.2
+isb --upstream-version v7.2
 ```
 
-See `man backport-subsystem` or `backport-subsystem -h` for the full
-list of options.
+See `man isb` or `isb -h` for the full list of options.
 
 ## License
 
