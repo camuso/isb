@@ -327,12 +327,15 @@ def parse_args():
                     help="Assisted-by trailer (e.g. 'Claude <no-reply@anthropic.com>')")
     p.add_argument("--pick", default=None, metavar="HASH",
                     help="Cherry-pick a single upstream commit onto current "
-                         "HEAD with conflict resolution and gort-style message")
+                         "HEAD with conflict resolution and RH Kernel Work Flow "
+                         "specified commit message")
     p.add_argument("--divergence", default=None,
                     help="Upstream commit hash to use as divergence point "
                          "(skips auto-detection)")
     p.add_argument("--toolbox", default=None,
                     help="Toolbox container name (default: rhel<RHEL>)")
+    p.add_argument("--status", action="store_true",
+                    help="Show backport progress and exit")
     p.add_argument("-h", "--help", action=_ManPageAction,
                     help="Show the man page (or short help if piped)")
     return p.parse_args()
@@ -848,6 +851,9 @@ def _params_to_session(params):
             _session[field] = params[field]
     if "scope_paths" in params:
         _session["only_paths"] = params["scope_paths"]
+    for extra in ("branch", "output_dir"):
+        if extra in params:
+            _session[extra] = params[extra]
 
 
 def show_confirmation_menu(params):
@@ -881,6 +887,41 @@ def show_confirmation_menu(params):
         for j, sp in enumerate(scope_paths):
             print(f"    {chr(ord('a') + j)}. {INF}{sp}{OFF}")
         print(f"    {'─' * 50}")
+
+        cached = _session.get("_cached")
+        if cached and cached.get("keep"):
+            keep_list = cached["keep"]
+            omit_list = cached.get("omit", [])
+            total = len(keep_list)
+            out_dir = params.get("output_dir", "")
+            state = load_state(out_dir) if out_dir else None
+            next_idx = state.get("next_idx", 0) if state else 0
+            completed_head = _session.get("_completed_head")
+            cur_head = git("rev-parse HEAD",
+                           cwd=_session_repo, check=False).stdout.strip()
+            is_done = completed_head and cur_head == completed_head
+            applied = total if is_done else next_idx
+            skipped = sum(1 for _, _, r in omit_list
+                          if "skipped" in r.lower())
+            head_line = git("log --format=%h\\ %s -1",
+                            cwd=_session_repo, check=False).stdout.strip()
+
+            print(f"\n{MNU}    {'Progress'}{OFF}")
+            print(f"    {'─' * 50}")
+            print(f"    HEAD:  {INF}{head_line}{OFF}")
+            if is_done:
+                extra = f", {skipped} skipped" if skipped else ""
+                print(f"    State: {STA}COMPLETE "
+                      f"({applied}/{total} applied{extra}){OFF}")
+            else:
+                extra = f" ({skipped} skipped)" if skipped else ""
+                print(f"    State: {INF}{applied}/{total} applied"
+                      f"{extra}{OFF}")
+                if next_idx < len(keep_list):
+                    nh, nsubj = keep_list[next_idx][0], keep_list[next_idx][1]
+                    print(f"    Next:  {INF}[{next_idx + 1}/{total}] "
+                          f"{nh[:12]} {nsubj}{OFF}")
+            print(f"    {'─' * 50}")
 
         print(f"  {CAU}*{OFF} changing invalidates cached results")
         print(f"  {MNU}s{OFF}  Edit scope paths   "
@@ -2592,6 +2633,87 @@ def load_state(output_dir):
             return json.load(fh)
     return None
 
+
+def show_status(rhel_repo):
+    """Display backport progress from saved session and state, then exit."""
+    session = load_session(rhel_repo)
+    if not session:
+        die("No session found. Run backport-subsystem first.")
+
+    subsystem = session.get("subsystem", "?")
+    rhel_ver = session.get("rhel", "?")
+    upstream_ver = session.get("upstream_version", "?")
+    branch = session.get("_last_branch", "?")
+
+    output_dir = session.get("output_dir") or os.path.join(
+        os.path.dirname(os.path.abspath(rhel_repo)), "backports",
+        str(rhel_ver),
+        os.path.basename(subsystem.rstrip("/")),
+    )
+
+    current_head = git("rev-parse HEAD",
+                       cwd=rhel_repo, check=False).stdout.strip()
+    head_line = git("log --format=%h\\ %s -1",
+                    cwd=rhel_repo, check=False).stdout.strip()
+
+    completed_head = session.get("_completed_head")
+    is_complete = completed_head and current_head == completed_head
+
+    cached = session.get("_cached")
+    keep = cached.get("keep", []) if cached else []
+    omit = cached.get("omit", []) if cached else []
+    total = len(keep)
+
+    state = load_state(output_dir)
+    next_idx = state.get("next_idx", 0) if state else 0
+    applied = next_idx if not is_complete else total
+
+    skipped = sum(1 for _, _, reason in omit
+                  if "skipped" in reason.lower()) if omit else 0
+
+    print(f"\n{MNU}{SEP}{OFF}")
+    print(f"  {BLD}Backport Status{OFF}")
+    print(f"{MNU}{SUB}{OFF}")
+    print(f"  {'Subsystem:':<20s} {INF}{subsystem}{OFF}")
+    print(f"  {'RHEL version:':<20s} {INF}{rhel_ver}{OFF}")
+    print(f"  {'Upstream version:':<20s} {INF}{upstream_ver}{OFF}")
+    print(f"  {'Branch:':<20s} {INF}{branch}{OFF}")
+    print()
+    print(f"  {'Current HEAD:':<20s} {INF}{head_line}{OFF}")
+
+    if total > 0:
+        if is_complete:
+            print(f"  {'Progress:':<20s} {STA}COMPLETE "
+                  f"({applied} of {total} applied")
+            if skipped:
+                print(f", {skipped} skipped", end="")
+            print(f"){OFF}")
+        else:
+            print(f"  {'Progress:':<20s} {INF}{applied} of {total} "
+                  f"applied")
+            if skipped:
+                print(f" ({skipped} skipped)", end="")
+            print(f"{OFF}")
+
+            if next_idx < len(keep):
+                nh, nsubj = keep[next_idx][0], keep[next_idx][1]
+                print(f"  {'Next commit:':<20s} "
+                      f"{INF}[{next_idx + 1}/{total}] "
+                      f"{nh[:12]} {nsubj}{OFF}")
+    else:
+        print(f"  {'Progress:':<20s} {WRN}No cached commit list "
+              f"(run backport-subsystem first){OFF}")
+
+    patches_dir = os.path.join(output_dir, "patches")
+    if os.path.isdir(patches_dir):
+        patch_files = sorted(glob(os.path.join(patches_dir, "*.patch")))
+        if patch_files:
+            print(f"  {'Patches:':<20s} {INF}{patches_dir} "
+                  f"({len(patch_files)} files){OFF}")
+
+    print(f"{MNU}{SEP}{OFF}\n")
+
+
 # ---------------------------------------------------------------------------
 # Phase 5: output generation
 # ---------------------------------------------------------------------------
@@ -2663,6 +2785,46 @@ def main():
     global _session, _session_repo
     _session = load_session(rhel_repo)
     _session_repo = rhel_repo
+
+    if args.status:
+        show_status(rhel_repo)
+        return
+
+    # -- Branch drift check --
+    # Compare against the target working branch, not the metadata branch.
+    target_branch = _session.get("branch")
+    if not target_branch and _session.get("subsystem"):
+        target_branch = os.path.basename(
+            _session["subsystem"].rstrip("/"))
+    if target_branch:
+        current_branch = git("rev-parse --abbrev-ref HEAD",
+                             cwd=rhel_repo, check=False).stdout.strip()
+        if current_branch != target_branch:
+            warn(f"Current branch is '{current_branch}', but session "
+                 f"working branch is '{target_branch}'.")
+            print(f"  {MNU}s{OFF}  Switch to '{target_branch}'   "
+                  f"{MNU}c{OFF}  Continue on '{current_branch}'   "
+                  f"{MNU}q{OFF}  Quit")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            while True:
+                ch = _getch()
+                if ch in ('s', 'S'):
+                    print("switch")
+                    rc, _, _ = run_quiet(
+                        f"git rev-parse --verify refs/heads/{target_branch}",
+                        cwd=rhel_repo,
+                    )
+                    if rc != 0:
+                        die(f"Branch '{target_branch}' no longer exists.")
+                    git(f"checkout {target_branch}", cwd=rhel_repo)
+                    status(f"  Switched to '{target_branch}'.")
+                    break
+                elif ch in ('c', 'C'):
+                    print("continue")
+                    break
+                elif ch in ('q', 'Q', '\x03'):
+                    print("quit")
+                    sys.exit(0)
 
     if has_session_cli_args(args):
         _session = merge_cli_into_session(args, _session)

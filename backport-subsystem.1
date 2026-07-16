@@ -180,6 +180,15 @@ Useful for reviewing what would be applied before committing to a run.
 .B \-\-continue
 Resume from previously saved state in the output directory.
 .TP
+.B \-\-status
+Show backport progress (current HEAD, commits applied, next commit
+in queue) and exit.
+Does not require session parameters such as
+.B \-\-subsystem
+or
+.BR \-\-rhel ;
+reads them from the saved session file.
+.TP
 .B \-\-yes
 Skip the interactive confirmation menu and proceed immediately.
 .TP
