@@ -625,7 +625,8 @@ def _print_menu(session):
     print(f"    {'─' * 50}")
     print(f"  {CAU}*{OFF} changing invalidates cached results")
     print(f"  {MNU}g{OFF}  Go          "
-          f"{MNU}q{OFF}  Quit")
+          f"{MNU}q{OFF}  Quit        "
+          f"{MNU}h{OFF}  Help")
 
 
 def prompt_session():
@@ -655,6 +656,11 @@ def prompt_session():
             _save()
             print()
             die("Aborted by user.")
+
+        if ch in ('h', 'H'):
+            print()
+            _show_manpage()
+            continue
 
         if ch in _key_map:
             field, label, required = _key_map[ch]
@@ -927,7 +933,8 @@ def show_confirmation_menu(params):
         print(f"  {MNU}s{OFF}  Edit scope paths   "
               f"{MNU}N{OFF}  New session (edit all)")
         print(f"  {MNU}g{OFF}  Go / proceed       "
-              f"{MNU}q{OFF}  Quit")
+              f"{MNU}q{OFF}  Quit        "
+              f"{MNU}h{OFF}  Help")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -947,6 +954,10 @@ def show_confirmation_menu(params):
             _save()
             print()
             sys.exit(0)
+
+        elif ch in ('h', 'H'):
+            _show_manpage()
+            continue
 
         elif ch == 'N':
             print(f"\n{MNU}    New Session -- Enter to keep current value{OFF}\n")
