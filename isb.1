@@ -100,6 +100,8 @@ Also available interactively via the
 .B r
 key in the confirmation menu, which presents a numbered list of
 applied commits.
+Commits that had conflicts are marked with a leading red
+.BR * .
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to
@@ -274,7 +276,9 @@ to abort.
 Press
 .B r
 to reset the branch to an earlier backport commit; a numbered
-list of applied commits is shown for selection.
+list of applied commits is shown for selection; commits that had
+conflicts are marked with a leading red
+.BR * .
 .PP
 When editing a field, type a new value and press Enter.
 Press Enter on an empty line to keep the current value,
