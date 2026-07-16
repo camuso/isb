@@ -77,7 +77,7 @@ isb
 Pick a single upstream commit:
 
 ```sh
-isb --pick a8aebe93a4938c0ca1941eeaae821738f869be3d
+isb pick a8aebe93a4938c0ca1941eeaae821738f869be3d
 ```
 
 Override a session value for one run:

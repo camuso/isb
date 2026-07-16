@@ -269,18 +269,18 @@ def parse_args():
         add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
+            commands:
+              isb                          default backport flow
+              isb status                   show progress and exit
+              isb continue                 resume from saved state
+              isb pick <HASH>              cherry-pick one upstream commit
+
             examples:
-              # First run (from inside the RHEL repo) -- prompts for session:
               cd ~/kernels/centos-9
-              isb --dry-run
-
-              # Subsequent runs reuse the session automatically:
-              isb
-              isb --pick abc123def456
-              isb --dry-run
-
-              # Override a session value for one run:
-              isb --upstream-version v7.2
+              isb --dry-run                first run, prompts for session
+              isb                          subsequent runs reuse session
+              isb pick abc123def456        single-commit pick
+              isb --upstream-version v7.2  override a session value
         """),
     )
     p.add_argument("--subsystem", default=None,
@@ -317,27 +317,36 @@ def parse_args():
                     help="When to build-test (default: conflict)")
     p.add_argument("--dry-run", action="store_true",
                     help="Classify commits but do not cherry-pick")
-    p.add_argument("--continue", dest="resume", action="store_true",
-                    help="Resume from saved state")
     p.add_argument("--yes", action="store_true",
                     help="Skip interactive confirmation menu")
     p.add_argument("-s", "--signed-off-by", default=None,
                     help="Signed-off-by trailer (e.g. 'Name <email>')")
     p.add_argument("--assisted-by", default="",
                     help="Assisted-by trailer (e.g. 'Claude <no-reply@anthropic.com>')")
-    p.add_argument("--pick", default=None, metavar="HASH",
-                    help="Cherry-pick a single upstream commit onto current "
-                         "HEAD with conflict resolution and RH Kernel Work Flow "
-                         "specified commit message")
     p.add_argument("--divergence", default=None,
                     help="Upstream commit hash to use as divergence point "
                          "(skips auto-detection)")
     p.add_argument("--toolbox", default=None,
                     help="Toolbox container name (default: rhel<RHEL>)")
-    p.add_argument("--status", action="store_true",
-                    help="Show backport progress and exit")
     p.add_argument("-h", "--help", action=_ManPageAction,
                     help="Show the man page (or short help if piped)")
+
+    # Hidden backward-compat aliases for the old flag forms.
+    p.add_argument("--continue", dest="resume", action="store_true",
+                    help=argparse.SUPPRESS)
+    p.add_argument("--pick", default=None, metavar="HASH",
+                    help=argparse.SUPPRESS)
+    p.add_argument("--status", action="store_true",
+                    help=argparse.SUPPRESS)
+
+    # Subcommands: continue, status, pick
+    sub = p.add_subparsers(dest="command")
+    sub.add_parser("continue", help="Resume from saved state")
+    sub.add_parser("status", help="Show backport progress and exit")
+    pick_p = sub.add_parser("pick",
+                            help="Cherry-pick a single upstream commit")
+    pick_p.add_argument("hash", help="Full 40-char upstream commit hash")
+
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -356,7 +365,8 @@ REQUIRED_SESSION = [
 ]
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
-                  "branch", "output_dir", "rhel_repo"}
+                  "branch", "output_dir", "rhel_repo",
+                  "command", "hash", "status"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -2788,6 +2798,16 @@ def print_summary(params, total_evaluated, keep_count, omit_count,
 def main():
     args = parse_args()
 
+    # Normalize hidden compat flags into args.command
+    if not args.command:
+        if getattr(args, "status", False):
+            args.command = "status"
+        elif getattr(args, "resume", False):
+            args.command = "continue"
+        elif getattr(args, "pick", None):
+            args.command = "pick"
+            args.hash = args.pick
+
     rhel_repo = os.path.abspath(args.rhel_repo)
     if not os.path.isdir(os.path.join(rhel_repo, ".git")):
         die("Must be run from a RHEL kernel git repo.")
@@ -2797,7 +2817,7 @@ def main():
     _session = load_session(rhel_repo)
     _session_repo = rhel_repo
 
-    if args.status:
+    if args.command == "status":
         show_status(rhel_repo)
         return
 
@@ -2937,12 +2957,13 @@ def main():
             return
 
     # -- Single-commit pick mode --
-    if args.pick:
-        verify = git(f"log --oneline -1 {args.pick}",
+    if args.command == "pick":
+        pick_arg = args.hash
+        verify = git(f"log --oneline -1 {pick_arg}",
                      cwd=upstream_repo, check=False)
         if verify.returncode != 0:
-            die(f"Commit {args.pick} not found in upstream repo.")
-        pick_hash = git(f"rev-parse {args.pick}",
+            die(f"Commit {pick_arg} not found in upstream repo.")
+        pick_hash = git(f"rev-parse {pick_arg}",
                         cwd=upstream_repo).stdout.strip()
 
         ensure_upstream_remote(rhel_repo, upstream_repo)
@@ -3083,7 +3104,7 @@ def main():
 
     base_commit = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
 
-    # Auto-resume from saved state (explicit --continue or automatic).
+    # Auto-resume from saved state (explicit 'continue' command or automatic).
     start_idx = 0
     state = load_state(output_dir)
     if state and state.get("next_idx", 0) > 0:

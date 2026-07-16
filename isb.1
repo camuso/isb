@@ -4,6 +4,7 @@
 isb \- Intelligent Subsystem Backport for RHEL kernels
 .SH SYNOPSIS
 .B isb
+.RI [ COMMAND ]
 .RI [ OPTIONS ]
 .PP
 Must be run from inside a RHEL kernel git repository.
@@ -66,6 +67,28 @@ A
 build is run inside a toolbox container to validate kernel configs,
 with caching so subsequent runs skip the rebuild when HEAD is
 unchanged.
+.SH COMMANDS
+When invoked without a command,
+.B isb
+runs the full backport flow.
+.TP
+.B status
+Show backport progress (current HEAD, commits applied, next commit
+in queue) and exit.
+Does not require session parameters such as
+.B \-\-subsystem
+or
+.BR \-\-rhel ;
+reads them from the saved session file.
+.TP
+.B continue
+Resume from previously saved state in the output directory.
+.TP
+.BI "pick " HASH
+Cherry-pick a single upstream commit (by its full 40-character hash)
+onto the current HEAD with conflict resolution and a RH Kernel Work
+Flow specified commit message.
+Skips the normal multi-commit workflow phases.
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to
@@ -177,30 +200,12 @@ Never build.
 Classify and list upstream commits without cherry-picking.
 Useful for reviewing what would be applied before committing to a run.
 .TP
-.B \-\-continue
-Resume from previously saved state in the output directory.
-.TP
-.B \-\-status
-Show backport progress (current HEAD, commits applied, next commit
-in queue) and exit.
-Does not require session parameters such as
-.B \-\-subsystem
-or
-.BR \-\-rhel ;
-reads them from the saved session file.
-.TP
 .B \-\-yes
 Skip the interactive confirmation menu and proceed immediately.
 .TP
 .BI \-\-assisted\-by " \"NAME <EMAIL>\""
 Assisted-by trailer added to commit messages, e.g.\&
 .IR "Claude <no-reply@anthropic.com>" .
-.TP
-.BI \-\-pick " HASH"
-Cherry-pick a single upstream commit (by its full 40-character hash)
-onto the current HEAD with conflict resolution and a RH Kernel Work Flow specified
-commit message.
-Skips the normal multi-commit workflow phases.
 .TP
 .BI \-\-divergence " HASH"
 Upstream commit hash to use as the divergence point, skipping
@@ -221,7 +226,7 @@ divergence point between upstream and RHEL, lists pending
 upstream commits, and cherry-picks them in order.
 Each commit receives a RH Kernel Work Flow specified message with JIRA, upstream status,
 conflict notes, the original commit metadata, and sign-off trailers.
-.SS "Single-commit pick (\-\-pick)"
+.SS "Single-commit pick (pick)"
 Cherry-picks exactly one upstream commit onto the current HEAD.
 The upstream repository is automatically configured as a git remote
 if needed, ensuring the commit object is reachable.
@@ -276,9 +281,12 @@ This allows scripted and non\-interactive usage.
 All session parameters carry their values across invocations
 as defaults in the interactive menu.
 .SS "Transient flags"
-.BR \-\-dry\-run ", " \-\-pick ", " \-\-continue ", " \-\-yes ", and "
+.BR \-\-dry\-run ", " \-\-yes ", and "
 .B \-\-divergence
 are per-invocation and never saved to the session.
+The
+.BR continue ", " pick ", and " status
+commands are also per-invocation.
 .SH EXAMPLES
 First run (prompts for session parameters):
 .PP
@@ -302,7 +310,7 @@ Pick a single upstream commit (session provides the rest):
 .PP
 .RS
 .nf
-isb \-\-pick a8aebe93a4938c0ca1941eeaae821738f869be3d
+isb pick a8aebe93a4938c0ca1941eeaae821738f869be3d
 .fi
 .RE
 .PP
@@ -341,7 +349,7 @@ caching.
 .TP
 .I <output\-dir>/state.json
 Saved state for
-.B \-\-continue
+.B continue
 resumption.
 .SH SEE ALSO
 .BR rhel\-upstream\-diff (1),
