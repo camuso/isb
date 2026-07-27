@@ -3230,9 +3230,12 @@ def main():
                         cwd=rhel_repo,
                     )
                     if rc != 0:
-                        die(f"Branch '{target_branch}' no longer exists.")
-                    git(f"checkout {target_branch}", cwd=rhel_repo)
-                    status(f"  Switched to '{target_branch}'.")
+                        info(f"  Branch '{target_branch}' does not "
+                             f"exist yet; it will be created in "
+                             f"Phase 4.")
+                    else:
+                        git(f"checkout {target_branch}", cwd=rhel_repo)
+                        status(f"  Switched to '{target_branch}'.")
                     break
                 elif ch in ('c', 'C'):
                     print("continue")
