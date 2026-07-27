@@ -14,6 +14,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import termios
 import textwrap
 import threading
@@ -452,7 +453,7 @@ def parse_args():
     p.add_argument("--status", action="store_true",
                     help=argparse.SUPPRESS)
 
-    # Subcommands: continue, status, pick, reset
+    # Subcommands: continue, status, pick, reset, regen
     sub = p.add_subparsers(dest="command")
     sub.add_parser("continue", help="Resume from saved state")
     sub.add_parser("status", help="Show backport progress and exit")
@@ -462,6 +463,9 @@ def parse_args():
     reset_p = sub.add_parser("reset",
                              help="Reset backport to an earlier commit")
     reset_p.add_argument("hash", help="Commit hash to reset to")
+    p.add_argument("--regen", action="store_true",
+                   help="Rewrite commit messages with current session "
+                        "fields and regenerate patches")
 
     return p.parse_args()
 
@@ -481,7 +485,7 @@ REQUIRED_SESSION = [
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
-                  "command", "hash", "status"}
+                  "command", "hash", "status", "regen"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -981,6 +985,7 @@ _CONFIRM_FIELDS = [
     ("6", "jira",             "JIRA",             "text"),
     ("7", "branch",           "Branch",           "text"),
     ("8", "output_dir",       "Output dir",       "text"),
+    ("9", "signed_off_by",    "Signed-off-by",    "text"),
     ("t", "toolbox",          "Toolbox",          "toolbox"),
     ("c", "conflict_policy",  "Conflict policy",  "cycle"),
     ("b", "build_policy",     "Build policy",     "cycle"),
@@ -1081,9 +1086,10 @@ def show_confirmation_menu(params):
         print(f"  {MNU}s{OFF}  Edit scope paths   "
               f"{MNU}N{OFF}  New session (edit all)")
         print(f"  {MNU}r{OFF}  Reset to commit    "
-              f"{MNU}h{OFF}  Help")
-        print(f"  {MNU}g{OFF}  Go / proceed       "
-              f"{MNU}q{OFF}  Quit")
+              f"{MNU}p{OFF}  Regen patches")
+        print(f"  {MNU}h{OFF}  Help               "
+              f"{MNU}g{OFF}  Go / proceed")
+        print(f"  {MNU}q{OFF}  Quit")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -1122,6 +1128,39 @@ def show_confirmation_menu(params):
             keep_list = cached.get("keep", [])
             interactive_reset(_session_repo, out_dir,
                               base_commit, keep_list)
+            continue
+
+        elif ch in ('p', 'P'):
+            base_commit = _session.get("_base_commit")
+            out_dir = params.get("output_dir", "")
+            if not base_commit and out_dir:
+                st = load_state(out_dir)
+                if st:
+                    base_commit = st.get("base_commit")
+            if not base_commit:
+                warn("  No backport in progress -- nothing to regenerate.")
+                continue
+            sob = params.get("signed_off_by", "")
+            if not sob:
+                try:
+                    uname = git("config user.name").stdout.strip().strip('"')
+                    email = git("config user.email").stdout.strip()
+                    if uname and email:
+                        sob = f"{uname} <{email}>"
+                except Exception:
+                    pass
+            if not sob:
+                warn("  Signed-off-by is required. Set it first (9).")
+                continue
+            _params_to_session(params)
+            _save()
+            regen_patches(
+                _session_repo, out_dir, base_commit,
+                params.get("jira", "RHEL-PLACEHOLDER"),
+                params.get("upstream_version", "UPSTREAM_VERSION"),
+                sob,
+                params.get("assisted_by", ""),
+            )
             continue
 
         elif ch == 'N':
@@ -3101,6 +3140,103 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
 
 
 # ---------------------------------------------------------------------------
+# Commit-message rewriting (regen)
+# ---------------------------------------------------------------------------
+
+def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by):
+    """Replace metadata fields in a gort-style commit message.
+
+    Preserves conflict notes, upstream commit citation, and body verbatim.
+    Only touches the well-known trailer/header lines.
+    """
+    msg = re.sub(r'^JIRA: .*$', f'JIRA: {jira}', msg, flags=re.MULTILINE)
+    msg = re.sub(r'^Upstream status: .*$',
+                 f'Upstream status: {upstream_version}',
+                 msg, flags=re.MULTILINE)
+    # Replace existing Signed-off-by (first occurrence only)
+    msg = re.sub(r'^Signed-off-by: .*$',
+                 f'Signed-off-by: {signed_off_by}',
+                 msg, count=1, flags=re.MULTILINE)
+    # Assisted-by: update, add, or leave alone
+    if assisted_by:
+        if re.search(r'^Assisted-by:', msg, re.MULTILINE):
+            msg = re.sub(r'^Assisted-by: .*$',
+                         f'Assisted-by: {assisted_by}',
+                         msg, count=1, flags=re.MULTILINE)
+        else:
+            msg = re.sub(r'^(Signed-off-by:)',
+                         f'Assisted-by: {assisted_by}\n\\1',
+                         msg, count=1, flags=re.MULTILINE)
+    return msg
+
+
+def regen_patches(rhel_repo, output_dir, base_commit,
+                  jira, upstream_version, signed_off_by, assisted_by):
+    """Rewrite commit messages on the backport branch and regenerate patches.
+
+    Uses git filter-branch --msg-filter to update JIRA, Upstream status,
+    Signed-off-by, and Assisted-by in every commit since base_commit.
+    """
+    header("Regenerating patches")
+
+    r = git(f"rev-list --reverse {base_commit}..HEAD", cwd=rhel_repo)
+    commits = [c for c in r.stdout.strip().split("\n") if c]
+    if not commits:
+        die("No commits found since base -- nothing to regenerate.")
+
+    info(f"  Rewriting {len(commits)} commit message(s) ...")
+    info(f"    JIRA:            {jira}")
+    info(f"    Upstream status: {upstream_version}")
+    info(f"    Signed-off-by:   {signed_off_by}")
+    if assisted_by:
+        info(f"    Assisted-by:     {assisted_by}")
+
+    msg_dir = tempfile.mkdtemp(prefix="isb-regen-")
+    try:
+        for c in commits:
+            old_msg = git(f"log --format=%B -1 {c}",
+                          cwd=rhel_repo).stdout.rstrip()
+            new_msg = _rewrite_message(old_msg, jira, upstream_version,
+                                       signed_off_by, assisted_by)
+            with open(os.path.join(msg_dir, c), "w") as fh:
+                fh.write(new_msg)
+
+        filter_cmd = (
+            f"git filter-branch -f --msg-filter "
+            f"'cat {msg_dir}/$GIT_COMMIT' "
+            f"-- {base_commit}..HEAD"
+        )
+        with Spinner("Rewriting commit messages ..."):
+            run(filter_cmd, cwd=rhel_repo, check=True)
+    finally:
+        shutil.rmtree(msg_dir, ignore_errors=True)
+
+    status(f"  Rewrote {len(commits)} commit(s).")
+
+    # Regenerate format-patch output
+    patches_dir = os.path.join(output_dir, "patches")
+    os.makedirs(patches_dir, exist_ok=True)
+    for old in glob(os.path.join(patches_dir, "*.patch")):
+        os.remove(old)
+    with Spinner("Generating patch series ..."):
+        git(f"format-patch -o {patches_dir} {base_commit}..HEAD",
+            cwd=rhel_repo)
+    patch_files = sorted(glob(os.path.join(patches_dir, "*.patch")))
+    n = len(patch_files)
+    print(f"\n{STA}{'=' * 74}{OFF}")
+    print(f"  {BLD}Patch series regenerated: {n} file{'s' if n != 1 else ''}{OFF}")
+    print(f"  {INF}{patches_dir}{OFF}")
+    print(f"{STA}{'=' * 74}{OFF}\n")
+
+    # Update completed head after rewrite (hashes changed)
+    new_head = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
+    _session["_completed_head"] = new_head
+    _save()
+
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Phase 5: output generation
 # ---------------------------------------------------------------------------
 
@@ -3208,6 +3344,46 @@ def main():
                 "Run isb first.")
         keep = cached.get("keep", [])
         do_reset(rhel_repo, args.hash, output_dir, base_commit, keep)
+        return
+
+    if args.regen:
+        base_commit = _session.get("_base_commit")
+        output_dir = _session.get("output_dir")
+        if not output_dir:
+            sub = _session.get("subsystem", "unknown")
+            rhel_ver = _session.get("rhel", "0")
+            output_dir = os.path.join(
+                os.path.dirname(rhel_repo), "backports",
+                str(rhel_ver),
+                os.path.basename(sub.rstrip("/")),
+            )
+        if not base_commit and output_dir:
+            st = load_state(output_dir)
+            if st:
+                base_commit = st.get("base_commit")
+        if not base_commit:
+            die("No backport in progress (no base commit). "
+                "Run isb first.")
+        apply_session_to_args(args, _session)
+        if not args.signed_off_by:
+            try:
+                uname = git("config user.name").stdout.strip().strip('"')
+                email = git("config user.email").stdout.strip()
+                if uname and email:
+                    args.signed_off_by = f"{uname} <{email}>"
+            except Exception:
+                pass
+        if not args.signed_off_by:
+            die("Signed-off-by is required. Set it with -s or in the "
+                "session menu.")
+        regen_patches(
+            rhel_repo, output_dir, base_commit,
+            args.jira or _session.get("jira", "RHEL-PLACEHOLDER"),
+            (args.upstream_version
+             or _session.get("upstream_version", "UPSTREAM_VERSION")),
+            args.signed_off_by,
+            args.assisted_by or _session.get("assisted_by", ""),
+        )
         return
 
     # -- Branch drift check --
@@ -3362,47 +3538,6 @@ def main():
     if not scope_paths:
         die("No valid scope paths found. Check --subsystem and upstream repo.")
 
-    # -- Completion check --
-    current_head = git("rev-parse HEAD",
-                       cwd=rhel_repo, check=False).stdout.strip()
-    completed_head = _session.get("_completed_head")
-    base_commit = _session.get("_base_commit")
-
-    if completed_head and current_head == completed_head:
-        if (args.conflict_policy == "patchpal"
-                and _session.get("conflict_policy") != "patchpal"
-                and base_commit):
-            replay_with_patchpal(
-                rhel_repo, upstream_repo, base_commit,
-                scope_paths, args.conflict_policy, args.build_policy,
-                toolbox_name, args.subsystem, args.jira,
-                args.upstream_version, args.rhel,
-                output_dir, args.signed_off_by,
-                args.assisted_by,
-            )
-            return
-        else:
-            status("Backport already completed with current session.")
-            for label, field in [
-                ("subsystem",        "subsystem"),
-                ("rhel",             "rhel"),
-                ("upstream-version", "upstream_version"),
-                ("signed-off-by",    "signed_off_by"),
-                ("jira",             "jira"),
-                ("toolbox",          "toolbox"),
-            ]:
-                val = getattr(args, field, None)
-                if val is not None:
-                    info(f"  {label+':':<20s} {val}")
-            patches_dir = os.path.join(output_dir, "patches")
-            if os.path.isdir(patches_dir):
-                patch_files = sorted(glob(os.path.join(patches_dir, "*.patch")))
-                info(f"  {'patches:':<20s} {patches_dir} "
-                     f"({len(patch_files)} files)")
-            info("\n  Re-run with different parameters or from a new branch "
-                 "to start a new backport.")
-            return
-
     # -- Single-commit pick mode --
     if args.command == "pick":
         pick_arg = args.hash
@@ -3449,6 +3584,7 @@ def main():
         "jira": args.jira,
         "branch": branch,
         "output_dir": output_dir,
+        "signed_off_by": args.signed_off_by,
         "toolbox": toolbox_name,
         "conflict_policy": args.conflict_policy,
         "build_policy": args.build_policy,
@@ -3468,9 +3604,42 @@ def main():
     upstream_repo = params["upstream_repo"]
     branch = params["branch"]
     output_dir = params["output_dir"]
+    args.signed_off_by = params.get("signed_off_by", args.signed_off_by)
+    args.jira = params.get("jira", args.jira)
+    args.upstream_version = params.get("upstream_version",
+                                       args.upstream_version)
 
     _params_to_session(params)
     _save()
+
+    # -- Completion check (after menu, so user could edit fields / regen) --
+    current_head = git("rev-parse HEAD",
+                       cwd=rhel_repo, check=False).stdout.strip()
+    completed_head = _session.get("_completed_head")
+    base_commit = _session.get("_base_commit")
+
+    if completed_head and current_head == completed_head:
+        if (conflict_policy == "patchpal"
+                and _session.get("conflict_policy") != "patchpal"
+                and base_commit):
+            replay_with_patchpal(
+                rhel_repo, upstream_repo, base_commit,
+                scope_paths, conflict_policy, build_policy,
+                toolbox_name, params["subsystem"], params.get("jira", ""),
+                params.get("upstream_version", ""),
+                params["rhel"],
+                output_dir,
+                params.get("signed_off_by", args.signed_off_by),
+                args.assisted_by,
+            )
+            return
+        else:
+            status("Backport already completed with current session.")
+            info(f"  To update JIRA, Signed-off-by, etc. and regenerate "
+                 f"patches, use 'p' in the menu or 'isb --regen'.")
+            info(f"  Re-run with different parameters or from a new branch "
+                 f"to start a new backport.")
+            return
 
     # -- Try to reuse cached divergence/classification results --
     cached = load_cached_results(_session)

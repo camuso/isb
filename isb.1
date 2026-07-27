@@ -102,6 +102,17 @@ key in the confirmation menu, which presents a numbered list of
 applied commits.
 Commits that had conflicts are marked with a leading red
 .BR * .
+.SH OPTIONS
+.TP
+.B \-\-regen
+Rewrite commit messages on the backport branch with the current session
+values for JIRA, Upstream status, Signed-off-by, and Assisted-by, then
+regenerate the patch series.
+Useful after updating metadata fields (e.g.\ adding a real JIRA number)
+without re-running the entire backport.
+Also available interactively via the
+.B p
+key in the confirmation menu.
 .SH DEPENDENCIES
 On startup,
 .B isb
