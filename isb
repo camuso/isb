@@ -1338,8 +1338,8 @@ def _toolbox_cmd(toolbox_name, make_cmd, rhel_repo):
     make command in a bash -c 'cd <path> && <cmd>' so the build runs
     in the correct directory regardless of mount layout.
     """
-    home = os.path.expanduser("~")
-    abs_repo = os.path.abspath(rhel_repo)
+    home = os.path.realpath(os.path.expanduser("~"))
+    abs_repo = os.path.realpath(rhel_repo)
     if abs_repo.startswith(home + "/") or abs_repo == home:
         return (f"toolbox run -c {toolbox_name} {make_cmd}", abs_repo)
     container_path = f"/run/host{abs_repo}"
