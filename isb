@@ -477,7 +477,6 @@ SESSION_FIELDS = [
 
 REQUIRED_SESSION = [
     "subsystem", "rhel", "upstream_repo", "upstream_version",
-    "signed_off_by",
 ]
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
@@ -3306,6 +3305,28 @@ def main():
             setattr(args, req_field, val)
             _session[req_field] = val
             _save()
+
+    # Auto-detect Signed-off-by from git config if not set.
+    if not args.signed_off_by:
+        try:
+            uname = git("config user.name").stdout.strip().strip('"')
+            email = git("config user.email").stdout.strip()
+            if uname and email:
+                args.signed_off_by = f"{uname} <{email}>"
+                _session["signed_off_by"] = args.signed_off_by
+                _save()
+                info(f"  Signed-off-by auto-detected: {args.signed_off_by}")
+        except Exception:
+            pass
+    if not args.signed_off_by:
+        print(f"  {WRN}Signed-off-by is not set and could not be "
+              f"auto-detected from git config.{OFF}")
+        val = input("  Signed-off-by (Name <email>): ").strip()
+        if not val:
+            die("Signed-off-by is required.")
+        args.signed_off_by = val
+        _session["signed_off_by"] = val
+        _save()
 
     # Upstream version is optional; default to PLACEHOLDER if not set.
     if not args.upstream_version:
