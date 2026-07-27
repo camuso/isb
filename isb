@@ -1218,6 +1218,107 @@ def show_confirmation_menu(params):
 # Toolbox helpers
 # ---------------------------------------------------------------------------
 
+def _host_os_info():
+    """Return (distro_id, major_version) from /etc/os-release.
+
+    e.g. ('fedora', '44'), ('rhel', '10'), ('centos', '9').
+    Returns (None, None) if the file can't be parsed.
+    """
+    distro_id = major = None
+    try:
+        with open("/etc/os-release") as fh:
+            for line in fh:
+                if line.startswith("ID="):
+                    distro_id = line.strip().split("=", 1)[1].strip('"')
+                elif line.startswith("VERSION_ID="):
+                    ver = line.strip().split("=", 1)[1].strip('"')
+                    major = ver.split(".")[0]
+    except OSError:
+        pass
+    return (distro_id, major)
+
+
+def _host_matches_rhel(rhel_ver):
+    """Return True if the host OS can natively build for the given RHEL ver."""
+    rhel_major = str(rhel_ver).split(".")[0]
+    distro, host_major = _host_os_info()
+    if not distro or not host_major:
+        return False
+    if distro in ("rhel", "centos") and host_major == rhel_major:
+        return True
+    return False
+
+
+def _resolve_toolbox(rhel_ver, build_policy):
+    """Determine the toolbox container name for the target RHEL version.
+
+    If the host OS matches the RHEL target, no toolbox is needed (return None
+    for build_policy 'none', or the matching container otherwise).
+    If the host doesn't match, inform the user and present available
+    toolboxes for selection.
+    """
+    rhel_major = str(rhel_ver).split(".")[0]
+
+    if _host_matches_rhel(rhel_ver):
+        candidates = [f"rhel{rhel_major}", f"c{rhel_major}s",
+                       f"rhel{rhel_ver}"]
+        available = _list_toolboxes()
+        for name in candidates:
+            if name in available:
+                return name
+        return f"rhel{rhel_major}"
+
+    # Host doesn't match -- toolbox is required for builds.
+    if build_policy == "none":
+        return None
+
+    if not shutil.which("toolbox"):
+        warn("Host OS does not match RHEL target and toolbox is not "
+             "installed.\n"
+             "       Builds will fail. Install toolbox or set "
+             "--build-policy none.")
+        return None
+
+    available = _list_toolboxes()
+    if not available:
+        die("Host OS does not match RHEL target and no toolbox "
+            "containers found.\n"
+            "       A toolbox is required for building. Create one "
+            "with 'toolbox create <name>'.")
+
+    # Always present the list when host doesn't match.
+    distro, host_ver = _host_os_info()
+    host_desc = f"{distro} {host_ver}" if distro else "this host"
+    print(f"\n  {WRN}Host ({host_desc}) does not match RHEL "
+          f"{rhel_major}. Select a toolbox:{OFF}")
+    for i, name in enumerate(available):
+        if i < 9:
+            print(f"    {MNU}{i + 1}{OFF}  {name}")
+        else:
+            print(f"    {INF}   {name}{OFF}")
+    print(f"    {MNU}q{OFF}  Quit")
+    print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+
+    if len(available) <= 9:
+        ch = _getch()
+        print(ch)
+    else:
+        ch = input().strip()
+
+    if ch.lower() == 'q':
+        sys.exit(0)
+    try:
+        idx = int(ch) - 1
+        if 0 <= idx < len(available):
+            return available[idx]
+    except ValueError:
+        pass
+
+    warn(f"  Invalid selection '{ch}'. Using first available: "
+         f"{available[0]}")
+    return available[0]
+
+
 def _toolbox_cmd(toolbox_name, make_cmd, rhel_repo):
     """Build a toolbox run command that works for paths outside $HOME.
 
@@ -3203,7 +3304,12 @@ def main():
         str(args.rhel),
         os.path.basename(args.subsystem.rstrip("/")),
     )
-    toolbox_name = args.toolbox or f"rhel{args.rhel}"
+    toolbox_name = args.toolbox
+    if not toolbox_name:
+        toolbox_name = _resolve_toolbox(args.rhel, args.build_policy)
+        if toolbox_name:
+            _session["toolbox"] = toolbox_name
+            _save()
 
     if args.only_paths:
         scope_paths = args.only_paths
