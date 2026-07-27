@@ -102,6 +102,31 @@ key in the confirmation menu, which presents a numbered list of
 applied commits.
 Commits that had conflicts are marked with a leading red
 .BR * .
+.SH DEPENDENCIES
+On startup,
+.B isb
+checks for required and optional tools:
+.TP
+.B Python 3.12+
+Required.
+If the running interpreter is too old, isb exits immediately.
+.TP
+.B toolbox
+Optional (needed when build-policy is not
+.BR none ).
+If missing, isb offers to install it via
+.BR "sudo dnf install toolbox" .
+.TP
+.B patchpal
+Optional (GUI conflict resolution).
+If missing, isb offers to enable the Copr repository and install it via
+.BR "sudo dnf copr enable jbenc/patchpal" " and " "sudo dnf install patchpal" .
+Requires a graphical display (X11 or Wayland); when no display is
+detected, the patchpal option is shown in dim italic with a
+.B **
+marker in interactive menus.
+The user may still select it, but isb will refuse to proceed at
+runtime if no display is available.
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to
@@ -270,6 +295,11 @@ If required fields (marked with
 are not set,
 .B g
 will refuse and list what is missing.
+Options that require a graphical display (such as
+.BR patchpal )
+are marked with
+.B **
+and shown in dim italic when no display is detected.
 Press
 .B q
 to abort.

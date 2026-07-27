@@ -31,6 +31,7 @@ INF = "\033[0;96m"
 WRN = "\033[0;93m"
 CAU = "\033[0;91m"
 STA = "\033[0;92m"
+DIM = "\033[2;3m"    # dim + italic
 OFF = "\033[0m"
 
 SEP = "=" * 74
@@ -49,6 +50,85 @@ _session_repo = None
 _loop_output_dir = None
 _loop_idx = None
 _loop_base_commit = None
+
+
+def _has_display():
+    """Return True if a graphical display (X11/Wayland) is available."""
+    return bool(os.environ.get("DISPLAY") or
+                os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _check_and_install_deps():
+    """Check for required and optional dependencies, offering to install."""
+    # -- Python version --
+    if sys.version_info < (3, 12):
+        print(f"{CAU}ERROR:{OFF} isb requires Python 3.12 or later "
+              f"(found {sys.version_info.major}.{sys.version_info.minor}).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    missing = []
+
+    # -- toolbox --
+    if not shutil.which("toolbox"):
+        missing.append({
+            "name": "toolbox",
+            "required": False,
+            "reason": "needed for build testing (build-policy != none)",
+            "commands": ["sudo dnf install -y toolbox"],
+        })
+
+    # -- patchpal --
+    if not shutil.which("patchpal"):
+        missing.append({
+            "name": "patchpal",
+            "required": False,
+            "reason": "GUI conflict resolution (requires X11/Wayland)",
+            "commands": [
+                "sudo dnf copr enable -y jbenc/patchpal",
+                "sudo dnf install -y patchpal",
+            ],
+        })
+
+    if not missing:
+        return
+
+    print(f"\n{MNU}    Dependency check{OFF}")
+    print(f"    {'─' * 50}")
+    for dep in missing:
+        tag = f"{WRN}optional{OFF}" if not dep["required"] else f"{CAU}REQUIRED{OFF}"
+        print(f"  {CAU}!{OFF}  {BLD}{dep['name']}{OFF} not found ({tag})")
+        print(f"      {dep['reason']}")
+        for cmd in dep["commands"]:
+            print(f"      $ {INF}{cmd}{OFF}")
+    print(f"    {'─' * 50}")
+
+    for dep in missing:
+        print(f"\n  Install {BLD}{dep['name']}{OFF}? [y/N] ", end="", flush=True)
+        ans = input().strip().lower()
+        if ans != 'y':
+            if dep["required"]:
+                print(f"  {CAU}{dep['name']} is required. Exiting.{OFF}",
+                      file=sys.stderr)
+                sys.exit(1)
+            print(f"  Skipping {dep['name']}.")
+            continue
+
+        ok = True
+        for cmd in dep["commands"]:
+            print(f"  Running: {INF}{cmd}{OFF}")
+            rc = subprocess.call(cmd, shell=True)
+            if rc != 0:
+                print(f"  {CAU}Command failed (exit {rc}).{OFF}")
+                ok = False
+                break
+        if ok and shutil.which(dep["name"]):
+            print(f"  {STA}{dep['name']} installed successfully.{OFF}")
+        elif ok:
+            print(f"  {WRN}Commands succeeded but {dep['name']} not "
+                  f"found on PATH.{OFF}")
+
+    print()
 
 
 def _save():
@@ -509,6 +589,8 @@ def _format_value(field, val):
         return f"{WRN}(not set){OFF}"
     if isinstance(val, list):
         return " ".join(str(v) for v in val)
+    if field == "conflict_policy" and val == "patchpal" and not _has_display():
+        return f"{DIM}patchpal{OFF} {WRN}(requires GUI) **{OFF}"
     return str(val)
 
 
@@ -576,13 +658,21 @@ def _pick_toolbox(current):
 def _edit_field(field, label, current, required):
     """Prompt the user to edit a single field. Returns the new value."""
     if field == "conflict_policy":
-        opts = "/".join(CONFLICT_POLICIES)
+        if _has_display():
+            opts = "/".join(CONFLICT_POLICIES)
+        else:
+            opts = "/".join(
+                f"{DIM}{p}{OFF}" if p == "patchpal" else p
+                for p in CONFLICT_POLICIES)
         display = current or "(auto)"
         prompt_str = f"    {label} [{display}] ({opts}): "
         val = input(prompt_str).strip().lower()
         if val == "":
             return current
         if val in CONFLICT_POLICIES:
+            if val == "patchpal" and not _has_display():
+                print(f"  {WRN}Note: patchpal requires a graphical "
+                      f"display (X11/Wayland){OFF}")
             return val
         warn(f"    Invalid choice '{val}', keeping '{display}'")
         return current
@@ -638,6 +728,8 @@ def _print_menu(session):
               f"{_format_value(field, val)}")
     print(f"    {'─' * 50}")
     print(f"  {CAU}*{OFF} changing invalidates cached results")
+    if not _has_display():
+        print(f"  {WRN}**{OFF} requires a graphical display (X11/Wayland)")
     print(f"  {MNU}g{OFF}  Go          "
           f"{MNU}q{OFF}  Quit        "
           f"{MNU}h{OFF}  Help")
@@ -898,7 +990,14 @@ def show_confirmation_menu(params):
             suffix = ""
             if field == "build_policy" and val == "conflict":
                 suffix = " (DEFAULT)"
-            display = f"{val}{suffix}" if val else f"{WRN}(not set){OFF}"
+            if (field == "conflict_policy" and val == "patchpal"
+                    and not _has_display()):
+                display = (f"{DIM}patchpal{OFF} "
+                           f"{WRN}(requires GUI) **{OFF}")
+            elif val:
+                display = f"{val}{suffix}"
+            else:
+                display = f"{WRN}(not set){OFF}"
             mark = f"{CAU}*{OFF}" if field in REQUISITE_FIELDS else " "
             print(f"  {MNU}{key}{OFF}{mark}{label:<18s}: {INF}{display}{OFF}")
 
@@ -944,6 +1043,9 @@ def show_confirmation_menu(params):
             print(f"    {'─' * 50}")
 
         print(f"  {CAU}*{OFF} changing invalidates cached results")
+        if not _has_display():
+            print(f"  {WRN}**{OFF} requires a graphical display "
+                  f"(X11/Wayland)")
         print(f"  {MNU}s{OFF}  Edit scope paths   "
               f"{MNU}N{OFF}  New session (edit all)")
         print(f"  {MNU}r{OFF}  Reset to commit    "
@@ -998,11 +1100,23 @@ def show_confirmation_menu(params):
                 old_val = params[field]
                 if ftype == "cycle":
                     vals = cycle_values[field]
-                    opts = "/".join(vals)
+                    if (field == "conflict_policy"
+                            and not _has_display()):
+                        opts = "/".join(
+                            f"{DIM}{p}{OFF}" if p == "patchpal" else p
+                            for p in vals)
+                    else:
+                        opts = "/".join(vals)
                     prompt_str = f"    {label} [{cur}] ({opts}): "
                     val = input(prompt_str).strip()
                     if val and val in vals:
                         params[field] = val
+                        if (field == "conflict_policy"
+                                and val == "patchpal"
+                                and not _has_display()):
+                            print(f"  {WRN}Note: patchpal requires a "
+                                  f"graphical display (X11/Wayland)"
+                                  f"{OFF}")
                     elif val:
                         warn(f"    Invalid choice, keeping '{cur}'")
                 else:
@@ -1055,6 +1169,11 @@ def show_confirmation_menu(params):
                     vals = cycle_values[field]
                     idx = vals.index(params[field])
                     params[field] = vals[(idx + 1) % len(vals)]
+                    if (field == "conflict_policy"
+                            and params[field] == "patchpal"
+                            and not _has_display()):
+                        print(f"\n  {WRN}Note: patchpal requires a "
+                              f"graphical display (X11/Wayland){OFF}")
                 else:
                     cur = params[field] or ""
                     print()
@@ -2899,6 +3018,7 @@ def print_summary(params, total_evaluated, keep_count, omit_count,
 
 def main():
     args = parse_args()
+    _check_and_install_deps()
 
     # Normalize hidden compat flags into args.command
     if not args.command:
@@ -2998,10 +3118,7 @@ def main():
         _save()
 
     if args.conflict_policy is None:
-        has_display = bool(os.environ.get("DISPLAY") or
-                           os.environ.get("WAYLAND_DISPLAY"))
-        has_patchpal = bool(shutil.which("patchpal"))
-        if has_display and has_patchpal:
+        if _has_display() and shutil.which("patchpal"):
             args.conflict_policy = "patchpal"
         else:
             args.conflict_policy = "edit"
@@ -3012,8 +3129,7 @@ def main():
     if args.conflict_policy == "patchpal":
         if not shutil.which("patchpal"):
             die("conflict-policy 'patchpal' requires patchpal on PATH.")
-        if not (os.environ.get("DISPLAY") or
-                os.environ.get("WAYLAND_DISPLAY")):
+        if not _has_display():
             die("conflict-policy 'patchpal' requires a graphical display "
                 "(DISPLAY or WAYLAND_DISPLAY must be set).")
 
