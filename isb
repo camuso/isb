@@ -267,9 +267,6 @@ def die(msg):
     sys.exit(1)
 
 
-UPSTREAM_REMOTE_NAME = "backport-upstream"
-
-
 def _detect_rhel_version(rhel_repo):
     """Detect the RHEL major.minor version from Makefile.rhelver.
 
@@ -297,31 +294,39 @@ def _detect_rhel_version(rhel_repo):
     return None
 
 
-def ensure_upstream_remote(rhel_repo, upstream_repo):
-    """Ensure the upstream repo is configured as a remote in the RHEL repo.
+def ensure_upstream_objects(rhel_repo, upstream_repo):
+    """Make upstream objects visible via git alternates (zero-copy).
 
-    Checks for an existing remote pointing to upstream_repo.  If none
-    exists, adds one as 'backport-upstream' and fetches from it.
-    Returns the remote name.
+    Adds the upstream repo's object directory to the RHEL repo's
+    alternates file if not already present.  This is instant --
+    no fetch or object transfer is needed.
     """
     upstream_repo = os.path.realpath(upstream_repo)
+    upstream_objects = os.path.join(upstream_repo, ".git", "objects")
+    if not os.path.isdir(upstream_objects):
+        bare_objects = os.path.join(upstream_repo, "objects")
+        if os.path.isdir(bare_objects):
+            upstream_objects = bare_objects
+        else:
+            die(f"Cannot find objects dir in {upstream_repo}")
 
-    r = git("remote -v", cwd=rhel_repo, check=False)
-    for line in r.stdout.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) >= 2 and os.path.realpath(parts[1]) == upstream_repo:
-            remote_name = parts[0]
-            info(f"Upstream remote '{remote_name}' already configured")
-            return remote_name
+    alternates_file = os.path.join(rhel_repo, ".git", "objects",
+                                    "info", "alternates")
 
-    info(f"Adding upstream remote '{UPSTREAM_REMOTE_NAME}' -> {upstream_repo}")
-    git(f"remote add {UPSTREAM_REMOTE_NAME} {upstream_repo}",
-        cwd=rhel_repo, check=False)
-    with Spinner(f"Fetching from '{UPSTREAM_REMOTE_NAME}' ..."):
-        git(f"fetch --no-tags {UPSTREAM_REMOTE_NAME}", cwd=rhel_repo, check=False)
-    return UPSTREAM_REMOTE_NAME
+    existing = set()
+    if os.path.isfile(alternates_file):
+        with open(alternates_file) as fh:
+            existing = {line.strip() for line in fh if line.strip()}
+
+    if upstream_objects in existing:
+        info(f"Upstream objects already linked via alternates")
+        return
+
+    os.makedirs(os.path.dirname(alternates_file), exist_ok=True)
+    with open(alternates_file, "a") as fh:
+        fh.write(upstream_objects + "\n")
+    info(f"Linked upstream objects via alternates "
+         f"({upstream_objects})")
 
 
 def info(msg):
@@ -3372,7 +3377,7 @@ def main():
         pick_hash = git(f"rev-parse {pick_arg}",
                         cwd=upstream_repo).stdout.strip()
 
-        ensure_upstream_remote(rhel_repo, upstream_repo)
+        ensure_upstream_objects(rhel_repo, upstream_repo)
 
         header("Single commit pick")
         info(f"Commit: {verify.stdout.strip()}")
@@ -3488,7 +3493,7 @@ def main():
     # -- Phase 4: cherry-pick loop --
     header("Phase 4: Cherry-picking")
 
-    ensure_upstream_remote(rhel_repo, upstream_repo)
+    ensure_upstream_objects(rhel_repo, upstream_repo)
 
     # Create or checkout branch
     current = git("rev-parse --abbrev-ref HEAD",
