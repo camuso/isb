@@ -1041,7 +1041,8 @@ def show_confirmation_menu(params):
         print(f"\n{MNU}    {'Scope Paths'}{OFF}  {CAU}*{OFF}")
         print(f"    {'─' * 50}")
         for j, sp in enumerate(scope_paths):
-            print(f"    {chr(ord('a') + j)}. {INF}{sp}{OFF}")
+            print(f"  {MNU}{chr(ord('A') + j)}{OFF}. {INF}{sp}{OFF}")
+        print(f"  {MNU}+{OFF}  Add a scope path")
         print(f"    {'─' * 50}")
 
         cached = _session.get("_cached")
@@ -1083,11 +1084,11 @@ def show_confirmation_menu(params):
         if not _has_display():
             print(f"  {WRN}**{OFF} requires a graphical display "
                   f"(X11/Wayland)")
-        print(f"  {MNU}s{OFF}  Edit scope paths   "
+        print(f"  {MNU}s{OFF}  Replace all scope paths  "
               f"{MNU}N{OFF}  New session (edit all)")
-        print(f"  {MNU}r{OFF}  Reset to commit    "
+        print(f"  {MNU}r{OFF}  Reset to commit          "
               f"{MNU}p{OFF}  Regen patches")
-        print(f"  {MNU}h{OFF}  Help               "
+        print(f"  {MNU}h{OFF}  Help                     "
               f"{MNU}g{OFF}  Go / proceed")
         print(f"  {MNU}q{OFF}  Quit")
         print()
@@ -1212,20 +1213,31 @@ def show_confirmation_menu(params):
             _save()
             status("  Session updated.")
 
-        elif ch == 's':
-            print(f"\n  Current paths: {', '.join(scope_paths)}")
-            raw = input("  Enter new comma-separated paths: ").strip()
-            if raw:
-                old_paths = scope_paths[:]
-                scope_paths = [p.strip() for p in raw.split(",") if p.strip()]
+        elif ch == '+':
+            val = input("  New scope path: ").strip()
+            if val:
+                scope_paths.append(val)
                 params["scope_paths"] = scope_paths
-                if sorted(scope_paths) != sorted(old_paths):
-                    invalidate_cached_results(_session)
+                invalidate_cached_results(_session)
                 _params_to_session(params)
                 _save()
-                status("  Scope paths updated.")
+                status(f"  Added: {val}")
+
+        elif ch.isupper() and ord(ch) - ord('A') < len(scope_paths):
+            idx = ord(ch) - ord('A')
+            old_path = scope_paths[idx]
+            val = input(f"  [{old_path}] new path (empty to remove): ").strip()
+            old_paths = scope_paths[:]
+            if val:
+                scope_paths[idx] = val
             else:
-                warn("  No change (empty input).")
+                scope_paths.pop(idx)
+                status(f"  Removed: {old_path}")
+            params["scope_paths"] = scope_paths
+            if sorted(scope_paths) != sorted(old_paths):
+                invalidate_cached_results(_session)
+            _params_to_session(params)
+            _save()
 
         else:
             hit = None
