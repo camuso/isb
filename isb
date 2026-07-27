@@ -1084,13 +1084,12 @@ def show_confirmation_menu(params):
         if not _has_display():
             print(f"  {WRN}**{OFF} requires a graphical display "
                   f"(X11/Wayland)")
-        print(f"  {MNU}s{OFF}  Replace all scope paths  "
-              f"{MNU}N{OFF}  New session (edit all)")
-        print(f"  {MNU}r{OFF}  Reset to commit          "
+        print(f"  {MNU}N{OFF}  New session (edit all)    "
               f"{MNU}p{OFF}  Regen patches")
-        print(f"  {MNU}h{OFF}  Help                     "
-              f"{MNU}g{OFF}  Go / proceed")
-        print(f"  {MNU}q{OFF}  Quit")
+        print(f"  {MNU}r{OFF}  Reset to commit          "
+              f"{MNU}h{OFF}  Help")
+        print(f"  {MNU}g{OFF}  Go / proceed             "
+              f"{MNU}q{OFF}  Quit")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
