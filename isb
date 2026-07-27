@@ -982,6 +982,7 @@ _CONFIRM_FIELDS = [
     ("6", "jira",             "JIRA",             "text"),
     ("7", "branch",           "Branch",           "text"),
     ("8", "output_dir",       "Output dir",       "text"),
+    ("t", "toolbox",          "Toolbox",          "toolbox"),
     ("c", "conflict_policy",  "Conflict policy",  "cycle"),
     ("b", "build_policy",     "Build policy",     "cycle"),
     ("e", "editor",           "Editor",           "text"),
@@ -1206,6 +1207,11 @@ def show_confirmation_menu(params):
                             and not _has_display()):
                         print(f"\n  {WRN}Note: patchpal requires a "
                               f"graphical display (X11/Wayland){OFF}")
+                elif ftype == "toolbox":
+                    print()
+                    new_tb = _pick_toolbox(params[field])
+                    if new_tb is not None:
+                        params[field] = new_tb
                 else:
                     cur = params[field] or ""
                     print()
@@ -3413,6 +3419,7 @@ def main():
         "jira": args.jira,
         "branch": branch,
         "output_dir": output_dir,
+        "toolbox": toolbox_name,
         "conflict_policy": args.conflict_policy,
         "build_policy": args.build_policy,
         "editor": _session.get("editor") or _get_editor(),
@@ -3426,6 +3433,7 @@ def main():
     scope_paths = params["scope_paths"]
     conflict_policy = params["conflict_policy"]
     build_policy = params["build_policy"]
+    toolbox_name = params["toolbox"]
     rhel_repo = params["rhel_repo"]
     upstream_repo = params["upstream_repo"]
     branch = params["branch"]
