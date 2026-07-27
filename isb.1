@@ -170,10 +170,16 @@ Useful for catch-up runs on specific directories such as
 Documentation or include headers.
 .TP
 .BI \-\-branch " NAME"
-Branch name to create or check out.
+Branch name for the backport.
+If the branch does not exist, it is created from the current HEAD
+at the start of Phase 4 (cherry-picking).
+If it already exists, it is checked out.
 Default: the leaf component of the
 .B \-\-subsystem
-path.
+path (e.g.\&
+.I drivers/char/ipmi
+produces branch
+.IR ipmi ).
 .TP
 .BI \-\-output\-dir " DIR"
 Output directory for patches, reports, and saved state.
