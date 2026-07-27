@@ -2530,8 +2530,9 @@ def diagnose_build_failure(build_output, commit_hash, subject,
     # Try fixing known missing API calls first
     fixed, fix_notes = try_fix_missing_api(build_output, rhel_repo)
     if fixed:
-        info("  Auto-fix applied, rebuilding ...")
-        ok, new_output = build_test(rhel_repo, toolbox_name, subsystem)
+        tb_label = f" in toolbox '{toolbox_name}'" if toolbox_name else ""
+        with Spinner(f"Rebuilding {subsystem}{tb_label} (auto-fix) ..."):
+            ok, new_output = build_test(rhel_repo, toolbox_name, subsystem)
         if ok:
             return True, "; ".join(fix_notes)
         warn("  Rebuild after auto-fix still fails.")
@@ -2774,7 +2775,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
 
     build_ok = True
     if should_build:
-        with Spinner(f"Building {subsystem} ..."):
+        build_reason = "post-conflict" if had_conflict else "post-apply"
+        tb_label = f" in toolbox '{toolbox_name}'" if toolbox_name else ""
+        with Spinner(f"Building {subsystem} ({build_reason}){tb_label} ..."):
             build_ok, build_output = build_test(
                 rhel_repo, toolbox_name, subsystem,
             )
@@ -2845,7 +2848,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         git("commit --amend --no-edit",
                             cwd=rhel_repo, check=False)
                         print()
-                        with Spinner(f"Re-building {subsystem} ..."):
+                        tb = (f" in toolbox '{toolbox_name}'"
+                              if toolbox_name else "")
+                        with Spinner(f"Re-building {subsystem}"
+                                     f"{tb} ..."):
                             rebuild_ok, rb_output = build_test(
                                 rhel_repo, toolbox_name, subsystem,
                             )
