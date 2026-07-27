@@ -270,6 +270,33 @@ def die(msg):
 UPSTREAM_REMOTE_NAME = "backport-upstream"
 
 
+def _detect_rhel_version(rhel_repo):
+    """Detect the RHEL major.minor version from Makefile.rhelver.
+
+    Returns a string like '9.9' or '10.3', or None if not found.
+    """
+    rhelver = os.path.join(rhel_repo, "Makefile.rhelver")
+    if not os.path.isfile(rhelver):
+        return None
+    major = minor = None
+    try:
+        with open(rhelver) as fh:
+            for line in fh:
+                m = re.match(r'RHEL_MAJOR\s*=\s*(\d+)', line)
+                if m:
+                    major = m.group(1)
+                m = re.match(r'RHEL_MINOR\s*=\s*(\d+)', line)
+                if m:
+                    minor = m.group(1)
+    except OSError:
+        return None
+    if major and minor:
+        return f"{major}.{minor}"
+    if major:
+        return major
+    return None
+
+
 def ensure_upstream_remote(rhel_repo, upstream_repo):
     """Ensure the upstream repo is configured as a remote in the RHEL repo.
 
@@ -570,7 +597,7 @@ _MENU_ITEMS = [
     ("s", "subsystem",        "subsystem",        True),
     ("r", "rhel",             "rhel",             True),
     ("u", "upstream_repo",    "upstream-repo",    True),
-    ("v", "upstream_version", "upstream-version", True),
+    ("v", "upstream_version", "upstream-version", False),
     ("b", "signed_off_by",    "signed-off-by",    True),
     ("j", "jira",             "jira",             False),
     ("t", "toolbox",          "toolbox",          False),
@@ -3132,6 +3159,38 @@ def main():
         if not _has_display():
             die("conflict-policy 'patchpal' requires a graphical display "
                 "(DISPLAY or WAYLAND_DISPLAY must be set).")
+
+    # Auto-detect RHEL version from Makefile.rhelver if not set.
+    if not args.rhel:
+        detected = _detect_rhel_version(rhel_repo)
+        if detected:
+            args.rhel = detected
+            _session["rhel"] = detected
+            _save()
+            info(f"  Detected RHEL version {detected} from "
+                 f"Makefile.rhelver")
+        else:
+            die("Could not detect RHEL version from Makefile.rhelver "
+                "and --rhel was not set.\n"
+                "       Are you in a RHEL/CentOS kernel repo?")
+
+    # Prompt for missing required fields.
+    for req_field, req_label in [("subsystem", "Subsystem path"),
+                                   ("upstream_repo", "Upstream repo path")]:
+        if not getattr(args, req_field, None):
+            print(f"  {WRN}{req_label} is not set.{OFF}")
+            val = input(f"  {req_label}: ").strip()
+            if not val:
+                die(f"{req_label} is required.")
+            setattr(args, req_field, val)
+            _session[req_field] = val
+            _save()
+
+    # Upstream version is optional; default to PLACEHOLDER if not set.
+    if not args.upstream_version:
+        args.upstream_version = "UPSTREAM_VERSION"
+        info("  --upstream-version not set; using placeholder. "
+             "Set it in the session menu (v) or via --upstream-version.")
 
     upstream_repo = os.path.abspath(args.upstream_repo)
 
