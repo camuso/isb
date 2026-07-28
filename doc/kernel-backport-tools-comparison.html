@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RHEL Kernel Backport Tools: A Three-Tier Comparison</title>
+<style>
+  body {
+    font-family: "Google Sans", "Segoe UI", Roboto, Arial, sans-serif;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #202124;
+    line-height: 1.6;
+  }
+  h1 {
+    color: #1a73e8;
+    border-bottom: 2px solid #1a73e8;
+    padding-bottom: 8px;
+    font-size: 24pt;
+  }
+  h2 {
+    color: #1967d2;
+    margin-top: 32px;
+    font-size: 16pt;
+  }
+  h3 {
+    color: #185abc;
+    font-size: 13pt;
+    margin-top: 24px;
+  }
+  p, li {
+    font-size: 11pt;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 10.5pt;
+  }
+  th {
+    background-color: #1a73e8;
+    color: white;
+    text-align: left;
+    padding: 10px 14px;
+    font-weight: 600;
+  }
+  td {
+    padding: 8px 14px;
+    border-bottom: 1px solid #dadce0;
+    vertical-align: top;
+  }
+  tr:nth-child(even) {
+    background-color: #f8f9fa;
+  }
+  tr:hover {
+    background-color: #e8f0fe;
+  }
+  .tier-label {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-weight: 600;
+    font-size: 10pt;
+  }
+  .tier-1 { background-color: #e8f5e9; color: #1b5e20; }
+  .tier-2 { background-color: #e3f2fd; color: #0d47a1; }
+  .tier-3 { background-color: #fce4ec; color: #b71c1c; }
+  .summary-box {
+    background-color: #f1f3f4;
+    border-left: 4px solid #1a73e8;
+    padding: 16px 20px;
+    margin: 20px 0;
+    border-radius: 0 8px 8px 0;
+  }
+  .pro { color: #1b5e20; }
+  .con { color: #b71c1c; }
+  ul { margin: 4px 0; padding-left: 24px; }
+  code {
+    background-color: #f1f3f4;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: "Roboto Mono", "Consolas", monospace;
+    font-size: 10pt;
+  }
+  .footer {
+    margin-top: 40px;
+    padding-top: 16px;
+    border-top: 1px solid #dadce0;
+    color: #5f6368;
+    font-size: 9pt;
+  }
+</style>
+</head>
+<body>
+
+<h1>RHEL Kernel Backport Tools: A Three-Tier Comparison</h1>
+
+<div class="summary-box">
+  <strong>Summary:</strong> Three Red Hat kernel backport tools occupy distinct tiers of
+  automation. <code>git-backport</code> is a single-commit formatting utility.
+  <code>isb</code> (Intelligent Subsystem Backport) automates the full multi-commit
+  workflow with interactive conflict resolution.
+  <code>frankenpatch</code> uses autonomous AI agents for fully hands-off backporting.
+  Each serves a different use case and audience.
+</div>
+
+<h2>Tool Overview</h2>
+
+<h3><span class="tier-label tier-1">Tier 1</span> &nbsp; git-backport — Single-Commit Formatting</h3>
+<p>
+  <code>git-backport</code> is a lightweight utility from the
+  <a href="https://gitlab.com/redhat/centos-stream/src/kernel/utils/tools">CentOS Stream kernel utils</a>.
+  It takes a single upstream commit hash, wraps it with RH metadata (JIRA ticket,
+  CVE identifier, Signed-off-by), and produces a formatted patch file. The developer
+  is responsible for everything else: identifying which commits to backport, ordering
+  them, resolving conflicts, verifying builds, and iterating.
+</p>
+<p><strong>Typical usage:</strong></p>
+<p><code>git-backport --sign-off --jira RHEL-1234 --CVE CVE-2024-99999 &lt;commit_hash&gt; &amp;&amp; git am -3 /tmp/0001.diff</code></p>
+
+<h3><span class="tier-label tier-2">Tier 2</span> &nbsp; isb — Interactive Multi-Commit Backport</h3>
+<p>
+  <code>isb</code> (Intelligent Subsystem Backport) automates the entire multi-commit
+  subsystem backport workflow while keeping the developer in control of judgment calls.
+  It discovers scope paths, finds the divergence point between upstream and RHEL,
+  classifies and filters commits, runs the cherry-pick loop with progress tracking and
+  resume capability, and provides interactive conflict resolution via
+  <code>patchpal</code> (GUI) or manual editing.
+</p>
+<p><strong>Key features:</strong></p>
+<ul>
+  <li><strong>Commit list review:</strong> After classification, KEEP and OMIT lists
+      are written to editable files. The script pauses so the user can review, add,
+      remove, or reorder commits in another terminal before proceeding.</li>
+  <li><strong>Single-step mode:</strong> <code>isb --step</code> (or <code>x</code>
+      in the menu) applies only the next commit and stops, allowing careful
+      inspection before continuing.</li>
+  <li><strong>Patch regeneration:</strong> <code>isb --regen</code> (or <code>p</code>
+      in the menu) rewrites commit messages with updated JIRA, Signed-off-by, or
+      other metadata and regenerates the patch series — without re-running the
+      entire backport.</li>
+  <li><strong>Visual feedback:</strong> Animated spinners for every long-running
+      operation: cherry-picking, conflict resolution, scope indexing, and build
+      testing. No silent delays.</li>
+  <li><strong>Patchpal integration:</strong> Prominent notification banner before
+      each patchpal invocation, with automatic window focus/raise via
+      <code>xdotool</code> or <code>wmctrl</code>.</li>
+  <li><strong>Scope path editing:</strong> Individual paths editable (A–Z keys),
+      removable (empty input), and addable (+) from the interactive menu.</li>
+  <li><strong>Signed-off-by auto-detection:</strong> Reads from <code>git config
+      user.name</code> / <code>user.email</code> if not provided.</li>
+  <li><strong>Stale state detection:</strong> Detects external HEAD resets and
+      discards stale resume state instead of silently picking up at the wrong
+      position.</li>
+  <li><strong>Git alternates:</strong> Uses git alternates for zero-copy, instant
+      access to upstream commit objects from a local upstream repository.</li>
+</ul>
+<p><strong>Typical usage:</strong></p>
+<p><code>cd ~/kernels/centos-10 &amp;&amp; isb</code></p>
+<p>(Session parameters are prompted interactively on first run and reused automatically.)</p>
+
+<h3><span class="tier-label tier-3">Tier 3</span> &nbsp; frankenpatch — Autonomous AI Backport</h3>
+<p>
+  <code>frankenpatch</code> uses LLM-powered AI agents (Claude via Google Vertex AI or
+  local Ollama) with unrestricted shell and file access to autonomously resolve
+  conflicts and fix build errors. The developer provides the commit list and reviews
+  the results at the end. It builds kernels in Podman containers and uses a
+  planner-executor agentic loop for iterative build-error fixing.
+</p>
+<p><strong>Typical usage:</strong></p>
+<p><code>uv run frankenpatch backport-cve --cve=CVE-2024-99999 --jira=RHEL-150000 --os=rhel --os-version=10 --commit=abc1234 /path/to/repo</code></p>
+
+<h2>Feature Comparison</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Capability</th>
+      <th>git-backport</th>
+      <th>isb</th>
+      <th>frankenpatch</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Scope</strong></td>
+      <td>Single commit</td>
+      <td>Full subsystem (hundreds of commits)</td>
+      <td>Full subsystem / CVE fix chain</td>
+    </tr>
+    <tr>
+      <td><strong>Commit discovery</strong></td>
+      <td>Manual — developer identifies commits</td>
+      <td>Automatic — scope-path discovery, divergence detection, commit classification</td>
+      <td>Manual — developer provides commit list</td>
+    </tr>
+    <tr>
+      <td><strong>Already-applied filtering</strong></td>
+      <td>None</td>
+      <td>Automatic — scans RHEL history, skips duplicates</td>
+      <td>None</td>
+    </tr>
+    <tr>
+      <td><strong>Conflict resolution</strong></td>
+      <td>None — developer resolves manually</td>
+      <td>Interactive — patchpal (GUI), editor (manual), or abort</td>
+      <td>Autonomous — AI agent resolves conflicts without human input</td>
+    </tr>
+    <tr>
+      <td><strong>Build verification</strong></td>
+      <td>None</td>
+      <td>Toolbox-based — per-conflict or per-commit, with skip/fix/abort menu</td>
+      <td>Podman-based — AI agent iteratively fixes build errors</td>
+    </tr>
+    <tr>
+      <td><strong>Commit formatting</strong></td>
+      <td>RH metadata (JIRA, CVE, sign-off) via patch file</td>
+      <td>Full RH Kernel Work Flow (gort-style) commit messages with Conflicts stanza</td>
+      <td>Via <code>git-backport</code> + AI-generated Conflicts stanza</td>
+    </tr>
+    <tr>
+      <td><strong>Session / state management</strong></td>
+      <td>None — stateless</td>
+      <td>Full — session file, progress tracking, auto-resume, reset,
+          stale-state detection on external HEAD reset</td>
+      <td>Results directory — no cross-run resume</td>
+    </tr>
+    <tr>
+      <td><strong>Interactive menus</strong></td>
+      <td>None</td>
+      <td>Single-keypress menus for all parameters, scope editing (A–Z, +),
+          reset, single-step (x), patch regen (p), help (h)</td>
+      <td>None — CLI arguments only</td>
+    </tr>
+    <tr>
+      <td><strong>Commit list editing</strong></td>
+      <td>N/A</td>
+      <td>Editable KEEP/OMIT files after classification; user can add, remove,
+          or reorder commits before cherry-picking</td>
+      <td>N/A</td>
+    </tr>
+    <tr>
+      <td><strong>Single-step mode</strong></td>
+      <td>N/A</td>
+      <td>Apply one commit at a time with <code>--step</code> or <code>x</code>
+          hotkey for careful inspection</td>
+      <td>N/A</td>
+    </tr>
+    <tr>
+      <td><strong>Post-hoc metadata update</strong></td>
+      <td>N/A</td>
+      <td>Rewrite JIRA, Signed-off-by, etc. in all commit messages and
+          regenerate patches with <code>--regen</code> or <code>p</code> hotkey</td>
+      <td>N/A</td>
+    </tr>
+    <tr>
+      <td><strong>Visual feedback</strong></td>
+      <td>None</td>
+      <td>Animated spinners for cherry-pick, conflict resolution, scope
+          indexing, and build; progress bars for classification</td>
+      <td>Agent log output</td>
+    </tr>
+    <tr>
+      <td><strong>Output</strong></td>
+      <td>Patch file in <code>/tmp</code></td>
+      <td>Patch series, omitted-commits log, build-failure reports,
+          editable commit lists</td>
+      <td>Results directory with per-step logs and agent output</td>
+    </tr>
+    <tr>
+      <td><strong>Human involvement</strong></td>
+      <td>Everything — the tool only formats</td>
+      <td>Decisions and conflicts — automation handles the rest</td>
+      <td>Review at the end — AI handles everything</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Dependency Comparison</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Requirement</th>
+      <th>git-backport</th>
+      <th>isb</th>
+      <th>frankenpatch</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Runtime</strong></td>
+      <td>Bash + Git</td>
+      <td>Python 3.12+ and Git</td>
+      <td>Python 3.12+, <code>uv</code>, Git</td>
+    </tr>
+    <tr>
+      <td><strong>Build environment</strong></td>
+      <td>N/A</td>
+      <td>Toolbox container</td>
+      <td>Podman (custom builder images)</td>
+    </tr>
+    <tr>
+      <td><strong>Conflict resolution</strong></td>
+      <td>N/A</td>
+      <td>Optional: <code>patchpal</code> + X11/Wayland; or just <code>vim</code></td>
+      <td>AI backend (see below)</td>
+    </tr>
+    <tr>
+      <td><strong>AI / cloud services</strong></td>
+      <td>None</td>
+      <td>None</td>
+      <td>Google Vertex AI (Claude) <em>or</em> local Ollama instance</td>
+    </tr>
+    <tr>
+      <td><strong>Python packages</strong></td>
+      <td>None</td>
+      <td>Standard library only</td>
+      <td>LangChain, LangGraph, Anthropic SDK, Pydantic, GitPython, and more (~12 packages)</td>
+    </tr>
+    <tr>
+      <td><strong>Other tools</strong></td>
+      <td>None</td>
+      <td>None</td>
+      <td><code>git-backport</code>, <code>podman</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>When to Use Each Tool</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Scenario</th>
+      <th>Recommended Tool</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Cherry-pick 1–2 known upstream commits</td>
+      <td><span class="tier-label tier-1">git-backport</span></td>
+      <td>Simple, fast, no setup. You already know exactly which commits you need.</td>
+    </tr>
+    <tr>
+      <td>Backport an entire subsystem across kernel versions</td>
+      <td><span class="tier-label tier-2">isb</span></td>
+      <td>Automates discovery of hundreds of commits, filters already-applied ones, handles the full loop with resume.</td>
+    </tr>
+    <tr>
+      <td>Backport with many complex conflicts and you want human control</td>
+      <td><span class="tier-label tier-2">isb</span></td>
+      <td>Interactive patchpal or editor lets you review each conflict. Build testing catches issues early.</td>
+    </tr>
+    <tr>
+      <td>Backport CVE fixes with AI assistance and you have cloud AI access</td>
+      <td><span class="tier-label tier-3">frankenpatch</span></td>
+      <td>AI agent can autonomously resolve conflicts and fix build errors. Best for teams with GCP/Vertex AI infrastructure.</td>
+    </tr>
+    <tr>
+      <td>Large-scale DRM subsystem backport (mega-patch workflow)</td>
+      <td><span class="tier-label tier-3">frankenpatch</span></td>
+      <td>Purpose-built DRM backport commands with AI-driven mega-patch conflict resolution.</td>
+    </tr>
+    <tr>
+      <td>Repeatable backports across point releases (10.1, 10.2, 10.3 ...)</td>
+      <td><span class="tier-label tier-2">isb</span></td>
+      <td>Session management remembers parameters. Output is organized by RHEL version. Reset and resume support iterative workflows.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Audience</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th></th>
+      <th>git-backport</th>
+      <th>isb</th>
+      <th>frankenpatch</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Target user</strong></td>
+      <td>Any kernel developer</td>
+      <td>Subsystem maintainers doing regular backports</td>
+      <td>Teams with AI/cloud infrastructure</td>
+    </tr>
+    <tr>
+      <td><strong>Learning curve</strong></td>
+      <td>Minimal — one command</td>
+      <td>Low — interactive menus guide the user</td>
+      <td>Moderate — requires AI provider setup</td>
+    </tr>
+    <tr>
+      <td><strong>Infrastructure needed</strong></td>
+      <td>Just a kernel tree</td>
+      <td>Kernel tree + toolbox</td>
+      <td>Kernel tree + Podman + GCP or Ollama</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Relationship Between Tools</h2>
+
+<p>
+  These three tools are complementary, not competing. They represent increasing
+  levels of automation for increasingly complex backport tasks:
+</p>
+
+<ul>
+  <li>A developer who needs to cherry-pick a single CVE fix uses <strong>git-backport</strong>.</li>
+  <li>A developer who outgrows single-commit picks because they maintain an entire
+      subsystem across RHEL versions graduates to <strong>isb</strong>.</li>
+  <li>A team with Google Cloud / Vertex AI infrastructure that wants fully autonomous
+      backporting uses <strong>frankenpatch</strong>.</li>
+</ul>
+
+<div class="summary-box">
+  <strong>Key insight:</strong> <code>isb</code> occupies the critical middle ground —
+  it automates the tedious parts (scope discovery, commit filtering, cherry-pick
+  looping, state management) while keeping the developer in control of the judgment
+  calls (conflict resolution, build fixes). <code>git-backport</code> leaves too much
+  to the developer; <code>frankenpatch</code> requires infrastructure most developers
+  don't have.
+</div>
+
+<h2>Links</h2>
+<ul>
+  <li><strong>git-backport:</strong> <a href="https://gitlab.com/redhat/centos-stream/src/kernel/utils/tools">gitlab.com/redhat/centos-stream/src/kernel/utils/tools</a></li>
+  <li><strong>isb:</strong> <a href="https://gitlab.cee.redhat.com/tcamuso/isb">gitlab.cee.redhat.com/tcamuso/isb</a></li>
+  <li><strong>frankenpatch:</strong> <a href="https://gitlab.com/redhat/rhel/sst/gpu-input-multimedia/drm-backport/frankenpatch">gitlab.com/redhat/rhel/.../frankenpatch</a></li>
+</ul>
+
+<div class="footer">
+  Document prepared by Tony Camuso &lt;tcamuso@redhat.com&gt; — July 2026 (updated July 28)
+</div>
+
+</body>
+</html>

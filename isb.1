@@ -1,5 +1,5 @@
 .\" Man page for isb
-.TH ISB 1 "June 2026" "isb" "User Commands"
+.TH ISB 1 "July 2026" "isb" "User Commands"
 .SH NAME
 isb \- Intelligent Subsystem Backport for RHEL kernels
 .SH SYNOPSIS
@@ -74,6 +74,30 @@ with
 or the interactive
 .B g
 key.
+.PP
+.PP
+Every long-running operation displays an animated spinner:
+cherry-picking, conflict resolution, scope indexing, and build
+testing.
+The build spinner shows whether the build is post-conflict or
+post-apply and which toolbox container is being used.
+.PP
+When the
+.B patchpal
+conflict policy is active and an in-scope conflict is found,
+.B isb
+displays a prominent notification banner directing the user to the
+patchpal window, then attempts to raise it to the foreground using
+.BR xdotool (1)
+or
+.BR wmctrl (1)
+(if available).
+.PP
+If
+.B isb
+detects that HEAD has been reset externally (e.g.\& by
+.BR "git reset" ),
+it discards stale resume state and starts fresh, warning the user.
 .PP
 A
 .B dist-configs
@@ -192,6 +216,14 @@ e.g.\&
 .TP
 .BR \-s ", " \-\-signed\-off\-by " " \fI"NAME <EMAIL>"\fR
 Signed-off-by trailer added to every commit message.
+If not provided on the command line and not saved in the session,
+.B isb
+auto-detects it from
+.BR "git config user.name" " and " "git config user.email" .
+If auto-detection fails, the user is prompted interactively.
+Also editable as field
+.B 9
+in the confirmation menu.
 .SS "Optional arguments"
 .TP
 .BI \-\-jira " URL"
@@ -347,12 +379,40 @@ and shown in dim italic when no display is detected.
 Press
 .B q
 to abort.
+.PP
+.B Scope paths
+are listed with uppercase letter keys
+.RB ( A ", " B ", " C ", ...);
+press a letter to edit that path (leave empty to remove it).
 Press
+.B +
+to add a new scope path.
+.PP
+.B Additional hotkeys
+in the confirmation menu:
+.TP
 .B r
-to reset the branch to an earlier backport commit; a numbered
-list of applied commits is shown for selection; commits that had
-conflicts are marked with a leading red
+Reset to an earlier backport commit; a numbered list of applied
+commits is shown for selection; commits that had conflicts are marked
+with a leading red
 .BR * .
+.TP
+.B p
+Regenerate patches with current session field values
+(same as
+.BR \-\-regen ).
+.TP
+.B x
+Single-step mode: apply only the next commit and stop
+(same as
+.BR \-\-step ).
+.TP
+.B h
+Display the man page.
+.TP
+.B N
+New session: walk through all parameters sequentially for editing.
+Also clears completion state and progress, allowing a full restart.
 .PP
 When editing a field, type a new value and press Enter.
 Press Enter on an empty line to keep the current value,
