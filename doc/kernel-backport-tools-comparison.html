@@ -99,7 +99,7 @@
   <strong>Summary:</strong> Three Red Hat kernel backport tools occupy distinct tiers of
   automation. <code>git-backport</code> is a single-commit formatting utility.
   <code>isb</code> (Intelligent Subsystem Backport) automates the full multi-commit
-  workflow with interactive conflict resolution.
+  workflow with partially autonomous conflict resolution.
   <code>frankenpatch</code> uses autonomous AI agents for fully hands-off backporting.
   Each serves a different use case and audience.
 </div>
@@ -124,8 +124,11 @@
   subsystem backport workflow while keeping the developer in control of judgment calls.
   It discovers scope paths, finds the divergence point between upstream and RHEL,
   classifies and filters commits, runs the cherry-pick loop with progress tracking and
-  resume capability, and provides interactive conflict resolution via
-  <code>patchpal</code> (GUI) or manual editing.
+  resume capability, and provides partially autonomous conflict resolution:
+  out-of-scope files, MAINTAINERS, delete/modify conflicts, duplicate struct/union/enum
+  definitions, and missing kernel API calls (e.g.&nbsp;<code>kzalloc_obj</code>) are all
+  resolved automatically. Only in-scope content conflicts — the actual merge decisions
+  — require human intervention, via <code>patchpal</code> (GUI) or manual editing.
 </p>
 <p><strong>Key features:</strong></p>
 <ul>
@@ -203,7 +206,11 @@
     <tr>
       <td><strong>Conflict resolution</strong></td>
       <td>None — developer resolves manually</td>
-      <td>Interactive — patchpal (GUI), editor (manual), or abort</td>
+      <td>Partially autonomous — out-of-scope files, MAINTAINERS,
+          delete/modify conflicts, duplicate definitions, and missing
+          API calls are resolved automatically. Only in-scope content
+          conflicts require human intervention via patchpal (GUI),
+          editor, or abort.</td>
       <td>Autonomous — AI agent resolves conflicts without human input</td>
     </tr>
     <tr>
