@@ -437,9 +437,9 @@ def parse_args():
                     help="Signed-off-by trailer (e.g. 'Name <email>')")
     p.add_argument("--assisted-by", default="",
                     help="Assisted-by trailer (e.g. 'Claude <no-reply@anthropic.com>')")
-    p.add_argument("--review", action="store_true", default=False,
-                    help="Review commit list after Phase 3 and exit for "
-                         "editing before cherry-picking")
+    p.add_argument("--step", action="store_true", default=False,
+                    help="Single-step mode: apply the next commit in the "
+                         "list and stop")
     p.add_argument("--divergence", default=None,
                     help="Upstream commit hash to use as divergence point "
                          "(skips auto-detection)")
@@ -488,7 +488,7 @@ REQUIRED_SESSION = [
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
-                  "command", "hash", "status", "regen", "review"}
+                  "command", "hash", "status", "regen", "step"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -572,8 +572,11 @@ def load_cached_results(session):
 
 
 def invalidate_cached_results(session):
-    """Remove cached results (called when a requisite field changes)."""
+    """Remove cached results and completion markers
+    (called when a requisite field changes)."""
     session.pop("_cached", None)
+    session.pop("_completed_head", None)
+    session.pop("_base_commit", None)
 
 
 def has_session_cli_args(args):
@@ -1092,8 +1095,9 @@ def show_confirmation_menu(params):
               f"{MNU}p{OFF}  Regen patches")
         print(f"  {MNU}r{OFF}  Reset to commit           "
               f"{MNU}h{OFF}  Help")
-        print(f"  {MNU}g{OFF}  Go / proceed              "
-              f"{MNU}q{OFF}  Quit")
+        print(f"  {MNU}x{OFF}  Single-step (one commit)  "
+              f"{MNU}g{OFF}  Go / proceed")
+        print(f"  {MNU}q{OFF}  Quit")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -1102,6 +1106,15 @@ def show_confirmation_menu(params):
 
         if ch == 'g':
             params["scope_paths"] = scope_paths
+            params["_step"] = False
+            _params_to_session(params)
+            _save()
+            print()
+            return
+
+        elif ch == 'x':
+            params["scope_paths"] = scope_paths
+            params["_step"] = True
             _params_to_session(params)
             _save()
             print()
@@ -1210,11 +1223,19 @@ def show_confirmation_menu(params):
             if sorted(scope_paths) != sorted(old_paths):
                 changed_requisite = True
             params["scope_paths"] = scope_paths
+            # New session always clears completion and progress state
+            _session.pop("_completed_head", None)
+            _session.pop("_base_commit", None)
             if changed_requisite:
                 invalidate_cached_results(_session)
+            out_dir = params.get("output_dir", "")
+            if out_dir:
+                sf = os.path.join(out_dir, ".backport-state.json")
+                if os.path.isfile(sf):
+                    os.remove(sf)
             _params_to_session(params)
             _save()
-            status("  Session updated.")
+            status("  Session reset.")
 
         elif ch == '+':
             val = input("  New scope path: ").strip()
@@ -3663,6 +3684,8 @@ def main():
     args.jira = params.get("jira", args.jira)
     args.upstream_version = params.get("upstream_version",
                                        args.upstream_version)
+    if params.get("_step"):
+        args.step = True
 
     _params_to_session(params)
     _save()
@@ -3732,7 +3755,14 @@ def main():
         )
 
         save_cached_results(_session, divergence, pending, keep, omit)
+        _session.pop("_completed_head", None)
         _save()
+
+        # Clear stale cherry-pick state from prior runs
+        state_file = os.path.join(output_dir, ".backport-state.json")
+        if os.path.isfile(state_file):
+            os.remove(state_file)
+            info("  Cleared stale state from previous run.")
 
     if args.dry_run:
         header("Dry run complete")
@@ -3749,27 +3779,16 @@ def main():
     omit_file = os.path.join(output_dir, "omit_commits.txt")
     _write_commit_list(keep_file, keep, omit_file, omit)
 
-    # Offer commit list review
-    do_review = args.review
-    if not do_review and not args.yes and args.command != "continue":
-        print(f"\n  {BLD}Review commit list before cherry-picking?{OFF}")
-        print(f"  {MNU}y{OFF}  Yes -- save list and exit for editing")
-        print(f"  {MNU}n{OFF}  No  -- proceed with cherry-picking")
-        print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
-        ch = _getch()
+    # Pause to let user review/edit commit lists in another terminal
+    if not args.yes and args.command != "continue":
+        print(f"\n  Commit lists written to:")
+        print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
+        print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
+        print(f"  Edit in another terminal to add, remove, or reorder.")
+        print(f"\n  {BLD}Press any key to continue, or Ctrl-C to exit{OFF} ",
+              end="", flush=True)
+        _getch()
         print()
-        do_review = ch in ('y', 'Y')
-
-    if do_review:
-        info(f"  Commit list written to:")
-        info(f"    {INF}{keep_file}{OFF}")
-        info(f"    {INF}{omit_file}{OFF}")
-        print(f"\n  Edit the files to add, remove, or reorder commits.")
-        print(f"  Lines starting with # are ignored.")
-        print(f"  Format: <40-char-hash> <subject>")
-        print(f"\n  When done, resume with:")
-        print(f"    {MNU}isb continue{OFF}    or    {MNU}isb{OFF} → {MNU}g{OFF}")
-        return
 
     # If resuming, reload the commit list (user may have edited it)
     if os.path.isfile(keep_file):
@@ -3813,9 +3832,18 @@ def main():
     start_idx = 0
     state = load_state(output_dir)
     if state and state.get("next_idx", 0) > 0:
-        start_idx = state["next_idx"]
-        base_commit = state.get("base_commit", base_commit)
-        status(f"Resuming from commit {start_idx + 1}/{len(keep)}")
+        saved_idx = state["next_idx"]
+        if saved_idx >= len(keep):
+            info(f"Previous run completed all {len(keep)} commits. "
+                 f"Starting fresh.")
+            save_state(output_dir, {
+                "next_idx": 0,
+                "base_commit": base_commit,
+            })
+        else:
+            start_idx = saved_idx
+            base_commit = state.get("base_commit", base_commit)
+            status(f"Resuming from commit {start_idx + 1}/{len(keep)}")
 
     _loop_output_dir = output_dir
     _loop_base_commit = base_commit
@@ -3876,6 +3904,19 @@ def main():
             "base_commit": base_commit,
         })
         status(f"  applied {'(with conflicts)' if notes else '(clean)'}")
+
+        if args.step:
+            remaining = len(keep) - (idx + 1)
+            if remaining > 0:
+                status(f"  Single-step: paused. "
+                       f"{remaining} commit(s) remaining.")
+                info(f"  Resume with: isb continue  or  isb --step")
+            else:
+                status(f"  Single-step: last commit applied.")
+            # Save cached results so resume works
+            save_cached_results(_session, divergence, pending, keep, omit)
+            _save()
+            return
 
     # -- Phase 5 --
     patch_count = generate_output(rhel_repo, output_dir, base_commit, omit)

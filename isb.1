@@ -62,6 +62,19 @@ Build failures also present an interactive menu allowing the user
 to fix failing files using their resolution strategy, skip the
 commit, or abort.
 .PP
+After commit classification (Phase\ 3), the KEEP and OMIT lists are
+written to editable files
+.RI ( keep_commits.txt ", " omit_commits.txt )
+in the output directory, and the script pauses so the user can review
+or edit the lists in another terminal before pressing any key to
+proceed.
+Press Ctrl-C to exit and edit in the current terminal; resume later
+with
+.B isb continue
+or the interactive
+.B g
+key.
+.PP
 A
 .B dist-configs
 build is run inside a toolbox container to validate kernel configs,
@@ -104,30 +117,19 @@ Commits that had conflicts are marked with a leading red
 .BR * .
 .SH OPTIONS
 .TP
-.B \-\-review
-After Phase\ 3 (commit classification), write the KEEP and OMIT commit
-lists to editable files in the output directory and exit.
-The user can then review, reorder, add, or remove commits using any
-editor.
-Lines starting with
-.B #
-are comments and are ignored.
-The format is one commit per line:
-.IR "<40-char-hash> <subject>" .
-Commits can be moved between
-.B keep_commits.txt
-and
-.B omit_commits.txt
-as desired.
-Resume with
+.B \-\-step
+Single-step mode: apply only the next commit in the list, resolve
+conflicts, build according to the build policy, then stop.
+The user can inspect the result and resume with
+.B isb \-\-step
+to apply the next commit, or
 .B isb continue
-or by running
-.B isb
-and pressing
-.BR g .
-When not running with
-.BR \-\-yes ,
-the script also offers this choice interactively after Phase\ 3.
+(or
+.BR g )
+to apply all remaining commits.
+Also available interactively via the
+.B x
+key in the confirmation menu.
 .TP
 .B \-\-regen
 Rewrite commit messages on the backport branch with the current session
