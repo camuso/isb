@@ -3865,16 +3865,36 @@ def main():
     state = load_state(output_dir)
     if state and state.get("next_idx", 0) > 0:
         saved_idx = state["next_idx"]
-        if saved_idx >= len(keep):
+        saved_base = state.get("base_commit", "")
+
+        # Detect external HEAD reset: the number of commits between
+        # saved base and current HEAD must be >= saved next_idx.
+        # If HEAD was reset, there will be fewer (or zero) commits.
+        stale = False
+        if saved_base:
+            r = git(f"rev-list --count {saved_base}..HEAD",
+                    cwd=rhel_repo, check=False)
+            commits_since_base = int(r.stdout.strip()) if r.returncode == 0 else 0
+            if commits_since_base < saved_idx:
+                stale = True
+                warn(f"HEAD has only {commits_since_base} commit(s) since "
+                     f"base ({saved_base[:12]}), but saved state expects "
+                     f"{saved_idx}. External reset detected — starting "
+                     f"fresh.")
+
+        if not stale and saved_idx >= len(keep):
             info(f"Previous run completed all {len(keep)} commits. "
                  f"Starting fresh.")
+            stale = True
+
+        if stale:
             save_state(output_dir, {
                 "next_idx": 0,
                 "base_commit": base_commit,
             })
         else:
             start_idx = saved_idx
-            base_commit = state.get("base_commit", base_commit)
+            base_commit = saved_base or base_commit
             status(f"Resuming from commit {start_idx + 1}/{len(keep)}")
 
     _loop_output_dir = output_dir
