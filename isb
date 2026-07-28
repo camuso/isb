@@ -2275,6 +2275,26 @@ def _resolve_inscope_edit(in_scope_conflicts, rhel_repo):
     return notes
 
 
+def _raise_patchpal_window():
+    """Try to raise the patchpal window to the foreground."""
+    for tool in ("xdotool", "wmctrl"):
+        if not shutil.which(tool):
+            continue
+        if tool == "xdotool":
+            subprocess.run(
+                "xdotool search --name patchpal windowactivate 2>/dev/null",
+                shell=True, timeout=3,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.run(
+                "wmctrl -a patchpal 2>/dev/null",
+                shell=True, timeout=3,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        return
+
+
 def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo):
     """Launch patchpal as git mergetool for in-scope conflicted files.
 
@@ -2282,7 +2302,18 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo):
     """
     notes = []
     for cf in in_scope_conflicts:
-        info(f"  Launching patchpal for {cf} ...")
+        print(f"\n{STA}{'=' * 74}{OFF}")
+        print(f"  {BLD}patchpal: resolve conflict in {cf}{OFF}")
+        print(f"  Switch to the patchpal window to resolve this conflict.")
+        print(f"  When done, save and close patchpal to continue.")
+        print(f"{STA}{'=' * 74}{OFF}\n")
+
+        def _delayed_raise():
+            time.sleep(1.5)
+            _raise_patchpal_window()
+        raiser = threading.Thread(target=_delayed_raise, daemon=True)
+        raiser.start()
+
         r = subprocess.run(
             "git "
             "-c mergetool.patchpal.cmd='patchpal -M \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"' "
