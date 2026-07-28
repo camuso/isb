@@ -220,6 +220,19 @@
       <td>Podman-based — AI agent iteratively fixes build errors</td>
     </tr>
     <tr>
+      <td><strong>Build error handling</strong></td>
+      <td>None — developer diagnoses and fixes manually</td>
+      <td>Interactive menu: <strong>skip</strong> the failing commit,
+          <strong>fix</strong> (auto-fix known API mismatches, or open
+          failing source files in the user's editor for manual correction,
+          then amend and rebuild), or <strong>abort</strong>.
+          Auto-fixes include replacing upstream-only APIs
+          (e.g.&nbsp;<code>kzalloc_obj</code>) with RHEL-compatible
+          equivalents.</td>
+      <td>Autonomous — AI agent analyzes compiler output and iteratively
+          edits source until the build passes</td>
+    </tr>
+    <tr>
       <td><strong>Commit formatting</strong></td>
       <td>RH metadata (JIRA, CVE, sign-off) via patch file</td>
       <td>Full RH Kernel Work Flow (gort-style) commit messages with Conflicts stanza</td>
