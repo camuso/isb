@@ -437,6 +437,9 @@ def parse_args():
                     help="Signed-off-by trailer (e.g. 'Name <email>')")
     p.add_argument("--assisted-by", default="",
                     help="Assisted-by trailer (e.g. 'Claude <no-reply@anthropic.com>')")
+    p.add_argument("--review", action="store_true", default=False,
+                    help="Review commit list after Phase 3 and exit for "
+                         "editing before cherry-picking")
     p.add_argument("--divergence", default=None,
                     help="Upstream commit hash to use as divergence point "
                          "(skips auto-detection)")
@@ -485,7 +488,7 @@ REQUIRED_SESSION = [
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
-                  "command", "hash", "status", "regen"}
+                  "command", "hash", "status", "regen", "review"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -2989,6 +2992,46 @@ def load_state(output_dir):
     return None
 
 
+def _write_commit_list(keep_path, keep, omit_path, omit):
+    """Write editable commit list files in git-log --oneline format."""
+    with open(keep_path, "w") as fh:
+        fh.write("# isb commit list -- commits to cherry-pick (oldest first)\n")
+        fh.write("# Edit this file to add, remove, or reorder commits.\n")
+        fh.write("# Lines starting with # are comments and will be ignored.\n")
+        fh.write("# Format: <40-char-hash> <subject line>\n")
+        fh.write("#\n")
+        for h, subj, reason in keep:
+            fh.write(f"{h} {subj}\n")
+    with open(omit_path, "w") as fh:
+        fh.write("# isb omit list -- commits excluded from cherry-pick\n")
+        fh.write("# Move lines from here to keep_commits.txt to include them.\n")
+        fh.write("#\n")
+        for h, subj, reason in omit:
+            fh.write(f"{h} {subj} | {reason}\n")
+
+
+def _read_commit_list(path):
+    """Read an edited commit list file.  Returns list of (hash, subject)
+    or None if the file doesn't exist."""
+    if not os.path.isfile(path):
+        return None
+    result = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            commit_hash = parts[0]
+            subject = parts[1]
+            if len(commit_hash) < 12:
+                continue
+            result.append((commit_hash, subject))
+    return result
+
+
 def show_status(rhel_repo):
     """Display backport progress from saved session and state, then exit."""
     session = load_session(rhel_repo)
@@ -3699,14 +3742,46 @@ def main():
             print(f"  {WRN}OMIT{OFF} {h[:12]} {subj}  ({reason})")
         return
 
-    # Save classification lists
+    # Write editable commit list
     os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "keep_commits.txt"), "w") as fh:
-        for h, subj, reason in keep:
-            fh.write(f"{h} {subj}\n")
-    with open(os.path.join(output_dir, "omit_commits.txt"), "w") as fh:
-        for h, subj, reason in omit:
-            fh.write(f"{h} {subj} | {reason}\n")
+    keep_file = os.path.join(output_dir, "keep_commits.txt")
+    omit_file = os.path.join(output_dir, "omit_commits.txt")
+    _write_commit_list(keep_file, keep, omit_file, omit)
+
+    # Offer commit list review
+    do_review = args.review
+    if not do_review and not args.yes and args.command != "continue":
+        print(f"\n  {BLD}Review commit list before cherry-picking?{OFF}")
+        print(f"  {MNU}y{OFF}  Yes -- save list and exit for editing")
+        print(f"  {MNU}n{OFF}  No  -- proceed with cherry-picking")
+        print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+        ch = _getch()
+        print()
+        do_review = ch in ('y', 'Y')
+
+    if do_review:
+        info(f"  Commit list written to:")
+        info(f"    {INF}{keep_file}{OFF}")
+        info(f"    {INF}{omit_file}{OFF}")
+        print(f"\n  Edit the files to add, remove, or reorder commits.")
+        print(f"  Lines starting with # are ignored.")
+        print(f"  Format: <40-char-hash> <subject>")
+        print(f"\n  When done, resume with:")
+        print(f"    {MNU}isb continue{OFF}    or    {MNU}isb{OFF} → {MNU}g{OFF}")
+        return
+
+    # If resuming, reload the commit list (user may have edited it)
+    if os.path.isfile(keep_file):
+        edited_keep = _read_commit_list(keep_file)
+        if edited_keep is not None:
+            orig_hashes = [h for h, _, _ in keep]
+            edit_hashes = [h for h, _ in edited_keep]
+            if edit_hashes != orig_hashes:
+                info(f"  Commit list was edited: {len(edited_keep)} commits "
+                     f"(was {len(keep)})")
+                keep = [(h, s, "user-selected") for h, s in edited_keep]
+                save_cached_results(_session, divergence, pending, keep, omit)
+                _save()
 
     # -- Phase 4: cherry-pick loop --
     header("Phase 4: Cherry-picking")

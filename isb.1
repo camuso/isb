@@ -104,6 +104,31 @@ Commits that had conflicts are marked with a leading red
 .BR * .
 .SH OPTIONS
 .TP
+.B \-\-review
+After Phase\ 3 (commit classification), write the KEEP and OMIT commit
+lists to editable files in the output directory and exit.
+The user can then review, reorder, add, or remove commits using any
+editor.
+Lines starting with
+.B #
+are comments and are ignored.
+The format is one commit per line:
+.IR "<40-char-hash> <subject>" .
+Commits can be moved between
+.B keep_commits.txt
+and
+.B omit_commits.txt
+as desired.
+Resume with
+.B isb continue
+or by running
+.B isb
+and pressing
+.BR g .
+When not running with
+.BR \-\-yes ,
+the script also offers this choice interactively after Phase\ 3.
+.TP
 .B \-\-regen
 Rewrite commit messages on the backport branch with the current session
 values for JIRA, Upstream status, Signed-off-by, and Assisted-by, then
