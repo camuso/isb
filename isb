@@ -2828,51 +2828,54 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 "       The commit object may not be reachable from "
                 "the RHEL repo.")
 
+    # -- Conflict resolution and scope filtering --
     conflict_notes = []
     oos_conflict_count = 0
     if had_conflict:
-        conflict_notes, oos_conflict_count = resolve_conflicts(
-            rhel_repo, scope_paths, conflict_policy, rhel_ver,
-            commit_hash=commit_hash, upstream_repo=upstream_repo,
-        )
-
-    removed = scope_index(rhel_repo, scope_paths)
-    total_oos = len(removed) + oos_conflict_count
-    if total_oos:
-        is_treewide = bool(re.search(r'tree[\s-]?wide', subject, re.I))
-        if is_treewide:
-            conflict_notes.append(
-                f"treewide commit scoped to {subsystem}; "
-                f"{total_oos} out-of-scope file(s) excluded"
-            )
-        else:
-            conflict_notes.append(
-                f"{total_oos} out-of-scope file(s) excluded"
+        with Spinner("Resolving conflicts ..."):
+            conflict_notes, oos_conflict_count = resolve_conflicts(
+                rhel_repo, scope_paths, conflict_policy, rhel_ver,
+                commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
 
-    # Annotate in-scope new files (not present in HEAD before this commit)
-    r = git("diff --cached --name-only --diff-filter=A", cwd=rhel_repo,
-            check=False)
-    new_files = [f for f in r.stdout.strip().split("\n") if f]
-    for nf in new_files:
-        conflict_notes.append(f"{nf}: new upstream file, included")
+    with Spinner("Scoping and indexing ..."):
+        removed = scope_index(rhel_repo, scope_paths)
+        total_oos = len(removed) + oos_conflict_count
+        if total_oos:
+            is_treewide = bool(re.search(r'tree[\s-]?wide', subject, re.I))
+            if is_treewide:
+                conflict_notes.append(
+                    f"treewide commit scoped to {subsystem}; "
+                    f"{total_oos} out-of-scope file(s) excluded"
+                )
+            else:
+                conflict_notes.append(
+                    f"{total_oos} out-of-scope file(s) excluded"
+                )
 
-    # Annotate in-scope deleted files
-    r = git("diff --cached --name-only --diff-filter=D", cwd=rhel_repo,
-            check=False)
-    del_files = [f for f in r.stdout.strip().split("\n") if f]
-    if del_files:
-        n = len(del_files)
-        conflict_notes.append(
-            f"{n} in-scope file(s) removed per upstream"
-        )
+        # Annotate in-scope new files
+        r = git("diff --cached --name-only --diff-filter=A", cwd=rhel_repo,
+                check=False)
+        new_files = [f for f in r.stdout.strip().split("\n") if f]
+        for nf in new_files:
+            conflict_notes.append(f"{nf}: new upstream file, included")
 
-    dup_fixes = check_duplicate_definitions(rhel_repo)
-    for hdr, kind, name, kept, _ in dup_fixes:
-        conflict_notes.append(
-            f"{hdr}: removed duplicate {kind} {name} "
-            f"definition (artifact of conflict resolution)"
-        )
+        # Annotate in-scope deleted files
+        r = git("diff --cached --name-only --diff-filter=D", cwd=rhel_repo,
+                check=False)
+        del_files = [f for f in r.stdout.strip().split("\n") if f]
+        if del_files:
+            n = len(del_files)
+            conflict_notes.append(
+                f"{n} in-scope file(s) removed per upstream"
+            )
+
+        dup_fixes = check_duplicate_definitions(rhel_repo)
+        for hdr, kind, name, kept, _ in dup_fixes:
+            conflict_notes.append(
+                f"{hdr}: removed duplicate {kind} {name} "
+                f"definition (artifact of conflict resolution)"
+            )
 
     should_build = (
         (build_policy == "every") or
