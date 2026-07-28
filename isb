@@ -2810,9 +2810,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     global _cherrypick_repo
     _cherrypick_repo = rhel_repo
 
-    rc, _, err = run_quiet(
-        f"git cherry-pick --no-commit {commit_hash}", cwd=rhel_repo,
-    )
+    with Spinner(f"Cherry-picking {commit_hash[:12]} ..."):
+        rc, _, err = run_quiet(
+            f"git cherry-pick --no-commit {commit_hash}", cwd=rhel_repo,
+        )
     had_conflict = rc != 0
 
     if had_conflict:
