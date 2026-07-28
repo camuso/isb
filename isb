@@ -599,7 +599,8 @@ def _getch():
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     if ch == '\x03':
-        raise KeyboardInterrupt
+        print()
+        _cleanup_and_exit()
     return ch
 
 
@@ -3904,4 +3905,7 @@ def main():
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _cleanup_and_exit)
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        _cleanup_and_exit()
