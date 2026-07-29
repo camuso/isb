@@ -199,9 +199,11 @@
     </tr>
     <tr>
       <td><strong>Commit discovery</strong></td>
-      <td>Manual — developer identifies commits</td>
-      <td>Automatic — scope-path discovery, divergence detection, commit classification</td>
-      <td>Manual — developer provides commit list</td>
+      <td>Manual — developer identifies each commit hash</td>
+      <td>Automatic — discovers scope paths, finds the divergence point,
+          enumerates and classifies all upstream commits in range</td>
+      <td>Manual — developer supplies commit hash(es) via CLI arguments
+          (<code>--commit</code>) or a commit list for mega-patch workflows</td>
     </tr>
     <tr>
       <td><strong>Already-applied filtering</strong></td>
