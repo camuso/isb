@@ -59,6 +59,51 @@ def _has_display():
                 os.environ.get("WAYLAND_DISPLAY"))
 
 
+# ---------------------------------------------------------------------------
+# API replacement rules -- loaded from JSON config files
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_USER_CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "isb",
+)
+
+def _load_api_config():
+    """Load API replacement rules from the repo baseline and optional user
+    override.  Returns (filter_symbols, replacements) where replacements
+    is a dict mapping symbol -> (replacement_template, regex_pattern)."""
+    baseline_path = os.path.join(_SCRIPT_DIR, "api-replacements.json")
+    user_path = os.path.join(_USER_CONFIG_DIR, "api-replacements.json")
+
+    filter_symbols = []
+    replacements = {}
+
+    for path in (baseline_path, user_path):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"{WRN}WARNING:{OFF} Failed to load {path}: {exc}",
+                  file=sys.stderr)
+            continue
+
+        if "filter_symbols" in data:
+            for sym in data["filter_symbols"]:
+                if sym not in filter_symbols:
+                    filter_symbols.append(sym)
+
+        if "replacements" in data:
+            for sym, (tpl, pat) in data["replacements"].items():
+                replacements[sym] = (tpl, pat)
+
+    return filter_symbols, replacements
+
+MISSING_API_SYMBOLS, API_REPLACEMENTS = _load_api_config()
+
+# ---------------------------------------------------------------------------
+
 def _check_and_install_deps():
     """Check for required and optional dependencies, offering to install."""
     # -- Python version --
@@ -1785,10 +1830,7 @@ def yaml_to_config(filepath, upstream_repo, config_map):
     return None
 
 
-MISSING_API_SYMBOLS = [
-    "kmalloc_obj", "kzalloc_obj", "kcalloc_obj", "krealloc_obj",
-    "alloc_obj", "alloc_flex",
-]
+# MISSING_API_SYMBOLS is loaded from api-replacements.json at startup.
 
 _missing_api_cache = {}
 
@@ -2573,16 +2615,7 @@ def _extract_failing_files(build_output):
     return sorted(files)
 
 
-API_REPLACEMENTS = {
-    "kzalloc_obj": ("kzalloc(sizeof({arg}), GFP_KERNEL)",
-                     r"kzalloc_obj\(([^)]+)\)"),
-    "kmalloc_obj": ("kmalloc(sizeof({arg}), GFP_KERNEL)",
-                     r"kmalloc_obj\(([^)]+)\)"),
-    "kcalloc_obj": ("kzalloc(sizeof({arg}), GFP_KERNEL)",
-                     r"kcalloc_obj\(([^)]+)\)"),
-    "krealloc_obj": ("krealloc({arg}, sizeof(*({arg})), GFP_KERNEL)",
-                      r"krealloc_obj\(([^)]+)\)"),
-}
+# API_REPLACEMENTS is loaded from api-replacements.json at startup.
 
 
 def try_fix_missing_api(build_output, rhel_repo):

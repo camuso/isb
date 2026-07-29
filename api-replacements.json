@@ -1,0 +1,21 @@
+{
+    "_comment": "Upstream-to-RHEL API replacement rules for isb build-time auto-fix.",
+    "_format": "Each key is the upstream symbol name. Value is [replacement_template, regex_pattern].",
+    "_template": "Use {arg} as placeholder for the captured argument in the replacement.",
+
+    "filter_symbols": [
+        "kmalloc_obj", "kzalloc_obj", "kcalloc_obj", "krealloc_obj",
+        "alloc_obj", "alloc_flex"
+    ],
+
+    "replacements": {
+        "kzalloc_obj": ["kzalloc(sizeof({arg}), GFP_KERNEL)",
+                        "kzalloc_obj\\(([^)]+)\\)"],
+        "kmalloc_obj": ["kmalloc(sizeof({arg}), GFP_KERNEL)",
+                        "kmalloc_obj\\(([^)]+)\\)"],
+        "kcalloc_obj": ["kzalloc(sizeof({arg}), GFP_KERNEL)",
+                        "kcalloc_obj\\(([^)]+)\\)"],
+        "krealloc_obj": ["krealloc({arg}, sizeof(*({arg})), GFP_KERNEL)",
+                         "krealloc_obj\\(([^)]+)\\)"]
+    }
+}
