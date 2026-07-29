@@ -25,6 +25,12 @@ RHEL-compliant commit messages suitable for merge requests.
   conflicts (configurable: after every commit, or never).
 - **Tree-wide commit handling** — out-of-scope files touched by tree-wide
   commits are automatically excluded.
+- **Extensible API replacement rules** — upstream-to-RHEL API mappings
+  (e.g. `kzalloc_obj` → `kzalloc(sizeof(...), GFP_KERNEL)`) are used to
+  filter commits during classification and auto-fix build errors. Rules
+  are loaded from `api-replacements.json` shipped with `isb`; users can
+  add their own in `~/.config/isb/api-replacements.json` without editing
+  the tool.
 - **Session persistence** — parameters are saved to `.backport/session.json`
   and reused across runs with an interactive single-keypress menu.
 - **Resumable** — interrupted runs save progress and resume automatically

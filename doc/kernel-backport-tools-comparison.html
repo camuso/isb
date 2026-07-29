@@ -157,6 +157,12 @@
       position.</li>
   <li><strong>Git alternates:</strong> Uses git alternates for zero-copy, instant
       access to upstream commit objects from a local upstream repository.</li>
+  <li><strong>Extensible API replacement rules:</strong> Upstream-to-RHEL API
+      mappings (e.g.&nbsp;<code>kzalloc_obj</code> &rarr;
+      <code>kzalloc(sizeof(...), GFP_KERNEL)</code>) are stored in an external
+      JSON config file shipped with <code>isb</code>. Users can add their own
+      rules in <code>~/.config/isb/api-replacements.json</code> without
+      modifying the tool itself.</li>
 </ul>
 <p><strong>Typical usage:</strong></p>
 <p><code>cd ~/kernels/centos-10 &amp;&amp; isb</code></p>
@@ -228,7 +234,9 @@
           then amend and rebuild), or <strong>abort</strong>.
           Auto-fixes include replacing upstream-only APIs
           (e.g.&nbsp;<code>kzalloc_obj</code>) with RHEL-compatible
-          equivalents.</td>
+          equivalents. Replacement rules are loaded from an extensible
+          JSON config file; users can add new mappings in
+          <code>~/.config/isb/api-replacements.json</code>.</td>
       <td>Autonomous — AI agent analyzes compiler output and iteratively
           edits source until the build passes</td>
     </tr>
