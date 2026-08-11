@@ -3574,15 +3574,17 @@ def main():
 
     if not target_branch:
         # No valid saved branch -- prompt user to select or create one
-        branches = git("for-each-ref --format=%(refname:short) refs/heads/",
-                       cwd=rhel_repo, check=False).stdout.strip().split("\n")
-        branches = [b.strip() for b in branches if b.strip()]
+        raw = git("for-each-ref --format=%(refname:short) refs/heads/",
+                  cwd=rhel_repo, check=False).stdout.strip()
+        branches = [b.strip() for b in raw.split("\n") if b.strip()]
+        if not branches:
+            branches = [current_branch]
 
         if len(branches) == 1:
             # Only one branch -- offer to create a new one
             print(f"\n{MNU}    Branch selection{OFF}")
             print(f"    {'─' * 50}")
-            print(f"  Only branch: {INF}{branches[0]}{OFF}")
+            print(f"  1 branch found: {INF}{branches[0]}{OFF}")
             print(f"  {MNU}n{OFF}  Create new branch from '{branches[0]}'")
             print(f"  {MNU}Enter{OFF}  Work on '{branches[0]}'")
             print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
