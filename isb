@@ -501,7 +501,7 @@ def parse_args():
     p.add_argument("--status", action="store_true",
                     help=argparse.SUPPRESS)
 
-    # Subcommands: continue, status, pick, reset, regen
+    # Subcommands: continue, status, pick, reset, new
     sub = p.add_subparsers(dest="command")
     sub.add_parser("continue", help="Resume from saved state")
     sub.add_parser("status", help="Show backport progress and exit")
@@ -511,6 +511,7 @@ def parse_args():
     reset_p = sub.add_parser("reset",
                              help="Reset backport to an earlier commit")
     reset_p.add_argument("hash", help="Commit hash to reset to")
+    sub.add_parser("new", help="Clear all session data and start fresh")
     p.add_argument("--regen", action="store_true",
                    help="Rewrite commit messages with current session "
                         "fields and regenerate patches")
@@ -3465,6 +3466,44 @@ def main():
 
     if args.command == "status":
         show_status(rhel_repo)
+        return
+
+    if args.command == "new":
+        # Clear all persistent session data
+        session_path = _session_path(rhel_repo)
+        stamp_path = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
+        removed = []
+        if os.path.isfile(session_path):
+            os.remove(session_path)
+            removed.append(session_path)
+        if os.path.isfile(stamp_path):
+            os.remove(stamp_path)
+            removed.append(stamp_path)
+        # Clear backport-state.json from the output dir if known
+        out_dir = _session.get("output_dir")
+        if not out_dir:
+            sub = _session.get("subsystem")
+            rhel_ver = _session.get("rhel")
+            if sub and rhel_ver:
+                out_dir = os.path.join(
+                    os.path.dirname(rhel_repo), "backports",
+                    str(rhel_ver),
+                    os.path.basename(sub.rstrip("/")),
+                )
+        if out_dir:
+            state_file = os.path.join(out_dir, ".backport-state.json")
+            if os.path.isfile(state_file):
+                os.remove(state_file)
+                removed.append(state_file)
+        # Reset in-memory session
+        _session.clear()
+        if removed:
+            status("Cleared session data:")
+            for f in removed:
+                info(f"  {f}")
+        else:
+            info("No session data found.")
+        status("Next invocation will start a fresh session.")
         return
 
     if args.command == "reset":

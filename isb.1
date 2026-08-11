@@ -139,6 +139,17 @@ key in the confirmation menu, which presents a numbered list of
 applied commits.
 Commits that had conflicts are marked with a leading red
 .BR * .
+.TP
+.B new
+Clear all persistent session data and exit.
+Removes
+.IR .backport/session.json ,
+the dist-configs cache stamp, and any
+.I .backport\-state.json
+in the output directory.
+The next invocation of
+.B isb
+will start a completely fresh session, prompting for all parameters.
 .SH OPTIONS
 .TP
 .B \-\-step
