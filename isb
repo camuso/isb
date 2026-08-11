@@ -3540,34 +3540,37 @@ def main():
         current_branch = git("rev-parse --abbrev-ref HEAD",
                              cwd=rhel_repo, check=False).stdout.strip()
         if current_branch != target_branch:
-            warn(f"Current branch is '{current_branch}', but session "
-                 f"working branch is '{target_branch}'.")
-            print(f"  {MNU}s{OFF}  Switch to '{target_branch}'   "
-                  f"{MNU}c{OFF}  Continue on '{current_branch}'   "
-                  f"{MNU}q{OFF}  Quit")
-            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
-            while True:
-                ch = _getch()
-                if ch in ('s', 'S'):
-                    print("switch")
-                    rc, _, _ = run_quiet(
-                        f"git rev-parse --verify refs/heads/{target_branch}",
-                        cwd=rhel_repo,
-                    )
-                    if rc != 0:
-                        info(f"  Branch '{target_branch}' does not "
-                             f"exist yet; it will be created in "
-                             f"Phase 4.")
-                    else:
+            # Check if target branch actually exists before prompting
+            rc, _, _ = run_quiet(
+                f"git rev-parse --verify refs/heads/{target_branch}",
+                cwd=rhel_repo,
+            )
+            if rc != 0:
+                info(f"Saved branch '{target_branch}' no longer exists; "
+                     f"clearing from session.")
+                _session.pop("branch", None)
+                _session.pop("_last_branch", None)
+                _save()
+            else:
+                warn(f"Current branch is '{current_branch}', but session "
+                     f"working branch is '{target_branch}'.")
+                print(f"  {MNU}s{OFF}  Switch to '{target_branch}'   "
+                      f"{MNU}c{OFF}  Continue on '{current_branch}'   "
+                      f"{MNU}q{OFF}  Quit")
+                print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+                while True:
+                    ch = _getch()
+                    if ch in ('s', 'S'):
+                        print("switch")
                         git(f"checkout {target_branch}", cwd=rhel_repo)
                         status(f"  Switched to '{target_branch}'.")
-                    break
-                elif ch in ('c', 'C'):
-                    print("continue")
-                    break
-                elif ch in ('q', 'Q', '\x03'):
-                    print("quit")
-                    sys.exit(0)
+                        break
+                    elif ch in ('c', 'C'):
+                        print("continue")
+                        break
+                    elif ch in ('q', 'Q', '\x03'):
+                        print("quit")
+                        sys.exit(0)
 
     if has_session_cli_args(args):
         _session = merge_cli_into_session(args, _session)
