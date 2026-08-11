@@ -250,6 +250,38 @@ path (e.g.\&
 .I drivers/char/ipmi
 produces branch
 .IR ipmi ).
+.PP
+When running interactively with no saved branch (or when a previously
+saved branch no longer exists),
+.B isb
+presents a branch selection menu:
+.RS
+.IP \(bu 2
+If the repo has a single branch, the user may press
+.B n
+to create a new branch or press
+.B Enter
+to work on the current branch.
+.IP \(bu 2
+If 2\(en9 branches exist, they are listed with single\-keypress
+selection (1\(en9), plus
+.B n
+to create a new branch or
+.B Enter
+to stay on the current branch.
+.IP \(bu 2
+If 10 or more branches exist, the user is prompted to type a
+branch name, enter
+.B n
+to create a new branch, or press
+.B Enter
+to stay on the current branch.
+.RE
+.PP
+Pressing
+.B Enter
+without input warns that all work will be performed on
+the current branch.
 .TP
 .BI \-\-output\-dir " DIR"
 Output directory for patches, reports, and saved state.

@@ -3530,47 +3530,168 @@ def main():
         )
         return
 
-    # -- Branch drift check --
-    # Compare against the target working branch, not the metadata branch.
+    # -- Branch selection / drift check --
     target_branch = _session.get("branch")
     if not target_branch and _session.get("subsystem"):
         target_branch = os.path.basename(
             _session["subsystem"].rstrip("/"))
+    current_branch = git("rev-parse --abbrev-ref HEAD",
+                         cwd=rhel_repo, check=False).stdout.strip()
+
     if target_branch:
-        current_branch = git("rev-parse --abbrev-ref HEAD",
-                             cwd=rhel_repo, check=False).stdout.strip()
-        if current_branch != target_branch:
-            # Check if target branch actually exists before prompting
-            rc, _, _ = run_quiet(
-                f"git rev-parse --verify refs/heads/{target_branch}",
-                cwd=rhel_repo,
-            )
-            if rc != 0:
-                info(f"Saved branch '{target_branch}' no longer exists; "
-                     f"clearing from session.")
-                _session.pop("branch", None)
-                _session.pop("_last_branch", None)
+        # Saved branch exists in session -- check if it's still a valid ref
+        rc, _, _ = run_quiet(
+            f"git rev-parse --verify refs/heads/{target_branch}",
+            cwd=rhel_repo,
+        )
+        if rc != 0:
+            # Branch was deleted -- fall through to branch selection
+            info(f"Saved branch '{target_branch}' no longer exists.")
+            _session.pop("branch", None)
+            _session.pop("_last_branch", None)
+            _save()
+            target_branch = None
+        elif current_branch != target_branch:
+            warn(f"Current branch is '{current_branch}', but session "
+                 f"working branch is '{target_branch}'.")
+            print(f"  {MNU}s{OFF}  Switch to '{target_branch}'   "
+                  f"{MNU}c{OFF}  Continue on '{current_branch}'   "
+                  f"{MNU}q{OFF}  Quit")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            while True:
+                ch = _getch()
+                if ch in ('s', 'S'):
+                    print("switch")
+                    git(f"checkout {target_branch}", cwd=rhel_repo)
+                    status(f"  Switched to '{target_branch}'.")
+                    break
+                elif ch in ('c', 'C'):
+                    print("continue")
+                    break
+                elif ch in ('q', 'Q', '\x03'):
+                    print("quit")
+                    sys.exit(0)
+
+    if not target_branch:
+        # No valid saved branch -- prompt user to select or create one
+        branches = git("for-each-ref --format=%(refname:short) refs/heads/",
+                       cwd=rhel_repo, check=False).stdout.strip().split("\n")
+        branches = [b.strip() for b in branches if b.strip()]
+
+        if len(branches) == 1:
+            # Only one branch -- offer to create a new one
+            print(f"\n{MNU}    Branch selection{OFF}")
+            print(f"    {'─' * 50}")
+            print(f"  Only branch: {INF}{branches[0]}{OFF}")
+            print(f"  {MNU}n{OFF}  Create new branch from '{branches[0]}'")
+            print(f"  {MNU}Enter{OFF}  Work on '{branches[0]}'")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            ch = _getch()
+            if ch in ('n', 'N'):
+                print("new")
+                name = input(f"  New branch name: ").strip()
+                if name:
+                    git(f"checkout -b {name}", cwd=rhel_repo)
+                    status(f"  Created and switched to '{name}'.")
+                    _session["branch"] = name
+                    _save()
+                else:
+                    warn(f"No name entered. Working on '{branches[0]}'.")
+                    _session["branch"] = branches[0]
+                    _save()
+            else:
+                print()
+                warn(f"All work will be on current branch "
+                     f"'{branches[0]}'.")
+                _session["branch"] = branches[0]
+                _save()
+        elif 2 <= len(branches) <= 9:
+            # Multiple branches, few enough for single-keypress selection
+            print(f"\n{MNU}    Branch selection{OFF}")
+            print(f"    {'─' * 50}")
+            for i, b in enumerate(branches):
+                marker = f" {STA}(current){OFF}" if b == current_branch else ""
+                print(f"  {MNU}{i + 1}{OFF}  {b}{marker}")
+            print(f"  {MNU}n{OFF}  Create new branch from '{current_branch}'")
+            print(f"  {MNU}Enter{OFF}  Work on '{current_branch}'")
+            print(f"    {'─' * 50}")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            while True:
+                ch = _getch()
+                if ch in ('n', 'N'):
+                    print("new")
+                    name = input(f"  New branch name: ").strip()
+                    if name:
+                        git(f"checkout -b {name}", cwd=rhel_repo)
+                        status(f"  Created and switched to '{name}'.")
+                        _session["branch"] = name
+                        _save()
+                    else:
+                        warn(f"No name entered. Working on "
+                             f"'{current_branch}'.")
+                        _session["branch"] = current_branch
+                        _save()
+                    break
+                elif ch == '\r' or ch == '\n':
+                    print()
+                    warn(f"All work will be on current branch "
+                         f"'{current_branch}'.")
+                    _session["branch"] = current_branch
+                    _save()
+                    break
+                elif ch in ('q', 'Q', '\x03'):
+                    print("quit")
+                    sys.exit(0)
+                elif ch.isdigit() and 1 <= int(ch) <= len(branches):
+                    idx = int(ch) - 1
+                    chosen = branches[idx]
+                    print(chosen)
+                    if chosen != current_branch:
+                        git(f"checkout {chosen}", cwd=rhel_repo)
+                        status(f"  Switched to '{chosen}'.")
+                    else:
+                        info(f"  Already on '{chosen}'.")
+                    _session["branch"] = chosen
+                    _save()
+                    break
+        else:
+            # 10+ branches -- too many for single-keypress, prompt for name
+            print(f"\n{MNU}    Branch selection{OFF}")
+            print(f"    {'─' * 50}")
+            info(f"  {len(branches)} branches found. Current: "
+                 f"{INF}{current_branch}{OFF}")
+            print(f"  Enter branch name, or 'n' to create a new one.")
+            print(f"  Press Enter to stay on '{current_branch}'.")
+            print(f"    {'─' * 50}")
+            raw = input(f"  {BLD}Branch:{OFF} ").strip()
+            if not raw:
+                warn(f"All work will be on current branch "
+                     f"'{current_branch}'.")
+                _session["branch"] = current_branch
+                _save()
+            elif raw.lower() == 'n':
+                name = input(f"  New branch name: ").strip()
+                if name:
+                    git(f"checkout -b {name}", cwd=rhel_repo)
+                    status(f"  Created and switched to '{name}'.")
+                    _session["branch"] = name
+                    _save()
+                else:
+                    warn(f"No name entered. Working on "
+                         f"'{current_branch}'.")
+                    _session["branch"] = current_branch
+                    _save()
+            elif raw in branches:
+                if raw != current_branch:
+                    git(f"checkout {raw}", cwd=rhel_repo)
+                    status(f"  Switched to '{raw}'.")
+                _session["branch"] = raw
                 _save()
             else:
-                warn(f"Current branch is '{current_branch}', but session "
-                     f"working branch is '{target_branch}'.")
-                print(f"  {MNU}s{OFF}  Switch to '{target_branch}'   "
-                      f"{MNU}c{OFF}  Continue on '{current_branch}'   "
-                      f"{MNU}q{OFF}  Quit")
-                print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
-                while True:
-                    ch = _getch()
-                    if ch in ('s', 'S'):
-                        print("switch")
-                        git(f"checkout {target_branch}", cwd=rhel_repo)
-                        status(f"  Switched to '{target_branch}'.")
-                        break
-                    elif ch in ('c', 'C'):
-                        print("continue")
-                        break
-                    elif ch in ('q', 'Q', '\x03'):
-                        print("quit")
-                        sys.exit(0)
+                warn(f"Branch '{raw}' not found. Working on "
+                     f"'{current_branch}'.")
+                _session["branch"] = current_branch
+                _save()
 
     if has_session_cli_args(args):
         _session = merge_cli_into_session(args, _session)
