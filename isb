@@ -3785,7 +3785,9 @@ def main():
     if not os.path.isdir(os.path.join(upstream_repo, ".git")):
         die(f"Not a git repo: {upstream_repo}")
 
-    branch = args.branch or os.path.basename(args.subsystem.rstrip("/"))
+    branch = (args.branch
+              or _session.get("branch")
+              or os.path.basename(args.subsystem.rstrip("/")))
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(rhel_repo), "backports",
         str(args.rhel),
