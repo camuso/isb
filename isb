@@ -95,8 +95,13 @@ def _load_api_config():
                     filter_symbols.append(sym)
 
         if "replacements" in data:
-            for sym, (tpl, pat) in data["replacements"].items():
-                replacements[sym] = (tpl, pat)
+            for sym, val in data["replacements"].items():
+                if isinstance(val, (list, tuple)) and len(val) == 2:
+                    replacements[sym] = (val[0], val[1])
+                else:
+                    print(f"{WRN}WARNING:{OFF} Skipping malformed "
+                          f"replacement entry '{sym}' in {path}",
+                          file=sys.stderr)
 
     return filter_symbols, replacements
 
@@ -554,8 +559,12 @@ def load_session(repo_root):
     path = _session_path(repo_root)
     if not os.path.isfile(path):
         return {}
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        warn(f"Corrupted session file {path} — starting fresh.")
+        return {}
 
 
 def save_session(repo_root, session):
@@ -609,12 +618,15 @@ def load_cached_results(session):
         return None
     if cached.get("fingerprint") != _requisite_fingerprint(session):
         return None
-    return (
-        cached["divergence"],
-        cached["pending"],
-        [tuple(x) for x in cached["keep"]],
-        [tuple(x) for x in cached["omit"]],
-    )
+    try:
+        return (
+            cached["divergence"],
+            cached["pending"],
+            [tuple(x) for x in cached["keep"]],
+            [tuple(x) for x in cached["omit"]],
+        )
+    except (KeyError, TypeError):
+        return None
 
 
 def invalidate_cached_results(session):
@@ -952,8 +964,11 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
         m = re.search(r'^commit ([0-9a-f]{40})$', body, re.MULTILINE)
         upstream_hashes.append((rhel_h, m.group(1) if m else None))
 
-    first_idx = next(i for i, (rh, _) in enumerate(upstream_hashes)
-                     if rh == first_rhel_hash)
+    first_idx = next((i for i, (rh, _) in enumerate(upstream_hashes)
+                      if rh == first_rhel_hash), None)
+    if first_idx is None:
+        die(f"Cannot find {first_rhel_hash[:12]} in RHEL history "
+            f"for patchpal replay.")
     replay_set = upstream_hashes[first_idx:]
 
     header("Patchpal replay")
@@ -1320,7 +1335,10 @@ def show_confirmation_menu(params):
                 old_val = params[field]
                 if ftype == "cycle":
                     vals = cycle_values[field]
-                    idx = vals.index(params[field])
+                    try:
+                        idx = vals.index(params[field])
+                    except ValueError:
+                        idx = -1
                     params[field] = vals[(idx + 1) % len(vals)]
                     if (field == "conflict_policy"
                             and params[field] == "patchpal"
@@ -1545,8 +1563,8 @@ def run_dist_configs(rhel_repo, toolbox_name):
             config_files = glob(os.path.join(configs_dir, "**",
                                 "kernel-*.config"), recursive=True)
         if config_files:
-            warn(f"make dist-configs exited with errors, but "
-                 f"{len(config_files)} config files already exist")
+            info(f"dist-configs already built "
+                 f"({len(config_files)} config files found)")
             info(f"Using existing configs in {configs_dir}")
             stamp = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
             with open(stamp, "w") as fh:
@@ -2769,13 +2787,18 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                         jira, upstream_version, conflict_notes,
                         signed_off_by, assisted_by=""):
     """Build a gort-style commit message."""
-    r = git(f"log --format='%an <%ae>' -1 {commit_hash}", cwd=upstream_repo)
+    r = git(f"log --format='%an <%ae>' -1 {commit_hash}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0:
+        die(f"Cannot read upstream commit {commit_hash[:12]}. "
+            f"Is the upstream repo accessible?")
     author = r.stdout.strip()
     r = git(f"log --format='%ad' --date=format:'%a %b %d %H:%M:%S %Y %z' "
-            f"-1 {commit_hash}", cwd=upstream_repo)
-    date = r.stdout.strip()
-    r = git(f"log --format='%B' -1 {commit_hash}", cwd=upstream_repo)
-    body = r.stdout.rstrip()
+            f"-1 {commit_hash}", cwd=upstream_repo, check=False)
+    date = r.stdout.strip() if r.returncode == 0 else "unknown"
+    r = git(f"log --format='%B' -1 {commit_hash}",
+            cwd=upstream_repo, check=False)
+    body = r.stdout.rstrip() if r.returncode == 0 else subject
 
     indented_body = textwrap.indent(body, "    ")
 
@@ -3042,7 +3065,14 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     with open(msg_file, "w") as fh:
         fh.write(msg)
 
-    git(f"commit --allow-empty --file={msg_file}", cwd=rhel_repo)
+    r = git(f"commit --allow-empty --file={msg_file}",
+            cwd=rhel_repo, check=False)
+    if r.returncode != 0:
+        warn("git commit failed (hook rejection or lock conflict).")
+        warn(f"  {r.stderr.strip()}" if r.stderr else "  (no details)")
+        warn("Your resolved changes are staged. Run 'git commit' "
+             "manually to recover.")
+        die("Cannot continue — commit failed.")
     _cherrypick_repo = None
 
     # Post-commit validation against upstream
@@ -3078,8 +3108,12 @@ def save_state(output_dir, state):
 def load_state(output_dir):
     path = os.path.join(output_dir, ".backport-state.json")
     if os.path.isfile(path):
-        with open(path) as fh:
-            return json.load(fh)
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, ValueError):
+            warn(f"Corrupted state file {path} — ignoring.")
+            return None
     return None
 
 
@@ -3324,7 +3358,11 @@ def regen_patches(rhel_repo, output_dir, base_commit,
     """
     header("Regenerating patches")
 
-    r = git(f"rev-list --reverse {base_commit}..HEAD", cwd=rhel_repo)
+    r = git(f"rev-list --reverse {base_commit}..HEAD",
+            cwd=rhel_repo, check=False)
+    if r.returncode != 0:
+        die(f"Cannot list commits from {base_commit[:12]}..HEAD "
+            f"— base commit may be stale.")
     commits = [c for c in r.stdout.strip().split("\n") if c]
     if not commits:
         die("No commits found since base -- nothing to regenerate.")
@@ -3352,10 +3390,17 @@ def regen_patches(rhel_repo, output_dir, base_commit,
             f"-- {base_commit}..HEAD"
         )
         with Spinner("Rewriting commit messages ..."):
-            run(filter_cmd, cwd=rhel_repo, check=True)
+            r = run(filter_cmd, cwd=rhel_repo, check=False)
+        if r.returncode != 0:
+            warn("filter-branch failed. Restoring original branch ...")
+            git("update-ref refs/heads/HEAD refs/original/refs/heads/HEAD",
+                cwd=rhel_repo, check=False)
+            die("Commit message rewrite failed. Branch restored.")
     finally:
         shutil.rmtree(msg_dir, ignore_errors=True)
 
+    git("update-ref -d refs/original/refs/heads/HEAD",
+        cwd=rhel_repo, check=False)
     status(f"  Rewrote {len(commits)} commit(s).")
 
     # Regenerate format-patch output
@@ -3642,7 +3687,11 @@ def main():
                 ch = _getch()
                 if ch in ('s', 'S'):
                     print("switch")
-                    git(f"checkout {target_branch}", cwd=rhel_repo)
+                    r = git(f"checkout {target_branch}",
+                            cwd=rhel_repo, check=False)
+                    if r.returncode != 0:
+                        warn(f"Cannot switch: {r.stderr.strip()}")
+                        continue
                     status(f"  Switched to '{target_branch}'.")
                     break
                 elif ch in ('c', 'C'):
@@ -3739,7 +3788,12 @@ def main():
                     chosen = branches[idx]
                     print(chosen)
                     if chosen != current_branch:
-                        git(f"checkout {chosen}", cwd=rhel_repo)
+                        r = git(f"checkout {chosen}",
+                                cwd=rhel_repo, check=False)
+                        if r.returncode != 0:
+                            warn(f"Cannot switch: "
+                                 f"{r.stderr.strip()}")
+                            continue
                         status(f"  Switched to '{chosen}'.")
                     else:
                         info(f"  Already on '{chosen}'.")
@@ -3778,7 +3832,10 @@ def main():
                         break
             elif raw in branches:
                 if raw != current_branch:
-                    git(f"checkout {raw}", cwd=rhel_repo)
+                    r = git(f"checkout {raw}", cwd=rhel_repo,
+                            check=False)
+                    if r.returncode != 0:
+                        die(f"Cannot switch: {r.stderr.strip()}")
                     status(f"  Switched to '{raw}'.")
                 _session["branch"] = raw
                 _save()
@@ -4147,10 +4204,18 @@ def main():
                 cwd=rhel_repo,
             )
             if rc == 0:
-                git(f"checkout {branch}", cwd=rhel_repo)
+                r = git(f"checkout {branch}", cwd=rhel_repo,
+                        check=False)
+                if r.returncode != 0:
+                    die(f"Cannot checkout '{branch}': "
+                        f"{r.stderr.strip()}")
                 info(f"Checked out existing branch '{branch}'")
             else:
-                git(f"checkout -b {branch}", cwd=rhel_repo)
+                r = git(f"checkout -b {branch}", cwd=rhel_repo,
+                        check=False)
+                if r.returncode != 0:
+                    die(f"Cannot create branch '{branch}': "
+                        f"{r.stderr.strip()}")
                 info(f"Created and checked out branch '{branch}'")
 
         base_commit = git("rev-parse HEAD",
