@@ -3460,7 +3460,8 @@ def main():
         die("Must be run from a RHEL kernel git repo.")
 
     # -- Session management --
-    global _session, _session_repo
+    global _session, _session_repo, _loop_output_dir, _loop_idx
+    global _loop_base_commit
     _session = load_session(rhel_repo)
     _session_repo = rhel_repo
 
@@ -3569,6 +3570,46 @@ def main():
         )
         return
 
+    def _create_branch(name, rhel_repo, branches):
+        """Create and switch to a new branch from main, or warn if exists."""
+        rc, _, _ = run_quiet(
+            f"git rev-parse --verify refs/heads/{name}", cwd=rhel_repo)
+        if rc == 0:
+            warn(f"Branch '{name}' already exists.")
+            print(f"  {MNU}s{OFF}  Switch to '{name}'   "
+                  f"{MNU}c{OFF}  Choose a different name   "
+                  f"{MNU}q{OFF}  Quit")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            while True:
+                ch = _getch()
+                if ch in ('s', 'S'):
+                    print("switch")
+                    git(f"checkout {name}", cwd=rhel_repo)
+                    status(f"  Switched to '{name}'.")
+                    return name
+                elif ch in ('c', 'C'):
+                    print("choose")
+                    return None
+                elif ch in ('q', 'Q', '\x03'):
+                    print("quit")
+                    sys.exit(0)
+        else:
+            # Determine the base branch: prefer main, then master
+            base = None
+            for candidate in ("main", "master"):
+                rc2, _, _ = run_quiet(
+                    f"git rev-parse --verify refs/heads/{candidate}",
+                    cwd=rhel_repo)
+                if rc2 == 0:
+                    base = candidate
+                    break
+            if base:
+                git(f"checkout -b {name} {base}", cwd=rhel_repo)
+            else:
+                git(f"checkout -b {name}", cwd=rhel_repo)
+            status(f"  Created and switched to '{name}'.")
+            return name
+
     # -- Branch selection / drift check --
     target_branch = _session.get("branch")
     if not target_branch and _session.get("subsystem"):
@@ -3613,7 +3654,7 @@ def main():
 
     if not target_branch:
         # No valid saved branch -- prompt user to select or create one
-        raw = git("for-each-ref --format=%(refname:short) refs/heads/",
+        raw = git("branch --list --format='%(refname:short)'",
                   cwd=rhel_repo, check=False).stdout.strip()
         branches = [b.strip() for b in raw.split("\n") if b.strip()]
         if not branches:
@@ -3624,22 +3665,25 @@ def main():
             print(f"\n{MNU}    Branch selection{OFF}")
             print(f"    {'─' * 50}")
             print(f"  1 branch found: {INF}{branches[0]}{OFF}")
-            print(f"  {MNU}n{OFF}  Create new branch from '{branches[0]}'")
+            print(f"  {MNU}n{OFF}  Create new branch from 'main'")
             print(f"  {MNU}Enter{OFF}  Work on '{branches[0]}'")
             print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
             ch = _getch()
             if ch in ('n', 'N'):
                 print("new")
-                name = input(f"  New branch name: ").strip()
-                if name:
-                    git(f"checkout -b {name}", cwd=rhel_repo)
-                    status(f"  Created and switched to '{name}'.")
-                    _session["branch"] = name
-                    _save()
-                else:
-                    warn(f"No name entered. Working on '{branches[0]}'.")
-                    _session["branch"] = branches[0]
-                    _save()
+                while True:
+                    name = input(f"  New branch name: ").strip()
+                    if not name:
+                        warn(f"No name entered. Working on "
+                             f"'{branches[0]}'.")
+                        _session["branch"] = branches[0]
+                        _save()
+                        break
+                    result = _create_branch(name, rhel_repo, branches)
+                    if result:
+                        _session["branch"] = result
+                        _save()
+                        break
             else:
                 print()
                 warn(f"All work will be on current branch "
@@ -3653,7 +3697,7 @@ def main():
             for i, b in enumerate(branches):
                 marker = f" {STA}(current){OFF}" if b == current_branch else ""
                 print(f"  {MNU}{i + 1}{OFF}  {b}{marker}")
-            print(f"  {MNU}n{OFF}  Create new branch from '{current_branch}'")
+            print(f"  {MNU}n{OFF}  Create new branch from 'main'")
             print(f"  {MNU}Enter{OFF}  Work on '{current_branch}'")
             print(f"    {'─' * 50}")
             print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
@@ -3661,18 +3705,25 @@ def main():
                 ch = _getch()
                 if ch in ('n', 'N'):
                     print("new")
-                    name = input(f"  New branch name: ").strip()
-                    if name:
-                        git(f"checkout -b {name}", cwd=rhel_repo)
-                        status(f"  Created and switched to '{name}'.")
-                        _session["branch"] = name
-                        _save()
-                    else:
-                        warn(f"No name entered. Working on "
-                             f"'{current_branch}'.")
-                        _session["branch"] = current_branch
-                        _save()
-                    break
+                    created = False
+                    while True:
+                        name = input(f"  New branch name: ").strip()
+                        if not name:
+                            warn(f"No name entered. Working on "
+                                 f"'{current_branch}'.")
+                            _session["branch"] = current_branch
+                            _save()
+                            created = True
+                            break
+                        result = _create_branch(
+                            name, rhel_repo, branches)
+                        if result:
+                            _session["branch"] = result
+                            _save()
+                            created = True
+                            break
+                    if created:
+                        break
                 elif ch == '\r' or ch == '\n':
                     print()
                     warn(f"All work will be on current branch "
@@ -3711,17 +3762,20 @@ def main():
                 _session["branch"] = current_branch
                 _save()
             elif raw.lower() == 'n':
-                name = input(f"  New branch name: ").strip()
-                if name:
-                    git(f"checkout -b {name}", cwd=rhel_repo)
-                    status(f"  Created and switched to '{name}'.")
-                    _session["branch"] = name
-                    _save()
-                else:
-                    warn(f"No name entered. Working on "
-                         f"'{current_branch}'.")
-                    _session["branch"] = current_branch
-                    _save()
+                while True:
+                    name = input(f"  New branch name: ").strip()
+                    if not name:
+                        warn(f"No name entered. Working on "
+                             f"'{current_branch}'.")
+                        _session["branch"] = current_branch
+                        _save()
+                        break
+                    result = _create_branch(
+                        name, rhel_repo, branches)
+                    if result:
+                        _session["branch"] = result
+                        _save()
+                        break
             elif raw in branches:
                 if raw != current_branch:
                     git(f"checkout {raw}", cwd=rhel_repo)
@@ -3930,274 +3984,292 @@ def main():
         "dry_run": args.dry_run,
     }
 
-    if not args.yes:
-        show_confirmation_menu(params)
+    _step_loop = True
+    while _step_loop:
+        _step_loop = False
 
-    scope_paths = params["scope_paths"]
-    conflict_policy = params["conflict_policy"]
-    build_policy = params["build_policy"]
-    toolbox_name = params["toolbox"]
-    rhel_repo = params["rhel_repo"]
-    upstream_repo = params["upstream_repo"]
-    branch = params["branch"]
-    output_dir = params["output_dir"]
-    args.signed_off_by = params.get("signed_off_by", args.signed_off_by)
-    args.jira = params.get("jira", args.jira)
-    args.upstream_version = params.get("upstream_version",
-                                       args.upstream_version)
-    if params.get("_step"):
-        args.step = True
+        if not args.yes:
+            show_confirmation_menu(params)
 
-    _params_to_session(params)
-    _save()
-
-    # -- Completion check (after menu, so user could edit fields / regen) --
-    current_head = git("rev-parse HEAD",
-                       cwd=rhel_repo, check=False).stdout.strip()
-    completed_head = _session.get("_completed_head")
-    base_commit = _session.get("_base_commit")
-
-    if completed_head and current_head == completed_head:
-        if (conflict_policy == "patchpal"
-                and _session.get("conflict_policy") != "patchpal"
-                and base_commit):
-            replay_with_patchpal(
-                rhel_repo, upstream_repo, base_commit,
-                scope_paths, conflict_policy, build_policy,
-                toolbox_name, params["subsystem"], params.get("jira", ""),
-                params.get("upstream_version", ""),
-                params["rhel"],
-                output_dir,
-                params.get("signed_off_by", args.signed_off_by),
-                args.assisted_by,
-            )
-            return
+        scope_paths = params["scope_paths"]
+        conflict_policy = params["conflict_policy"]
+        build_policy = params["build_policy"]
+        toolbox_name = params["toolbox"]
+        rhel_repo = params["rhel_repo"]
+        upstream_repo = params["upstream_repo"]
+        branch = params["branch"]
+        output_dir = params["output_dir"]
+        args.signed_off_by = params.get("signed_off_by", args.signed_off_by)
+        args.jira = params.get("jira", args.jira)
+        args.upstream_version = params.get("upstream_version",
+                                           args.upstream_version)
+        if params.get("_step"):
+            args.step = True
         else:
-            status("Backport already completed with current session.")
-            info(f"  To update JIRA, Signed-off-by, etc. and regenerate "
-                 f"patches, use 'p' in the menu or 'isb --regen'.")
-            info(f"  Re-run with different parameters or from a new branch "
-                 f"to start a new backport.")
-            return
+            args.step = False
 
-    # -- Try to reuse cached divergence/classification results --
-    cached = load_cached_results(_session)
-    if cached and not args.divergence:
-        divergence, pending, keep, omit = cached
-        status("Using cached results from previous run")
-        info(f"  divergence:  {divergence[:12]}")
-        info(f"  pending:     {len(pending)} commits")
-        info(f"  KEEP: {len(keep)}   OMIT: {len(omit)}")
-    else:
-        if cached:
-            info("--divergence supplied; re-scanning.")
-
-        # -- Phase 1 --
-        configs_dir = run_dist_configs(rhel_repo, toolbox_name)
-        config_map = load_enabled_configs(configs_dir)
-
-        # -- Phase 2 --
-        if args.divergence:
-            divergence = args.divergence
-            info(f"Using user-supplied divergence point: {divergence[:12]}")
-        else:
-            divergence = find_divergence_point(
-                rhel_repo, upstream_repo, scope_paths,
-            )
-        pending = list_pending_commits(
-            upstream_repo, divergence, scope_paths, rhel_repo,
-        )
-        if not pending:
-            die("No pending commits found. Nothing to backport.")
-
-        # -- Phase 3 --
-        keep, omit = classify_commits(
-            pending, config_map, upstream_repo, rhel_repo, scope_paths,
-        )
-
-        save_cached_results(_session, divergence, pending, keep, omit)
-        _session.pop("_completed_head", None)
+        _params_to_session(params)
         _save()
 
-        # Clear stale cherry-pick state from prior runs
-        state_file = os.path.join(output_dir, ".backport-state.json")
-        if os.path.isfile(state_file):
-            os.remove(state_file)
-            info("  Cleared stale state from previous run.")
+        # -- Completion check (after menu, so user could edit/regen) --
+        current_head = git("rev-parse HEAD",
+                           cwd=rhel_repo, check=False).stdout.strip()
+        completed_head = _session.get("_completed_head")
+        base_commit = _session.get("_base_commit")
 
-    if args.dry_run:
-        header("Dry run complete")
-        info(f"Would cherry-pick {len(keep)} commits, omit {len(omit)}")
-        for h, subj, reason in keep:
-            print(f"  {STA}KEEP{OFF} {h[:12]} {subj}")
-        for h, subj, reason in omit:
-            print(f"  {WRN}OMIT{OFF} {h[:12]} {subj}  ({reason})")
-        return
+        if completed_head and current_head == completed_head:
+            if (conflict_policy == "patchpal"
+                    and _session.get("conflict_policy") != "patchpal"
+                    and base_commit):
+                replay_with_patchpal(
+                    rhel_repo, upstream_repo, base_commit,
+                    scope_paths, conflict_policy, build_policy,
+                    toolbox_name, params["subsystem"],
+                    params.get("jira", ""),
+                    params.get("upstream_version", ""),
+                    params["rhel"],
+                    output_dir,
+                    params.get("signed_off_by", args.signed_off_by),
+                    args.assisted_by,
+                )
+                return
+            else:
+                status("Backport already completed with current session.")
+                info(f"  To update JIRA, Signed-off-by, etc. and regenerate "
+                     f"patches, use 'p' in the menu or 'isb --regen'.")
+                info(f"  Re-run with different parameters or from a new "
+                     f"branch to start a new backport.")
+                return
 
-    # Write editable commit list
-    os.makedirs(output_dir, exist_ok=True)
-    keep_file = os.path.join(output_dir, "keep_commits.txt")
-    omit_file = os.path.join(output_dir, "omit_commits.txt")
-    _write_commit_list(keep_file, keep, omit_file, omit)
-
-    # Pause to let user review/edit commit lists in another terminal
-    if not args.yes and args.command != "continue":
-        print(f"\n  Commit lists written to:")
-        print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
-        print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
-        print(f"  Edit in another terminal to add, remove, or reorder.")
-        print(f"\n  {BLD}Press any key to continue, or Ctrl-C to exit{OFF} ",
-              end="", flush=True)
-        _getch()
-        print()
-
-    # If resuming, reload the commit list (user may have edited it)
-    if os.path.isfile(keep_file):
-        edited_keep = _read_commit_list(keep_file)
-        if edited_keep is not None:
-            orig_hashes = [h for h, _, _ in keep]
-            edit_hashes = [h for h, _ in edited_keep]
-            if edit_hashes != orig_hashes:
-                info(f"  Commit list was edited: {len(edited_keep)} commits "
-                     f"(was {len(keep)})")
-                keep = [(h, s, "user-selected") for h, s in edited_keep]
-                save_cached_results(_session, divergence, pending, keep, omit)
-                _save()
-
-    # -- Phase 4: cherry-pick loop --
-    header("Phase 4: Cherry-picking")
-
-    ensure_upstream_objects(rhel_repo, upstream_repo)
-
-    # Create or checkout branch
-    current = git("rev-parse --abbrev-ref HEAD",
-                  cwd=rhel_repo, check=False).stdout.strip()
-    if current == branch:
-        info(f"Already on branch '{branch}'")
-    else:
-        rc, _, _ = run_quiet(
-            f"git rev-parse --verify refs/heads/{branch}", cwd=rhel_repo,
-        )
-        if rc == 0:
-            git(f"checkout {branch}", cwd=rhel_repo)
-            info(f"Checked out existing branch '{branch}'")
+        # -- Try to reuse cached divergence/classification results --
+        cached = load_cached_results(_session)
+        if cached and not args.divergence:
+            divergence, pending, keep, omit = cached
+            status("Using cached results from previous run")
+            info(f"  divergence:  {divergence[:12]}")
+            info(f"  pending:     {len(pending)} commits")
+            info(f"  KEEP: {len(keep)}   OMIT: {len(omit)}")
         else:
-            git(f"checkout -b {branch}", cwd=rhel_repo)
-            info(f"Created and checked out branch '{branch}'")
+            if cached:
+                info("--divergence supplied; re-scanning.")
 
-    global _loop_output_dir, _loop_idx, _loop_base_commit
+            # -- Phase 1 --
+            configs_dir = run_dist_configs(rhel_repo, toolbox_name)
+            config_map = load_enabled_configs(configs_dir)
 
-    base_commit = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
+            # -- Phase 2 --
+            if args.divergence:
+                divergence = args.divergence
+                info(f"Using user-supplied divergence point: "
+                     f"{divergence[:12]}")
+            else:
+                divergence = find_divergence_point(
+                    rhel_repo, upstream_repo, scope_paths,
+                )
+            pending = list_pending_commits(
+                upstream_repo, divergence, scope_paths, rhel_repo,
+            )
+            if not pending:
+                die("No pending commits found. Nothing to backport.")
 
-    # Auto-resume from saved state (explicit 'continue' command or automatic).
-    start_idx = 0
-    state = load_state(output_dir)
-    if state and state.get("next_idx", 0) > 0:
-        saved_idx = state["next_idx"]
-        saved_base = state.get("base_commit", "")
+            # -- Phase 3 --
+            keep, omit = classify_commits(
+                pending, config_map, upstream_repo, rhel_repo, scope_paths,
+            )
 
-        # Detect external HEAD reset: the number of commits between
-        # saved base and current HEAD must be >= saved next_idx.
-        # If HEAD was reset, there will be fewer (or zero) commits.
-        stale = False
-        if saved_base:
-            r = git(f"rev-list --count {saved_base}..HEAD",
-                    cwd=rhel_repo, check=False)
-            commits_since_base = int(r.stdout.strip()) if r.returncode == 0 else 0
-            if commits_since_base < saved_idx:
+            save_cached_results(_session, divergence, pending, keep, omit)
+            _session.pop("_completed_head", None)
+            _save()
+
+            # Clear stale cherry-pick state from prior runs
+            state_file = os.path.join(output_dir, ".backport-state.json")
+            if os.path.isfile(state_file):
+                os.remove(state_file)
+                info("  Cleared stale state from previous run.")
+
+        if args.dry_run:
+            header("Dry run complete")
+            info(f"Would cherry-pick {len(keep)} commits, "
+                 f"omit {len(omit)}")
+            for h, subj, reason in keep:
+                print(f"  {STA}KEEP{OFF} {h[:12]} {subj}")
+            for h, subj, reason in omit:
+                print(f"  {WRN}OMIT{OFF} {h[:12]} {subj}  ({reason})")
+            return
+
+        # Write editable commit list
+        os.makedirs(output_dir, exist_ok=True)
+        keep_file = os.path.join(output_dir, "keep_commits.txt")
+        omit_file = os.path.join(output_dir, "omit_commits.txt")
+        _write_commit_list(keep_file, keep, omit_file, omit)
+
+        # Pause to let user review/edit commit lists in another terminal
+        if not args.yes and args.command != "continue":
+            print(f"\n  Commit lists written to:")
+            print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
+            print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
+            print(f"  Edit in another terminal to add, remove, or "
+                  f"reorder.")
+            print(f"\n  {BLD}Press any key to continue, or Ctrl-C to "
+                  f"exit{OFF} ", end="", flush=True)
+            _getch()
+            print()
+
+        # If resuming, reload the commit list (user may have edited it)
+        if os.path.isfile(keep_file):
+            edited_keep = _read_commit_list(keep_file)
+            if edited_keep is not None:
+                orig_hashes = [h for h, _, _ in keep]
+                edit_hashes = [h for h, _ in edited_keep]
+                if edit_hashes != orig_hashes:
+                    info(f"  Commit list was edited: "
+                         f"{len(edited_keep)} commits "
+                         f"(was {len(keep)})")
+                    keep = [(h, s, "user-selected")
+                            for h, s in edited_keep]
+                    save_cached_results(
+                        _session, divergence, pending, keep, omit)
+                    _save()
+
+        # -- Phase 4: cherry-pick loop --
+        header("Phase 4: Cherry-picking")
+
+        ensure_upstream_objects(rhel_repo, upstream_repo)
+
+        # Create or checkout branch
+        current = git("rev-parse --abbrev-ref HEAD",
+                      cwd=rhel_repo, check=False).stdout.strip()
+        if current == branch:
+            info(f"Already on branch '{branch}'")
+        else:
+            rc, _, _ = run_quiet(
+                f"git rev-parse --verify refs/heads/{branch}",
+                cwd=rhel_repo,
+            )
+            if rc == 0:
+                git(f"checkout {branch}", cwd=rhel_repo)
+                info(f"Checked out existing branch '{branch}'")
+            else:
+                git(f"checkout -b {branch}", cwd=rhel_repo)
+                info(f"Created and checked out branch '{branch}'")
+
+        base_commit = git("rev-parse HEAD",
+                          cwd=rhel_repo).stdout.strip()
+
+        # Auto-resume from saved state
+        start_idx = 0
+        state = load_state(output_dir)
+        if state and state.get("next_idx", 0) > 0:
+            saved_idx = state["next_idx"]
+            saved_base = state.get("base_commit", "")
+
+            stale = False
+            if saved_base:
+                r = git(f"rev-list --count {saved_base}..HEAD",
+                        cwd=rhel_repo, check=False)
+                commits_since_base = (int(r.stdout.strip())
+                                      if r.returncode == 0 else 0)
+                if commits_since_base < saved_idx:
+                    stale = True
+                    warn(f"HEAD has only {commits_since_base} commit(s) "
+                         f"since base ({saved_base[:12]}), but saved "
+                         f"state expects {saved_idx}. External reset "
+                         f"detected — starting fresh.")
+
+            if not stale and saved_idx >= len(keep):
+                info(f"Previous run completed all {len(keep)} commits. "
+                     f"Starting fresh.")
                 stale = True
-                warn(f"HEAD has only {commits_since_base} commit(s) since "
-                     f"base ({saved_base[:12]}), but saved state expects "
-                     f"{saved_idx}. External reset detected — starting "
-                     f"fresh.")
 
-        if not stale and saved_idx >= len(keep):
-            info(f"Previous run completed all {len(keep)} commits. "
-                 f"Starting fresh.")
-            stale = True
+            if stale:
+                save_state(output_dir, {
+                    "next_idx": 0,
+                    "base_commit": base_commit,
+                })
+            else:
+                start_idx = saved_idx
+                base_commit = saved_base or base_commit
+                status(f"Resuming from commit "
+                       f"{start_idx + 1}/{len(keep)}")
 
-        if stale:
-            save_state(output_dir, {
-                "next_idx": 0,
-                "base_commit": base_commit,
-            })
-        else:
-            start_idx = saved_idx
-            base_commit = saved_base or base_commit
-            status(f"Resuming from commit {start_idx + 1}/{len(keep)}")
+        _loop_output_dir = output_dir
+        _loop_base_commit = base_commit
+        _session["_base_commit"] = base_commit
+        _save()
 
-    _loop_output_dir = output_dir
-    _loop_base_commit = base_commit
-    _session["_base_commit"] = base_commit
-    _save()
+        clean_count = 0
+        conflict_count = 0
+        build_tests = 0
+        build_fixes = 0
+        fail_count = 0
 
-    clean_count = 0
-    conflict_count = 0
-    build_tests = 0
-    build_fixes = 0
-    fail_count = 0
+        for idx in range(start_idx, len(keep)):
+            _loop_idx = idx
+            h, subj, _ = keep[idx]
+            num = f"[{idx + 1}/{len(keep)}]"
+            info(f"{num} {h[:12]} {subj}")
 
-    for idx in range(start_idx, len(keep)):
-        _loop_idx = idx
-        h, subj, _ = keep[idx]
-        num = f"[{idx + 1}/{len(keep)}]"
-        info(f"{num} {h[:12]} {subj}")
+            result, notes = cherry_pick_commit(
+                h, upstream_repo, rhel_repo, scope_paths,
+                conflict_policy, build_policy, toolbox_name,
+                args.subsystem, params["jira"],
+                params["upstream_version"],
+                args.rhel, omit, output_dir, idx, len(keep),
+                signed_off_by=args.signed_off_by,
+                assisted_by=args.assisted_by,
+            )
 
-        result, notes = cherry_pick_commit(
-            h, upstream_repo, rhel_repo, scope_paths,
-            conflict_policy, build_policy, toolbox_name,
-            args.subsystem, params["jira"], params["upstream_version"],
-            args.rhel, omit, output_dir, idx, len(keep),
-            signed_off_by=args.signed_off_by,
-            assisted_by=args.assisted_by,
-        )
+            if result == "skip":
+                omit.append((h, subj, "skipped (build failure)"))
+                save_state(output_dir, {
+                    "next_idx": idx + 1,
+                    "base_commit": base_commit,
+                })
+                continue
 
-        if result == "skip":
-            omit.append((h, subj, "skipped (build failure)"))
+            if not result:
+                fail_count += 1
+                save_state(output_dir, {
+                    "next_idx": idx,
+                    "base_commit": base_commit,
+                })
+                sys.exit(1)
+
+            if notes:
+                conflict_count += 1
+            else:
+                clean_count += 1
+
+            should_build = (
+                (build_policy == "every") or
+                (build_policy == "conflict" and notes)
+            )
+            if should_build:
+                build_tests += 1
+
             save_state(output_dir, {
                 "next_idx": idx + 1,
                 "base_commit": base_commit,
             })
+            status(f"  applied "
+                   f"{'(with conflicts)' if notes else '(clean)'}")
+
+            if args.step:
+                remaining = len(keep) - (idx + 1)
+                if remaining > 0:
+                    status(f"  Single-step: paused. "
+                           f"{remaining} commit(s) remaining.")
+                else:
+                    status(f"  Single-step: last commit applied.")
+                save_cached_results(
+                    _session, divergence, pending, keep, omit)
+                _save()
+                if remaining > 0:
+                    _step_loop = True
+                break
+
+        if _step_loop:
             continue
-
-        if not result:
-            fail_count += 1
-            save_state(output_dir, {
-                "next_idx": idx,
-                "base_commit": base_commit,
-            })
-            sys.exit(1)
-
-        if notes:
-            conflict_count += 1
-        else:
-            clean_count += 1
-
-        should_build = (
-            (build_policy == "every") or
-            (build_policy == "conflict" and notes)
-        )
-        if should_build:
-            build_tests += 1
-
-        save_state(output_dir, {
-            "next_idx": idx + 1,
-            "base_commit": base_commit,
-        })
-        status(f"  applied {'(with conflicts)' if notes else '(clean)'}")
-
-        if args.step:
-            remaining = len(keep) - (idx + 1)
-            if remaining > 0:
-                status(f"  Single-step: paused. "
-                       f"{remaining} commit(s) remaining.")
-                info(f"  Resume with: isb continue  or  isb --step")
-            else:
-                status(f"  Single-step: last commit applied.")
-            # Save cached results so resume works
-            save_cached_results(_session, divergence, pending, keep, omit)
-            _save()
-            return
 
     # -- Phase 5 --
     patch_count = generate_output(rhel_repo, output_dir, base_commit, omit)
