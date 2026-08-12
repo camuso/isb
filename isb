@@ -3759,11 +3759,37 @@ def main():
     _save()
 
     if args.conflict_policy == "patchpal":
+        unavailable = None
         if not shutil.which("patchpal"):
-            die("conflict-policy 'patchpal' requires patchpal on PATH.")
-        if not _has_display():
-            die("conflict-policy 'patchpal' requires a graphical display "
-                "(DISPLAY or WAYLAND_DISPLAY must be set).")
+            unavailable = "patchpal is not installed"
+        elif not _has_display():
+            unavailable = "no graphical display detected (DISPLAY/WAYLAND_DISPLAY)"
+
+        if unavailable:
+            warn(f"Conflict policy 'patchpal' unavailable: {unavailable}.")
+            print(f"  {MNU}e{OFF}  Use '{INF}edit{OFF}' — open conflicts "
+                  f"in your editor ({_get_editor()})")
+            print(f"  {MNU}a{OFF}  Use '{INF}abort{OFF}' — stop on any "
+                  f"in-scope conflict")
+            print(f"  {MNU}q{OFF}  Quit")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            while True:
+                ch = _getch()
+                if ch in ('e', 'E'):
+                    print("edit")
+                    args.conflict_policy = "edit"
+                    _session["conflict_policy"] = "edit"
+                    _save()
+                    break
+                elif ch in ('a', 'A'):
+                    print("abort")
+                    args.conflict_policy = "abort"
+                    _session["conflict_policy"] = "abort"
+                    _save()
+                    break
+                elif ch in ('q', 'Q', '\x03'):
+                    print("quit")
+                    sys.exit(0)
 
     # Auto-detect RHEL version from Makefile.rhelver if not set.
     if not args.rhel:
