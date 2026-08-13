@@ -3436,6 +3436,8 @@ def generate_output(rhel_repo, output_dir, base_commit, omit_list):
 
     patches_dir = os.path.join(output_dir, "patches")
     os.makedirs(patches_dir, exist_ok=True)
+    for old in glob(os.path.join(patches_dir, "*.patch")):
+        os.remove(old)
 
     with Spinner("Generating patch series ..."):
         git(f"format-patch -o {patches_dir} {base_commit}..HEAD", cwd=rhel_repo)
