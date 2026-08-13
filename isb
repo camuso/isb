@@ -2275,7 +2275,70 @@ def _get_editor():
     return "vi"
 
 
-def _resolve_inscope_edit(in_scope_conflicts, rhel_repo):
+def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
+    """Analyze a resolved conflict file and return a short classification.
+
+    Compares the resolved file against the upstream version to determine
+    the nature of the conflict:
+      - context drift:  surrounding code differs between RHEL and upstream
+      - missing prerequisite:  upstream patch assumes code not in RHEL
+      - API difference:  function signatures or structs changed
+      - overlapping change:  both sides modified the same lines
+    """
+    if not commit_hash or not upstream_repo:
+        return "in-scope conflict"
+
+    # Get the upstream version of this file from the commit
+    us_r = git(f"show {commit_hash}:{cf}",
+               cwd=upstream_repo, check=False)
+    if us_r.returncode != 0:
+        # File doesn't exist in upstream at this commit — new file or rename
+        our_r = git(f"show HEAD:{cf}", cwd=rhel_repo, check=False)
+        if our_r.returncode != 0:
+            return "new file conflict"
+        return "file only in RHEL (possible rename or deletion upstream)"
+
+    # Get our resolved version
+    our_r = git(f"show :0:{cf}", cwd=rhel_repo, check=False)
+    if our_r.returncode != 0:
+        our_path = os.path.join(rhel_repo, cf)
+        if os.path.isfile(our_path):
+            with open(our_path) as fh:
+                ours = fh.read()
+        else:
+            return "file removed during resolution"
+    else:
+        ours = our_r.stdout
+
+    upstream = us_r.stdout
+
+    # Count differing hunks between resolved file and upstream version
+    import difflib
+    us_lines = upstream.splitlines(keepends=True)
+    our_lines = ours.splitlines(keepends=True)
+    diff_hunks = list(difflib.unified_diff(us_lines, our_lines, n=0))
+    hunk_headers = [l for l in diff_hunks if l.startswith("@@")]
+    n_hunks = len(hunk_headers)
+
+    if n_hunks == 0:
+        return "resolved (identical to upstream)"
+
+    # Look for common patterns in the diff
+    added = [l for l in diff_hunks if l.startswith("+") and not l.startswith("+++")]
+    removed = [l for l in diff_hunks if l.startswith("-") and not l.startswith("---")]
+
+    # Check for KABI or RHEL-specific guards
+    rhel_markers = sum(1 for l in added
+                       if "RH_KABI" in l or "RHEL" in l or "redhat" in l.lower())
+    if rhel_markers:
+        return (f"{n_hunks} hunk(s) differ from upstream "
+                f"({rhel_markers} RHEL-specific)")
+
+    return f"{n_hunks} hunk(s) differ from upstream"
+
+
+def _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
+                          commit_hash=None, upstream_repo=None):
     """Open conflicted files in the user's editor for manual resolution.
 
     Returns a list of conflict note strings.
@@ -2328,7 +2391,9 @@ def _resolve_inscope_edit(in_scope_conflicts, rhel_repo):
                             cwd=rhel_repo, check=False)
                         die(f"Aborted during manual edit of {cf}.")
             else:
-                notes.append(f"{cf}: resolved manually via {editor}")
+                detail = _classify_conflict(cf, rhel_repo, commit_hash,
+                                            upstream_repo)
+                notes.append(f"{cf}: editor — {detail}")
         else:
             notes.append(f"{cf}: deleted during manual edit")
         git(f"add -- {cf}", cwd=rhel_repo, check=False)
@@ -2356,7 +2421,8 @@ def _raise_patchpal_window():
         return
 
 
-def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo):
+def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
+                              commit_hash=None, upstream_repo=None):
     """Launch patchpal as git mergetool for in-scope conflicted files.
 
     Returns a list of conflict note strings.
@@ -2396,7 +2462,9 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo):
             git("cherry-pick --abort", cwd=rhel_repo, check=False)
             die(f"{cf} still has unresolved conflicts after patchpal. "
                 "Cherry-pick aborted.")
-        notes.append(f"{cf}: resolved interactively via patchpal")
+        detail = _classify_conflict(cf, rhel_repo, commit_hash,
+                                    upstream_repo)
+        notes.append(f"{cf}: patchpal — {detail}")
     return notes
 
 
@@ -2478,10 +2546,12 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
         if conflict_policy == "patchpal":
             deferred_notes = _resolve_inscope_patchpal(
                 in_scope_deferred, rhel_repo,
+                commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
         else:
             deferred_notes = _resolve_inscope_edit(
                 in_scope_deferred, rhel_repo,
+                commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
         notes.extend(deferred_notes)
 
