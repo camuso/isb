@@ -999,7 +999,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             continue
         if not result:
             die(f"Replay failed on {uh[:12]}. Resolve manually.")
-        status(f"  applied {'(with conflicts)' if notes else '(clean)'}")
+        status(f"  applied {'with resolved conflicts' if notes else '(clean)'}")
 
     patch_count = generate_output(rhel_repo, output_dir, base_commit, [])
 
@@ -4317,7 +4317,7 @@ def main():
                 "base_commit": base_commit,
             })
             status(f"  applied "
-                   f"{'(with conflicts)' if notes else '(clean)'}")
+                   f"{'with resolved conflicts' if notes else '(clean)'}")
 
             if args.step:
                 remaining = len(keep) - (idx + 1)
