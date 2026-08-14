@@ -4408,6 +4408,90 @@ def main():
         if _step_loop:
             continue
 
+    # -- Final build validation --
+    # Per-commit builds (M=subsystem) may miss header/struct changes
+    # from clean commits.  Do one clean rebuild before generating patches.
+    header("Final build validation")
+    tb_label = f" in toolbox '{toolbox_name}'" if toolbox_name else ""
+    with Spinner(f"Clean rebuild of {args.subsystem}{tb_label} ..."):
+        clean_cmd = f"make M={args.subsystem} clean"
+        cmd, cwd = _toolbox_cmd(toolbox_name, clean_cmd, rhel_repo)
+        run_quiet(cmd, cwd=cwd)
+        final_ok, final_output = build_test(
+            rhel_repo, toolbox_name, args.subsystem,
+        )
+    if final_ok:
+        status(f"  Final build passed.")
+    else:
+        report_path = os.path.join(output_dir, "build-failure-report.txt")
+        with open(report_path, "w") as fh:
+            fh.write(final_output)
+        bad_files = _extract_failing_files(final_output)
+        print(f"\n{CAU}=== FINAL BUILD FAILED ==={OFF}")
+        print(f"  Build error: {INF}{report_path}{OFF}")
+        if bad_files:
+            print(f"  Failing:     {', '.join(bad_files)}")
+        print(f"  All {len(keep)} commits applied, but the combined "
+              f"result does not build.")
+        print()
+        print(f"  {MNU}f{OFF}  Fix manually and retry build")
+        print(f"  {MNU}p{OFF}  Proceed anyway (generate patches)")
+        print(f"  {MNU}a{OFF}  Abort")
+        print()
+        print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+
+        while True:
+            ch = _getch()
+            if ch in ('f', 'F'):
+                print("fix")
+                editor = _get_editor()
+                targets = bad_files or []
+                if targets:
+                    file_args = " ".join(
+                        os.path.join(rhel_repo, f) for f in targets)
+                    subprocess.run(f"{editor} {file_args}", shell=True,
+                                   cwd=rhel_repo)
+                else:
+                    info("  No specific files identified. Opening editor.")
+                    subprocess.run(f"{editor}", shell=True, cwd=rhel_repo)
+                # Stage fixes and amend last commit
+                git("add -u", cwd=rhel_repo, check=False)
+                git("commit --amend --no-edit", cwd=rhel_repo, check=False)
+                # Retry build
+                with Spinner(f"Retrying build of {args.subsystem}"
+                             f"{tb_label} ..."):
+                    final_ok, final_output = build_test(
+                        rhel_repo, toolbox_name, args.subsystem,
+                    )
+                if final_ok:
+                    status(f"  Build passed after fix.")
+                    break
+                else:
+                    with open(report_path, "w") as fh:
+                        fh.write(final_output)
+                    warn(f"  Still failing. See {report_path}")
+                    print(f"  {MNU}f{OFF}  Fix again   "
+                          f"{MNU}p{OFF}  Proceed   "
+                          f"{MNU}a{OFF}  Abort")
+                    print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+                    continue
+            elif ch in ('p', 'P'):
+                print("proceed")
+                warn("  Proceeding with failing build.")
+                break
+            elif ch in ('a', 'A', '\x03'):
+                print("abort")
+                save_state(output_dir, {
+                    "next_idx": len(keep),
+                    "base_commit": base_commit,
+                })
+                _session["_base_commit"] = base_commit
+                save_cached_results(
+                    _session, divergence, pending, keep, omit)
+                _save()
+                die("Aborted due to final build failure. "
+                    "State saved — re-run isb to resume.")
+
     # -- Phase 5 --
     patch_count = generate_output(rhel_repo, output_dir, base_commit, omit)
 
