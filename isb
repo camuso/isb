@@ -4084,6 +4084,19 @@ def main():
             _session["toolbox"] = toolbox_name
             _save()
 
+    # In pick mode, ignore session scope paths — derive from the commit
+    # unless the user explicitly passed --only on the command line.
+    if args.command == "pick" and args.only_paths:
+        # Check if only_paths came from the session vs the CLI.
+        # argparse default is None; session loads a list.
+        cli_only = None
+        for i, a in enumerate(sys.argv):
+            if a == "--only":
+                cli_only = True
+                break
+        if not cli_only:
+            args.only_paths = None
+
     if args.only_paths:
         scope_paths = args.only_paths
         info(f"Using --only scope paths: {', '.join(scope_paths)}")
