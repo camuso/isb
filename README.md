@@ -35,10 +35,15 @@ RHEL-compliant commit messages suitable for merge requests.
   and reused across runs with an interactive single-keypress menu.
 - **Resumable** — interrupted runs save progress and resume automatically
   with `--continue`.
-- **Single-commit mode** — `--pick HASH` cherry-picks one upstream commit
-  with full conflict resolution and commit message formatting.
+- **Single-commit mode** — `isb pick HASH` cherry-picks one upstream commit
+  with full conflict resolution and commit message formatting. Detects
+  already-backported commits by searching the RHEL log for the upstream
+  hash before cherry-picking.
 - **Dry-run mode** — `--dry-run` classifies and lists upstream commits
   without applying anything.
+- **Built-in help** — `isb help` shows a summary of all commands and
+  options; `isb help <topic>` gives detailed help for any command or
+  option (e.g. `isb help conflict-policy`).
 
 ## Requirements
 
@@ -98,7 +103,15 @@ Override a session value for one run:
 isb --upstream-version v7.2
 ```
 
-See `man isb` or `isb -h` for the full list of options.
+Get help on any command or option:
+
+```sh
+isb help                   # full summary
+isb help pick              # details on the pick command
+isb help conflict-policy   # details on conflict resolution options
+```
+
+See `man isb` or `isb -h` for the full man page.
 
 ## License
 
