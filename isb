@@ -451,6 +451,317 @@ class _ManPageAction(argparse.Action):
         sys.exit(0)
 
 
+_HELP_TOPICS = {
+    "help": (
+        "isb help [TOPIC]",
+        "Show general help or detailed help for a specific command or option.",
+        textwrap.dedent("""\
+            With no argument, displays the man page (or a summary if the man
+            page is unavailable).  With a TOPIC, prints detailed help for
+            that command or option.
+
+            IMPORTANT: When asking for help on an option, omit the leading
+            dashes.  The shell will interpret --option as a flag, not as a
+            topic name.
+
+              isb help conflict-policy    correct
+              isb help --conflict-policy  WRONG (parsed as a flag)
+
+            TOPIC can be any subcommand or option name:
+
+              Commands:  help, pick, continue, status, reset, new
+              Options:   subsystem, rhel, upstream-repo, upstream-version,
+                         jira, extra-paths, only, branch, output-dir,
+                         conflict-policy, editor, build-policy, dry-run,
+                         yes, signed-off-by (or just 's'), assisted-by,
+                         step, divergence, toolbox, regen
+
+            The -h and --help flags still work and display the man page.
+        """),
+    ),
+    "pick": (
+        "isb pick <HASH>",
+        "Cherry-pick a single upstream commit into the RHEL tree.",
+        textwrap.dedent("""\
+            Cherry-picks the upstream commit identified by HASH into the
+            current RHEL branch.  Scope paths are derived from the commit's
+            own files unless --subsystem or --only is given.
+
+            Before cherry-picking, isb checks whether the commit has already
+            been backported by searching the RHEL log for the upstream hash.
+
+            Examples:
+              isb pick abc123def456
+              isb pick abc123 --only drivers/char/ipmi
+        """),
+    ),
+    "continue": (
+        "isb continue",
+        "Resume a backport from saved state.",
+        textwrap.dedent("""\
+            Resumes a previously interrupted backport session.  isb reads
+            the saved progress from .backport/session.json and
+            .backport-state.json and continues from where it left off.
+        """),
+    ),
+    "status": (
+        "isb status",
+        "Show backport progress and exit.",
+        textwrap.dedent("""\
+            Displays the current backport progress: how many commits have
+            been applied, how many remain, the current and next commit,
+            and the session parameters.
+        """),
+    ),
+    "reset": (
+        "isb reset <HASH>",
+        "Reset backport progress to an earlier commit.",
+        textwrap.dedent("""\
+            Resets the backport branch to the specified commit HASH and
+            discards the saved progress beyond that point.  In interactive
+            mode (menu hotkey 'r'), presents a numbered list of applied
+            commits; conflicted commits are marked with a red *.
+        """),
+    ),
+    "new": (
+        "isb new",
+        "Clear all session data and start fresh.",
+        textwrap.dedent("""\
+            Removes .backport/session.json, the dist-configs stamp, and
+            .backport-state.json.  The next invocation will prompt for
+            all parameters as if running for the first time.
+        """),
+    ),
+    "subsystem": (
+        "--subsystem PATH",
+        "Subsystem path, e.g. drivers/input.",
+        textwrap.dedent("""\
+            Identifies the kernel subsystem to backport.  isb uses this
+            to auto-discover scope paths (Makefile, header directories,
+            DT binding paths, etc.) and to name the working branch and
+            output directory.
+
+            Example: isb --subsystem drivers/char/ipmi
+        """),
+    ),
+    "rhel": (
+        "--rhel VERSION",
+        "RHEL version (9, 10, 10.3, ...).",
+        textwrap.dedent("""\
+            Normally auto-detected from Makefile.rhelver in the current
+            repo.  Use this to override when the repo version does not
+            reflect the target release.
+        """),
+    ),
+    "upstream-repo": (
+        "--upstream-repo PATH",
+        "Path to a local upstream kernel git repo.",
+        textwrap.dedent("""\
+            Used for commit discovery and cherry-picking.  isb links the
+            upstream objects via git alternates for zero-copy access.
+
+            Auto-detected from .git/objects/info/alternates if already
+            configured.  Saved in the session for subsequent runs.
+        """),
+    ),
+    "upstream-version": (
+        "--upstream-version TAG",
+        "Upstream version tag, e.g. v7.1-rc3.",
+        textwrap.dedent("""\
+            Recorded in the gort-style commit message as the upstream
+            status.  Optional; defaults to UPSTREAM_VERSION if not set.
+        """),
+    ),
+    "jira": (
+        "--jira URL",
+        "JIRA ticket URL (default: RHEL-PLACEHOLDER).",
+        textwrap.dedent("""\
+            Recorded in the gort-style commit message.  Can be updated
+            later via the interactive menu or --regen.
+        """),
+    ),
+    "extra-paths": (
+        "--extra-paths PATH [PATH ...]",
+        "Additional scope paths beyond auto-discovered ones.",
+        textwrap.dedent("""\
+            Appended to the paths that isb discovers from the subsystem
+            Makefile.  Useful for including headers or DT bindings that
+            are not automatically found.
+        """),
+    ),
+    "only": (
+        "--only PATH [PATH ...]",
+        "Use only these scope paths, skip auto-discovery.",
+        textwrap.dedent("""\
+            Overrides all auto-discovery and uses exactly the given paths.
+
+            Example:
+              isb --only drivers/char/ipmi include/linux/ipmi.h
+        """),
+    ),
+    "branch": (
+        "--branch NAME",
+        "Working branch name (default: leaf of subsystem path).",
+        textwrap.dedent("""\
+            The branch where cherry-picked commits will land.  Created
+            from main/master if it does not exist.  Saved in the session.
+        """),
+    ),
+    "output-dir": (
+        "--output-dir PATH",
+        "Output directory for patches and reports.",
+        textwrap.dedent("""\
+            Default: ../backports/<RHEL-version>/<subsystem-leaf>/
+            Contains the patches/ subdirectory, build failure reports,
+            and commit list files (keep_commits.txt, omit_commits.txt).
+        """),
+    ),
+    "conflict-policy": (
+        "--conflict-policy {patchpal,edit,abort}",
+        "In-scope conflict resolution strategy.",
+        textwrap.dedent("""\
+            patchpal  - Launch the patchpal GUI mergetool (requires a
+                        graphical display and the patchpal executable).
+            edit      - Open conflicted files in the configured editor.
+            abort     - Abort on any in-scope conflict.
+
+            Default: patchpal if a display and the executable are found,
+            otherwise edit.  Out-of-scope files, MAINTAINERS, and
+            delete/modify conflicts are always resolved automatically.
+        """),
+    ),
+    "editor": (
+        "--editor COMMAND",
+        "Editor for conflict-policy=edit (default: vim).",
+        textwrap.dedent("""\
+            Any editor command the user prefers (vim, gvim, emacs, nano,
+            vscodium, etc.).  Saved in the session.  Also used by the
+            'fix' option when a build fails.
+        """),
+    ),
+    "build-policy": (
+        "--build-policy {every,conflict,never}",
+        "When to run incremental build-tests.",
+        textwrap.dedent("""\
+            every     - Build after every cherry-picked commit.
+            conflict  - Build only after commits that had conflicts.
+            never     - Skip all incremental builds.
+
+            Default: conflict.
+        """),
+    ),
+    "dry-run": (
+        "--dry-run",
+        "Classify commits but do not cherry-pick.",
+        textwrap.dedent("""\
+            Runs phases 1-3 (dist-configs, divergence, commit discovery)
+            and prints the keep/omit lists, then exits without modifying
+            the working tree.
+        """),
+    ),
+    "yes": (
+        "--yes",
+        "Skip the interactive confirmation menu.",
+        textwrap.dedent("""\
+            Proceeds directly with the current session parameters
+            without displaying the confirmation menu.  Useful for
+            scripted or non-interactive invocations.
+        """),
+    ),
+    "signed-off-by": (
+        "--signed-off-by 'NAME <EMAIL>'",
+        "Signed-off-by trailer for commit messages (-s).",
+        textwrap.dedent("""\
+            Auto-detected from git config user.name and user.email if
+            not provided.  Editable in the interactive menu (hotkey 9).
+        """),
+    ),
+    "assisted-by": (
+        "--assisted-by 'NAME <EMAIL>'",
+        "Assisted-by trailer for commit messages.",
+        textwrap.dedent("""\
+            Optional trailer added to gort-style commit messages.
+            Example: --assisted-by 'Claude <no-reply@anthropic.com>'
+        """),
+    ),
+    "step": (
+        "--step",
+        "Single-step mode: apply one commit and return to menu.",
+        textwrap.dedent("""\
+            Applies the next commit in the list, resolves conflicts,
+            builds (per build policy), and returns to the interactive
+            menu.  Also available as hotkey 'x' in the menu.
+        """),
+    ),
+    "divergence": (
+        "--divergence HASH",
+        "Override the auto-detected divergence point.",
+        textwrap.dedent("""\
+            Specifies the upstream commit hash to use as the divergence
+            point, skipping phase 2 auto-detection.  Useful when the
+            auto-detection picks the wrong commit.
+        """),
+    ),
+    "toolbox": (
+        "--toolbox NAME",
+        "Toolbox container name for builds.",
+        textwrap.dedent("""\
+            Name of the toolbox container to use for 'make dist-configs'
+            and incremental build-tests.  If the RHEL target version
+            does not match the host OS, isb prompts for selection from
+            the available toolboxes.
+        """),
+    ),
+    "regen": (
+        "--regen",
+        "Rewrite commit messages and regenerate patches.",
+        textwrap.dedent("""\
+            Rewrites all commit messages on the backport branch with the
+            current session values (JIRA, Signed-off-by, upstream version)
+            and regenerates the patch series.  Also available as hotkey
+            'p' in the interactive menu.
+        """),
+    ),
+}
+
+
+def _show_topic_help(topic):
+    """Print help for a single topic and exit."""
+    key = topic.lstrip("-")
+    if key == "s":
+        key = "signed-off-by"
+    if key not in _HELP_TOPICS:
+        print(f"Unknown topic: {topic}")
+        print(f"Available topics: {', '.join(sorted(_HELP_TOPICS))}")
+        sys.exit(1)
+    usage, summary, detail = _HELP_TOPICS[key]
+    print(f"\n  {BLD}{usage}{OFF}")
+    print(f"  {summary}\n")
+    print(detail)
+    sys.exit(0)
+
+
+def _show_general_help():
+    """Show man page or print a summary of all commands and options."""
+    if _show_manpage():
+        return
+    print(f"\n{BLD}isb{OFF} -- Intelligent Subsystem Backport for RHEL kernels\n")
+    print(f"{BLD}Commands:{OFF}")
+    for cmd in ("help", "pick", "continue", "status", "reset", "new"):
+        _, summary, _ = _HELP_TOPICS[cmd]
+        print(f"  {cmd:<12s} {summary}")
+    print(f"\n{BLD}Options:{OFF}")
+    for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
+                "jira", "extra-paths", "only", "branch", "output-dir",
+                "conflict-policy", "editor", "build-policy", "dry-run",
+                "yes", "signed-off-by", "assisted-by", "step",
+                "divergence", "toolbox", "regen"):
+        usage, summary, _ = _HELP_TOPICS[opt]
+        print(f"  {usage.split()[0]:<22s} {summary}")
+    print(f"\nRun 'isb help <topic>' for details on any command or option.")
+    sys.exit(0)
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="isb -- Intelligent Subsystem Backport for RHEL kernels",
@@ -459,17 +770,19 @@ def parse_args():
         epilog=textwrap.dedent("""\
             commands:
               isb                          default backport flow
+              isb help [TOPIC]             show help (or topic details)
               isb status                   show progress and exit
               isb continue                 resume from saved state
               isb pick <HASH>              cherry-pick one upstream commit
               isb reset <HASH>             reset to an earlier commit
+              isb new                      clear session and start fresh
 
             examples:
               cd ~/kernels/centos-9
               isb --dry-run                first run, prompts for session
               isb                          subsequent runs reuse session
               isb pick abc123def456        single-commit pick
-              isb --upstream-version v7.2  override a session value
+              isb help conflict-policy     detailed help for an option
         """),
     )
     p.add_argument("--subsystem", default=None,
@@ -526,13 +839,14 @@ def parse_args():
     # Hidden backward-compat aliases for the old flag forms.
     p.add_argument("--continue", dest="resume", action="store_true",
                     help=argparse.SUPPRESS)
-    p.add_argument("--pick", default=None, metavar="HASH",
-                    help=argparse.SUPPRESS)
     p.add_argument("--status", action="store_true",
                     help=argparse.SUPPRESS)
 
-    # Subcommands: continue, status, pick, reset, new
+    # Subcommands: help, continue, status, pick, reset, new
     sub = p.add_subparsers(dest="command")
+    help_p = sub.add_parser("help", help="Show help for a command or option")
+    help_p.add_argument("topic", nargs="?", default=None,
+                        help="Command or option name")
     sub.add_parser("continue", help="Resume from saved state")
     sub.add_parser("status", help="Show backport progress and exit")
     pick_p = sub.add_parser("pick",
@@ -3599,15 +3913,20 @@ def main():
     args = parse_args()
     _check_and_install_deps()
 
+    # Handle help subcommand before anything else
+    if args.command == "help":
+        topic = getattr(args, "topic", None)
+        if topic:
+            _show_topic_help(topic)
+        else:
+            _show_general_help()
+
     # Normalize hidden compat flags into args.command
     if not args.command:
         if getattr(args, "status", False):
             args.command = "status"
         elif getattr(args, "resume", False):
             args.command = "continue"
-        elif getattr(args, "pick", None):
-            args.command = "pick"
-            args.hash = args.pick
 
     rhel_repo = os.path.abspath(args.rhel_repo)
     if not os.path.isdir(os.path.join(rhel_repo, ".git")):
