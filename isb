@@ -4069,13 +4069,15 @@ def main():
     if not os.path.isdir(os.path.join(upstream_repo, ".git")):
         die(f"Not a git repo: {upstream_repo}")
 
+    _sub_base = (os.path.basename(args.subsystem.rstrip("/"))
+                  if args.subsystem else "pick")
     branch = (args.branch
               or _session.get("branch")
-              or os.path.basename(args.subsystem.rstrip("/")))
+              or _sub_base)
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(rhel_repo), "backports",
         str(args.rhel),
-        os.path.basename(args.subsystem.rstrip("/")),
+        _sub_base,
     )
     toolbox_name = args.toolbox
     if not toolbox_name:
@@ -4084,18 +4086,13 @@ def main():
             _session["toolbox"] = toolbox_name
             _save()
 
-    # In pick mode, ignore session scope paths — derive from the commit
-    # unless the user explicitly passed --only on the command line.
-    if args.command == "pick" and args.only_paths:
-        # Check if only_paths came from the session vs the CLI.
-        # argparse default is None; session loads a list.
-        cli_only = None
-        for i, a in enumerate(sys.argv):
-            if a == "--only":
-                cli_only = True
-                break
-        if not cli_only:
+    # In pick mode, ignore session/subsystem scope paths — derive from
+    # the commit itself.  Only honor --only if explicitly on the CLI.
+    if args.command == "pick":
+        _pick_cli_only = any(a == "--only" for a in sys.argv[1:])
+        if not _pick_cli_only:
             args.only_paths = None
+            args.subsystem = None
 
     if args.only_paths:
         scope_paths = args.only_paths
