@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2967,11 +2968,12 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         )
     had_conflict = rc != 0
 
+    # Check for empty cherry-pick (already applied or unreachable)
+    r_staged = git("diff --cached --name-only",
+                   cwd=rhel_repo, check=False)
     if had_conflict:
         r_unmerged = git("diff --name-only --diff-filter=U",
                          cwd=rhel_repo, check=False)
-        r_staged = git("diff --cached --name-only",
-                       cwd=rhel_repo, check=False)
         if not r_unmerged.stdout.strip() and not r_staged.stdout.strip():
             warn(f"  Cherry-pick produced no changes: {err.strip()}")
             die(f"Cherry-pick of {commit_hash[:12]} failed with no "
@@ -3027,6 +3029,17 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 f"{hdr}: removed duplicate {kind} {name} "
                 f"definition (artifact of conflict resolution)"
             )
+
+    # After scoping, verify something remains staged
+    r_post = git("diff --cached --name-only", cwd=rhel_repo, check=False)
+    if not r_post.stdout.strip():
+        warn(f"  No in-scope changes remain after scoping "
+             f"for {commit_hash[:12]}.")
+        warn(f"  This commit may already be applied or touches "
+             f"no in-scope files.")
+        git("reset HEAD", cwd=rhel_repo, check=False)
+        _cherrypick_repo = None
+        return "skip", conflict_notes
 
     should_build = (
         (build_policy == "every") or
@@ -4135,6 +4148,32 @@ def main():
         info(f"Commit: {verify.stdout.strip()}")
         if scope_paths:
             info(f"Scope:  {', '.join(scope_paths)}")
+
+        # Check if this commit was already backported (hash in RHEL log)
+        paths_arg = " ".join(scope_paths) if scope_paths else "."
+        rc_dup, out_dup, _ = run_quiet(
+            f"git log --all -- {paths_arg} "
+            f"| grep -m1 -B30 -F {pick_hash}",
+            cwd=rhel_repo)
+        if rc_dup == 0 and out_dup.strip():
+            rhel_hash = ""
+            for ctx in reversed(out_dup.strip().split("\n")):
+                m = re.match(r'^commit\s+([0-9a-f]{12,})', ctx)
+                if m:
+                    rhel_hash = m.group(1)[:12]
+                    break
+            rhel_oneline = ""
+            if rhel_hash:
+                r_ol = git(f"log --oneline -1 {rhel_hash}",
+                           cwd=rhel_repo, check=False)
+                if r_ol.returncode == 0:
+                    rhel_oneline = r_ol.stdout.strip()
+            if rhel_oneline:
+                warn(f"  Already backported in RHEL: {rhel_oneline}")
+            else:
+                warn(f"  Already backported — upstream hash found "
+                     f"in RHEL log.")
+            return
 
         result, notes = cherry_pick_commit(
             pick_hash, upstream_repo, rhel_repo,
