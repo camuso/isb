@@ -345,6 +345,30 @@ def _detect_rhel_version(rhel_repo):
     return None
 
 
+def _detect_upstream_from_alternates(rhel_repo):
+    """Read .git/objects/info/alternates and return the upstream repo path,
+    or None if no alternates are configured."""
+    alternates_file = os.path.join(rhel_repo, ".git", "objects",
+                                    "info", "alternates")
+    if not os.path.isfile(alternates_file):
+        return None
+    try:
+        with open(alternates_file) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                # alternates entry is like /path/to/repo/.git/objects
+                # strip trailing .git/objects or /objects to get repo root
+                if line.endswith("/.git/objects"):
+                    return line[:-len("/.git/objects")]
+                elif line.endswith("/objects"):
+                    return line[:-len("/objects")]
+    except OSError:
+        pass
+    return None
+
+
 def ensure_upstream_objects(rhel_repo, upstream_repo):
     """Make upstream objects visible via git alternates (zero-copy).
 
@@ -3988,9 +4012,21 @@ def main():
                 "and --rhel was not set.\n"
                 "       Are you in a RHEL/CentOS kernel repo?")
 
+    # Auto-detect upstream repo from alternates if not set.
+    if not args.upstream_repo:
+        alt_repo = _detect_upstream_from_alternates(rhel_repo)
+        if alt_repo:
+            args.upstream_repo = alt_repo
+            _session["upstream_repo"] = alt_repo
+            _save()
+            info(f"  Upstream repo from alternates: {alt_repo}")
+
     # Prompt for missing required fields.
-    for req_field, req_label in [("subsystem", "Subsystem path"),
-                                   ("upstream_repo", "Upstream repo path")]:
+    # For 'pick' mode, subsystem is optional (derived from the commit).
+    req_fields = [("upstream_repo", "Upstream repo path")]
+    if args.command != "pick":
+        req_fields.insert(0, ("subsystem", "Subsystem path"))
+    for req_field, req_label in req_fields:
         if not getattr(args, req_field, None):
             print(f"  {WRN}{req_label} is not set.{OFF}")
             val = input(f"  {req_label}: ").strip()
@@ -4051,11 +4087,13 @@ def main():
     if args.only_paths:
         scope_paths = args.only_paths
         info(f"Using --only scope paths: {', '.join(scope_paths)}")
-    else:
+    elif args.subsystem:
         scope_paths = discover_scope_paths(
             args.subsystem, upstream_repo, args.extra_paths,
         )
-    if not scope_paths:
+    else:
+        scope_paths = []
+    if not scope_paths and args.command != "pick":
         die("No valid scope paths found. Check --subsystem and upstream repo.")
 
     # -- Single-commit pick mode --
@@ -4070,14 +4108,29 @@ def main():
 
         ensure_upstream_objects(rhel_repo, upstream_repo)
 
+        # If no subsystem was given, derive scope from the commit's files
+        pick_subsystem = args.subsystem or ""
+        if not scope_paths:
+            r = git(f"diff-tree --no-commit-id --name-only -r {pick_hash}",
+                    cwd=upstream_repo, check=False)
+            if r.returncode == 0 and r.stdout.strip():
+                pick_files = [f for f in r.stdout.strip().split("\n")
+                              if f.strip()]
+                scope_paths = sorted({os.path.dirname(f) for f in pick_files
+                                      if os.path.dirname(f)})
+                if not pick_subsystem and scope_paths:
+                    pick_subsystem = scope_paths[0]
+
         header("Single commit pick")
         info(f"Commit: {verify.stdout.strip()}")
-        info(f"Scope:  {', '.join(scope_paths)}")
+        if scope_paths:
+            info(f"Scope:  {', '.join(scope_paths)}")
 
         result, notes = cherry_pick_commit(
-            pick_hash, upstream_repo, rhel_repo, scope_paths,
+            pick_hash, upstream_repo, rhel_repo,
+            scope_paths or ["."],
             args.conflict_policy, args.build_policy, toolbox_name,
-            args.subsystem, args.jira, args.upstream_version,
+            pick_subsystem, args.jira, args.upstream_version,
             args.rhel, [], output_dir, 0, 1,
             signed_off_by=args.signed_off_by,
             assisted_by=args.assisted_by,
