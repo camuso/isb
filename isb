@@ -4468,10 +4468,13 @@ def main():
         if scope_paths:
             info(f"Scope:  {', '.join(scope_paths)}")
 
-        # Check if this commit was already backported (hash in RHEL log)
+        # Check if this commit was already backported on the current branch.
+        # Do NOT use --all: that walks tags (linux-stable) and remotes
+        # (upstream), producing false positives from stable trailers like
+        # "commit <hash> upstream." that are not actual RHEL backports.
         paths_arg = " ".join(scope_paths) if scope_paths else "."
         rc_dup, out_dup, _ = run_quiet(
-            f"git log --all -- {paths_arg} "
+            f"git log -- {paths_arg} "
             f"| grep -m1 -B30 -F {pick_hash}",
             cwd=rhel_repo)
         if rc_dup == 0 and out_dup.strip():
