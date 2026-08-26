@@ -2,7 +2,7 @@
 """isb -- Intelligent Subsystem Backport for RHEL kernels.
 
 Discovers upstream commits, classifies by CONFIG enablement, cherry-picks
-with gort-style commit messages, resolves conflicts, and optionally
+with RHEL kernel compliant commit messages, resolves conflicts, and optionally
 build-tests via toolbox.
 """
 
@@ -471,7 +471,7 @@ _HELP_TOPICS = {
 
               Commands:  help, pick, continue, status, reset, new
               Options:   subsystem, rhel, upstream-repo, upstream-version,
-                         jira, extra-paths, only, branch, output-dir,
+                         cve, jira, extra-paths, only, branch, output-dir,
                          conflict-policy, editor, build-policy, dry-run,
                          yes, signed-off-by (or just 's'), assisted-by,
                          step, divergence, toolbox, regen
@@ -568,15 +568,25 @@ _HELP_TOPICS = {
         "--upstream-version TAG",
         "Upstream version tag, e.g. v7.1-rc3.",
         textwrap.dedent("""\
-            Recorded in the gort-style commit message as the upstream
+            Recorded in the RHEL kernel compliant commit message as the upstream
             status.  Optional; defaults to UPSTREAM_VERSION if not set.
+        """),
+    ),
+    "cve": (
+        "--cve IDENTIFIER",
+        "CVE identifier for the commit message.",
+        textwrap.dedent("""\
+            Placed above the JIRA line in the RHEL kernel compliant commit message.
+            Saved in the session and editable in the interactive menu.
+
+            Example: isb --cve CVE-2026-64191
         """),
     ),
     "jira": (
         "--jira URL",
         "JIRA ticket URL (default: RHEL-PLACEHOLDER).",
         textwrap.dedent("""\
-            Recorded in the gort-style commit message.  Can be updated
+            Recorded in the RHEL kernel compliant commit message.  Can be updated
             later via the interactive menu or --regen.
         """),
     ),
@@ -680,7 +690,7 @@ _HELP_TOPICS = {
         "--assisted-by 'NAME <EMAIL>'",
         "Assisted-by trailer for commit messages.",
         textwrap.dedent("""\
-            Optional trailer added to gort-style commit messages.
+            Optional trailer added to RHEL kernel compliant commit messages.
             Example: --assisted-by 'Claude <no-reply@anthropic.com>'
         """),
     ),
@@ -752,7 +762,7 @@ def _show_general_help():
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
-                "jira", "extra-paths", "only", "branch", "output-dir",
+                "cve", "jira", "extra-paths", "only", "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen"):
@@ -795,6 +805,8 @@ def parse_args():
                     help="Path to upstream kernel git repo")
     p.add_argument("--upstream-version", default=None,
                     help="Upstream version tag, e.g. v7.1-rc3")
+    p.add_argument("--cve", default="",
+                    help="CVE identifier (e.g. CVE-2026-64191)")
     p.add_argument("--jira", default="RHEL-PLACEHOLDER",
                     help="JIRA URL (default: RHEL-PLACEHOLDER)")
     p.add_argument("--extra-paths", nargs="*", default=[],
@@ -868,7 +880,7 @@ def parse_args():
 
 SESSION_FIELDS = [
     "subsystem", "rhel", "upstream_repo", "upstream_version",
-    "signed_off_by", "jira", "toolbox", "only_paths", "extra_paths",
+    "signed_off_by", "cve", "jira", "toolbox", "only_paths", "extra_paths",
     "conflict_policy", "build_policy", "editor", "assisted_by",
 ]
 
@@ -1175,7 +1187,7 @@ def _print_menu(session):
 
 
 def prompt_session():
-    """Menu-driven session editor, gort-style.
+    """Menu-driven session editor.
 
     Operates directly on the global _session dict. Every edit is
     immediately visible to the Ctrl-C handler for saving.
@@ -1251,7 +1263,7 @@ def find_conflicted_commits(rhel_repo, base_commit):
     """Scan backported commits for those with a Conflicts stanza.
 
     Returns a list of (rhel_hash, upstream_hash) for each commit
-    that has 'Conflicts:' in its gort-style message.
+    that has 'Conflicts:' in its RHEL kernel compliant message.
     """
     r = git(f"log --reverse --format='%H' {base_commit}..HEAD",
             cwd=rhel_repo, check=False)
@@ -1277,7 +1289,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
                          scope_paths, conflict_policy, build_policy,
                          toolbox_name, subsystem, jira, upstream_version,
                          rhel_ver, output_dir, signed_off_by,
-                         assisted_by):
+                         assisted_by, cve=""):
     """Reset to before the first conflicted commit and re-apply with patchpal."""
     conflicted = find_conflicted_commits(rhel_repo, base_commit)
     if not conflicted:
@@ -1331,7 +1343,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             subsystem, jira, upstream_version,
             rhel_ver, [], output_dir, idx, len(replay_set),
             signed_off_by=signed_off_by,
-            assisted_by=assisted_by,
+            assisted_by=assisted_by, cve=cve,
         )
         if result == "skip":
             warn(f"  skipped {uh[:12]}")
@@ -1389,6 +1401,7 @@ _CONFIRM_FIELDS = [
     ("3", "rhel_repo",        "RHEL repo",        "text"),
     ("4", "upstream_repo",    "Upstream repo",     "text"),
     ("5", "upstream_version", "Upstream version",  "text"),
+    ("v", "cve",              "CVE",              "text"),
     ("6", "jira",             "JIRA",             "text"),
     ("7", "branch",           "Branch",           "text"),
     ("8", "output_dir",       "Output dir",       "text"),
@@ -1577,6 +1590,7 @@ def show_confirmation_menu(params):
                 params.get("upstream_version", "UPSTREAM_VERSION"),
                 sob,
                 params.get("assisted_by", ""),
+                cve=params.get("cve", ""),
             )
             continue
 
@@ -1960,7 +1974,7 @@ def find_divergence_point(rhel_repo, upstream_repo, scope_paths):
     the search.
 
     Recognizes these formats in commit messages:
-      - 'commit <40-hex>' on its own line (gort format)
+      - 'commit <40-hex>' on its own line (RHEL kernel compliant format)
       - 'commit <40-hex> upstream'
       - '(cherry picked from commit <40-hex>)'
     """
@@ -3160,7 +3174,7 @@ def write_build_failure_report(output_dir, commit_hash, subject,
 
 
 def _consolidate_conflict_notes(notes):
-    """Group and consolidate conflict notes for gort formatting.
+    """Group and consolidate conflict notes for RHEL kernel compliant formatting.
 
     When there are more than 3 'new upstream file' entries, group them
     into a single consolidated note to avoid excessively long stanzas.
@@ -3194,8 +3208,8 @@ def _consolidate_conflict_notes(notes):
 
 def format_gort_message(subject, commit_hash, upstream_repo,
                         jira, upstream_version, conflict_notes,
-                        signed_off_by, assisted_by=""):
-    """Build a gort-style commit message."""
+                        signed_off_by, assisted_by="", cve=""):
+    """Build an RHEL kernel compliant commit message."""
     r = git(f"log --format='%an <%ae>' -1 {commit_hash}",
             cwd=upstream_repo, check=False)
     if r.returncode != 0:
@@ -3212,6 +3226,8 @@ def format_gort_message(subject, commit_hash, upstream_repo,
     indented_body = textwrap.indent(body, "    ")
 
     lines = [subject, ""]
+    if cve:
+        lines.append(f"CVE: {cve}")
     lines.append(f"JIRA: {jira}")
     lines.append(f"Upstream status: {upstream_version}")
 
@@ -3266,7 +3282,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                        conflict_policy, build_policy, toolbox_name,
                        subsystem, jira, upstream_version, rhel_ver,
                        omit_list, output_dir, applied_count, total_count,
-                       signed_off_by, assisted_by=""):
+                       signed_off_by, assisted_by="", cve=""):
     """Cherry-pick a single commit with conflict resolution and optional build.
     Returns (success, conflict_notes)."""
 
@@ -3480,7 +3496,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     msg = format_gort_message(
         subject, commit_hash, upstream_repo,
         jira, upstream_version, conflict_notes,
-        signed_off_by, assisted_by=assisted_by,
+        signed_off_by, assisted_by=assisted_by, cve=cve,
     )
     msg_file = "/tmp/backport_msg.txt"
     with open(msg_file, "w") as fh:
@@ -3743,12 +3759,22 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
 # Commit-message rewriting (regen)
 # ---------------------------------------------------------------------------
 
-def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by):
-    """Replace metadata fields in a gort-style commit message.
+def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by,
+                     cve=""):
+    """Replace metadata fields in an RHEL kernel compliant commit message.
 
     Preserves conflict notes, upstream commit citation, and body verbatim.
     Only touches the well-known trailer/header lines.
     """
+    if cve:
+        if re.search(r'^CVE: ', msg, re.MULTILINE):
+            msg = re.sub(r'^CVE: .*$', f'CVE: {cve}',
+                         msg, count=1, flags=re.MULTILINE)
+        else:
+            msg = re.sub(r'^(JIRA:)', f'CVE: {cve}\n\\1',
+                         msg, count=1, flags=re.MULTILINE)
+    elif re.search(r'^CVE: ', msg, re.MULTILINE):
+        msg = re.sub(r'^CVE: .*\n?', '', msg, count=1, flags=re.MULTILINE)
     msg = re.sub(r'^JIRA: .*$', f'JIRA: {jira}', msg, flags=re.MULTILINE)
     msg = re.sub(r'^Upstream status: .*$',
                  f'Upstream status: {upstream_version}',
@@ -3771,11 +3797,12 @@ def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by):
 
 
 def regen_patches(rhel_repo, output_dir, base_commit,
-                  jira, upstream_version, signed_off_by, assisted_by):
+                  jira, upstream_version, signed_off_by, assisted_by,
+                  cve=""):
     """Rewrite commit messages on the backport branch and regenerate patches.
 
     Uses git filter-branch --msg-filter to update JIRA, Upstream status,
-    Signed-off-by, and Assisted-by in every commit since base_commit.
+    Signed-off-by, CVE, and Assisted-by in every commit since base_commit.
     """
     header("Regenerating patches")
 
@@ -3789,6 +3816,8 @@ def regen_patches(rhel_repo, output_dir, base_commit,
         die("No commits found since base -- nothing to regenerate.")
 
     info(f"  Rewriting {len(commits)} commit message(s) ...")
+    if cve:
+        info(f"    CVE:             {cve}")
     info(f"    JIRA:            {jira}")
     info(f"    Upstream status: {upstream_version}")
     info(f"    Signed-off-by:   {signed_off_by}")
@@ -3801,7 +3830,8 @@ def regen_patches(rhel_repo, output_dir, base_commit,
             old_msg = git(f"log --format=%B -1 {c}",
                           cwd=rhel_repo).stdout.rstrip()
             new_msg = _rewrite_message(old_msg, jira, upstream_version,
-                                       signed_off_by, assisted_by)
+                                       signed_off_by, assisted_by,
+                                       cve=cve)
             with open(os.path.join(msg_dir, c), "w") as fh:
                 fh.write(new_msg)
 
@@ -4040,6 +4070,7 @@ def main():
              or _session.get("upstream_version", "UPSTREAM_VERSION")),
             args.signed_off_by,
             args.assisted_by or _session.get("assisted_by", ""),
+            cve=args.cve or _session.get("cve", ""),
         )
         return
 
@@ -4084,12 +4115,19 @@ def main():
             return name
 
     # -- Branch selection / drift check --
-    target_branch = _session.get("branch")
-    if not target_branch and _session.get("subsystem"):
-        target_branch = os.path.basename(
-            _session["subsystem"].rstrip("/"))
-    current_branch = git("rev-parse --abbrev-ref HEAD",
-                         cwd=rhel_repo, check=False).stdout.strip()
+    # Skip for pick mode: pick operates on whatever branch is current
+    # unless the user explicitly passed --branch.
+    if args.command == "pick" and args.branch is None:
+        target_branch = None
+        current_branch = git("rev-parse --abbrev-ref HEAD",
+                             cwd=rhel_repo, check=False).stdout.strip()
+    else:
+        target_branch = _session.get("branch")
+        if not target_branch and _session.get("subsystem"):
+            target_branch = os.path.basename(
+                _session["subsystem"].rstrip("/"))
+        current_branch = git("rev-parse --abbrev-ref HEAD",
+                             cwd=rhel_repo, check=False).stdout.strip()
 
     if target_branch:
         # Saved branch exists in session -- check if it's still a valid ref
@@ -4129,7 +4167,8 @@ def main():
                     print("quit")
                     sys.exit(0)
 
-    if not target_branch:
+    if not target_branch and not (args.command == "pick" and
+                                    args.branch is None):
         # No valid saved branch -- prompt user to select or create one
         raw = git("branch --list --format='%(refname:short)'",
                   cwd=rhel_repo, check=False).stdout.strip()
@@ -4504,7 +4543,7 @@ def main():
             pick_subsystem, args.jira, args.upstream_version,
             args.rhel, [], output_dir, 0, 1,
             signed_off_by=args.signed_off_by,
-            assisted_by=args.assisted_by,
+            assisted_by=args.assisted_by, cve=args.cve,
         )
         if result == "skip":
             warn("Commit skipped.")
@@ -4525,6 +4564,7 @@ def main():
         "rhel_repo": rhel_repo,
         "upstream_repo": upstream_repo,
         "upstream_version": args.upstream_version,
+        "cve": args.cve,
         "jira": args.jira,
         "branch": branch,
         "output_dir": output_dir,
@@ -4553,6 +4593,7 @@ def main():
         branch = params["branch"]
         output_dir = params["output_dir"]
         args.signed_off_by = params.get("signed_off_by", args.signed_off_by)
+        args.cve = params.get("cve", args.cve)
         args.jira = params.get("jira", args.jira)
         args.upstream_version = params.get("upstream_version",
                                            args.upstream_version)
@@ -4583,7 +4624,7 @@ def main():
                     params["rhel"],
                     output_dir,
                     params.get("signed_off_by", args.signed_off_by),
-                    args.assisted_by,
+                    args.assisted_by, cve=args.cve,
                 )
                 return
             else:
@@ -4777,7 +4818,7 @@ def main():
                 params["upstream_version"],
                 args.rhel, omit, output_dir, idx, len(keep),
                 signed_off_by=args.signed_off_by,
-                assisted_by=args.assisted_by,
+                assisted_by=args.assisted_by, cve=args.cve,
             )
 
             if result == "skip":
