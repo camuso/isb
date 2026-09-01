@@ -1410,6 +1410,8 @@ _CONFIRM_FIELDS = [
     ("c", "conflict_policy",  "Conflict policy",  "cycle"),
     ("b", "build_policy",     "Build policy",     "cycle"),
     ("e", "editor",           "Editor",           "text"),
+    ("o", "only_paths",       "Only paths",       "paths"),
+    ("f", "extra_paths",      "Extra paths",      "paths"),
 ]
 
 
@@ -1451,6 +1453,8 @@ def show_confirmation_menu(params):
                     and not _has_display()):
                 display = (f"{DIM}patchpal{OFF} "
                            f"{WRN}(requires GUI) **{OFF}")
+            elif isinstance(val, list):
+                display = " ".join(val) if val else f"{WRN}(not set){OFF}"
             elif val:
                 display = f"{val}{suffix}"
             else:
@@ -1703,6 +1707,18 @@ def show_confirmation_menu(params):
                     new_tb = _pick_toolbox(params[field])
                     if new_tb is not None:
                         params[field] = new_tb
+                elif ftype == "paths":
+                    cur = params[field] or []
+                    display = " ".join(cur) if cur else "(none)"
+                    print()
+                    print(f"    Current: {INF}{display}{OFF}")
+                    val = input("    Space-separated paths "
+                                "(Enter to keep, 'clear' to empty): "
+                                ).strip()
+                    if val == "clear":
+                        params[field] = []
+                    elif val:
+                        params[field] = val.split()
                 else:
                     cur = params[field] or ""
                     print()
@@ -4574,6 +4590,8 @@ def main():
         "build_policy": args.build_policy,
         "editor": _session.get("editor") or _get_editor(),
         "scope_paths": scope_paths,
+        "only_paths": args.only_paths or [],
+        "extra_paths": args.extra_paths or [],
         "dry_run": args.dry_run,
     }
 
@@ -4595,6 +4613,8 @@ def main():
         args.signed_off_by = params.get("signed_off_by", args.signed_off_by)
         args.cve = params.get("cve", args.cve)
         args.jira = params.get("jira", args.jira)
+        args.only_paths = params.get("only_paths") or None
+        args.extra_paths = params.get("extra_paths") or []
         args.upstream_version = params.get("upstream_version",
                                            args.upstream_version)
         if params.get("_step"):
