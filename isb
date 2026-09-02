@@ -539,7 +539,15 @@ _HELP_TOPICS = {
             Identifies the kernel subsystem to backport.  isb uses this
             to auto-discover scope paths (Makefile, header directories,
             DT binding paths, etc.) and to name the working branch and
-            output directory.
+            output directory.  Also used as the build target
+            (make M=<subsystem>).
+
+            Interactive menu hotkey: 1
+
+            Scope paths control which files are kept in each cherry-pick.
+            Use --only to override auto-discovery, or --extra-paths to
+            add to it.  Builds always compile the full subsystem
+            directory regardless of scope path granularity.
 
             Example: isb --subsystem drivers/char/ipmi
         """),
@@ -551,6 +559,8 @@ _HELP_TOPICS = {
             Normally auto-detected from Makefile.rhelver in the current
             repo.  Use this to override when the repo version does not
             reflect the target release.
+
+            Interactive menu hotkey: 2
         """),
     ),
     "upstream-repo": (
@@ -562,6 +572,8 @@ _HELP_TOPICS = {
 
             Auto-detected from .git/objects/info/alternates if already
             configured.  Saved in the session for subsequent runs.
+
+            Interactive menu hotkey: 4
         """),
     ),
     "upstream-version": (
@@ -570,6 +582,8 @@ _HELP_TOPICS = {
         textwrap.dedent("""\
             Recorded in the RHEL kernel compliant commit message as the upstream
             status.  Optional; defaults to UPSTREAM_VERSION if not set.
+
+            Interactive menu hotkey: 5
         """),
     ),
     "cve": (
@@ -578,6 +592,8 @@ _HELP_TOPICS = {
         textwrap.dedent("""\
             Placed above the JIRA line in the RHEL kernel compliant commit message.
             Saved in the session and editable in the interactive menu.
+
+            Interactive menu hotkey: v
 
             Example: isb --cve CVE-2026-64191
         """),
@@ -588,6 +604,8 @@ _HELP_TOPICS = {
         textwrap.dedent("""\
             Recorded in the RHEL kernel compliant commit message.  Can be updated
             later via the interactive menu or --regen.
+
+            Interactive menu hotkey: 6
         """),
     ),
     "extra-paths": (
@@ -596,14 +614,28 @@ _HELP_TOPICS = {
         textwrap.dedent("""\
             Appended to the paths that isb discovers from the subsystem
             Makefile.  Useful for including headers or DT bindings that
-            are not automatically found.
+            are not automatically found.  Paths can be directories or
+            individual files.
+
+            Interactive menu hotkey: f
+
+            Note: these paths control which files are kept in each
+            cherry-pick.  Builds always compile the full --subsystem
+            directory (make M=<subsystem>), regardless of scope paths.
         """),
     ),
     "only": (
         "--only PATH [PATH ...]",
         "Use only these scope paths, skip auto-discovery.",
         textwrap.dedent("""\
-            Overrides all auto-discovery and uses exactly the given paths.
+            Overrides all auto-discovery and uses exactly the given
+            paths.  Paths can be directories or individual files.
+
+            Interactive menu hotkey: o
+
+            Note: these paths control which files are kept in each
+            cherry-pick.  Builds always compile the full --subsystem
+            directory (make M=<subsystem>), regardless of scope paths.
 
             Example:
               isb --only drivers/char/ipmi include/linux/ipmi.h
@@ -615,6 +647,8 @@ _HELP_TOPICS = {
         textwrap.dedent("""\
             The branch where cherry-picked commits will land.  Created
             from main/master if it does not exist.  Saved in the session.
+
+            Interactive menu hotkey: 7
         """),
     ),
     "output-dir": (
@@ -624,6 +658,8 @@ _HELP_TOPICS = {
             Default: ../backports/<RHEL-version>/<subsystem-leaf>/
             Contains the patches/ subdirectory, build failure reports,
             and commit list files (keep_commits.txt, omit_commits.txt).
+
+            Interactive menu hotkey: 8
         """),
     ),
     "conflict-policy": (
@@ -638,6 +674,8 @@ _HELP_TOPICS = {
             Default: patchpal if a display and the executable are found,
             otherwise edit.  Out-of-scope files, MAINTAINERS, and
             delete/modify conflicts are always resolved automatically.
+
+            Interactive menu hotkey: c (cycles through policies)
         """),
     ),
     "editor": (
@@ -647,6 +685,8 @@ _HELP_TOPICS = {
             Any editor command the user prefers (vim, gvim, emacs, nano,
             vscodium, etc.).  Saved in the session.  Also used by the
             'fix' option when a build fails.
+
+            Interactive menu hotkey: e
         """),
     ),
     "build-policy": (
@@ -658,6 +698,8 @@ _HELP_TOPICS = {
             never     - Skip all incremental builds.
 
             Default: conflict.
+
+            Interactive menu hotkey: b (cycles through policies)
         """),
     ),
     "dry-run": (
@@ -667,6 +709,8 @@ _HELP_TOPICS = {
             Runs phases 1-3 (dist-configs, divergence, commit discovery)
             and prints the keep/omit lists, then exits without modifying
             the working tree.
+
+            No interactive menu hotkey (CLI-only).
         """),
     ),
     "yes": (
@@ -676,6 +720,8 @@ _HELP_TOPICS = {
             Proceeds directly with the current session parameters
             without displaying the confirmation menu.  Useful for
             scripted or non-interactive invocations.
+
+            No interactive menu hotkey (CLI-only).
         """),
     ),
     "signed-off-by": (
@@ -683,7 +729,9 @@ _HELP_TOPICS = {
         "Signed-off-by trailer for commit messages (-s).",
         textwrap.dedent("""\
             Auto-detected from git config user.name and user.email if
-            not provided.  Editable in the interactive menu (hotkey 9).
+            not provided.
+
+            Interactive menu hotkey: 9
         """),
     ),
     "assisted-by": (
@@ -691,6 +739,9 @@ _HELP_TOPICS = {
         "Assisted-by trailer for commit messages.",
         textwrap.dedent("""\
             Optional trailer added to RHEL kernel compliant commit messages.
+
+            No interactive menu hotkey (set via CLI or New session flow).
+
             Example: --assisted-by 'Claude <no-reply@anthropic.com>'
         """),
     ),
@@ -710,6 +761,8 @@ _HELP_TOPICS = {
             Specifies the upstream commit hash to use as the divergence
             point, skipping phase 2 auto-detection.  Useful when the
             auto-detection picks the wrong commit.
+
+            No interactive menu hotkey (CLI-only).
         """),
     ),
     "toolbox": (
@@ -720,6 +773,8 @@ _HELP_TOPICS = {
             and incremental build-tests.  If the RHEL target version
             does not match the host OS, isb prompts for selection from
             the available toolboxes.
+
+            Interactive menu hotkey: t
         """),
     ),
     "regen": (
