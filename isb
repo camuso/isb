@@ -610,8 +610,8 @@ _HELP_TOPICS = {
         """),
     ),
     "extra-paths": (
-        "--extra-paths PATH [PATH ...]",
-        "Additional scope paths beyond auto-discovered ones.",
+        "--extra-paths path [path ...]",
+        "Additional scope paths beyond auto-discovered ones (space-separated).",
         textwrap.dedent("""\
             Appended to the paths that isb discovers from the subsystem
             Makefile.  Useful for including headers or DT bindings that
@@ -626,8 +626,8 @@ _HELP_TOPICS = {
         """),
     ),
     "only": (
-        "--only PATH [PATH ...]",
-        "Use only these scope paths, skip auto-discovery.",
+        "--only path [path ...]",
+        "Use only these scope paths, skip auto-discovery (space-separated).",
         textwrap.dedent("""\
             Overrides all auto-discovery and uses exactly the given
             paths.  Paths can be directories or individual files.
@@ -643,8 +643,8 @@ _HELP_TOPICS = {
         """),
     ),
     "exclude": (
-        "--exclude PATH [PATH ...]",
-        "Exclude paths/files from scope.",
+        "--exclude path [path ...]",
+        "Exclude paths/files from scope (space-separated).",
         textwrap.dedent("""\
             Removes matching paths from the scope.  Applied after
             auto-discovery (or --only) and --extra-paths, so it can
@@ -659,8 +659,10 @@ _HELP_TOPICS = {
             commits are discovered.  Builds always compile the full
             --subsystem directory (make M=<subsystem>).
 
-            Example:
+            Examples:
               isb --subsystem drivers/i2c --exclude drivers/i2c/busses
+              isb --exclude drivers/i2c/busses drivers/i2c/muxes
+              isb --exclude drivers/char/ipmi/ipmb_dev_int.c
         """),
     ),
     "branch": (
