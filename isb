@@ -4779,10 +4779,15 @@ def main():
             print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
             print(f"  Edit in another terminal to add, remove, or "
                   f"reorder.")
-            print(f"\n  {BLD}Press any key to continue, or Ctrl-C to "
-                  f"exit{OFF} ", end="", flush=True)
-            _getch()
+            print(f"\n  {BLD}Press g to go (apply all), "
+                  f"x to single-step, or Ctrl-C to exit:{OFF} ",
+                  end="", flush=True)
+            ch = _getch()
             print()
+            if ch == 'x':
+                args.step = True
+            elif ch == 'g':
+                args.step = False
 
         # If resuming, reload the commit list (user may have edited it)
         if os.path.isfile(keep_file):
