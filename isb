@@ -471,7 +471,8 @@ _HELP_TOPICS = {
 
               Commands:  help, pick, continue, status, reset, new
               Options:   subsystem, rhel, upstream-repo, upstream-version,
-                         cve, jira, extra-paths, only, branch, output-dir,
+                         cve, jira, extra-paths, only, exclude,
+                         branch, output-dir,
                          conflict-policy, editor, build-policy, dry-run,
                          yes, signed-off-by (or just 's'), assisted-by,
                          step, divergence, toolbox, regen
@@ -639,6 +640,27 @@ _HELP_TOPICS = {
 
             Example:
               isb --only drivers/char/ipmi include/linux/ipmi.h
+        """),
+    ),
+    "exclude": (
+        "--exclude PATH [PATH ...]",
+        "Exclude paths/files from scope.",
+        textwrap.dedent("""\
+            Removes matching paths from the scope.  Applied after
+            auto-discovery (or --only) and --extra-paths, so it can
+            subtract from any source.  Paths can be directories or
+            individual files.  A scope file is excluded if it starts
+            with any of the exclude prefixes.
+
+            Interactive menu hotkey: -
+
+            Note: like --only and --extra-paths, this controls which
+            files are kept in each cherry-pick and which upstream
+            commits are discovered.  Builds always compile the full
+            --subsystem directory (make M=<subsystem>).
+
+            Example:
+              isb --subsystem drivers/i2c --exclude drivers/i2c/busses
         """),
     ),
     "branch": (
@@ -817,7 +839,8 @@ def _show_general_help():
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
-                "cve", "jira", "extra-paths", "only", "branch", "output-dir",
+                "cve", "jira", "extra-paths", "only", "exclude",
+                "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen"):
@@ -869,6 +892,9 @@ def parse_args():
     p.add_argument("--only", nargs="+", default=None, dest="only_paths",
                     help="Use only these scope paths, skip auto-discovery "
                          "(e.g. --only Documentation/devicetree/bindings/ipmi)")
+    p.add_argument("--exclude", nargs="+", default=[],
+                    help="Exclude these paths/files from scope "
+                         "(e.g. --exclude drivers/i2c/busses)")
     p.add_argument("--branch", default=None,
                     help="Branch name (default: leaf of subsystem path)")
     p.add_argument("--output-dir", default=None,
@@ -936,7 +962,7 @@ def parse_args():
 SESSION_FIELDS = [
     "subsystem", "rhel", "upstream_repo", "upstream_version",
     "signed_off_by", "cve", "jira", "toolbox", "only_paths", "extra_paths",
-    "conflict_policy", "build_policy", "editor", "assisted_by",
+    "exclude", "conflict_policy", "build_policy", "editor", "assisted_by",
 ]
 
 REQUIRED_SESSION = [
@@ -950,7 +976,7 @@ TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
     "subsystem", "rhel", "upstream_repo", "upstream_version",
-    "only_paths", "extra_paths",
+    "only_paths", "extra_paths", "exclude",
 }
 
 SESSION_FILE = os.path.join(".backport", "session.json")
@@ -1047,11 +1073,11 @@ def has_session_cli_args(args):
     """Return True if the user provided session-level args on the CLI."""
     for field in SESSION_FIELDS:
         val = getattr(args, field, None)
-        if field in ("extra_paths",) and val:
+        if field in ("extra_paths", "exclude") and val:
             return True
         if field in ("only_paths",) and val is not None:
             return True
-        if field not in ("extra_paths", "only_paths") and val is not None:
+        if field not in ("extra_paths", "exclude", "only_paths") and val is not None:
             return True
     return False
 
@@ -1195,7 +1221,7 @@ def _edit_field(field, label, current, required):
         return current
     elif field == "toolbox":
         return _pick_toolbox(current)
-    elif field in ("only_paths", "extra_paths"):
+    elif field in ("only_paths", "extra_paths", "exclude"):
         display = " ".join(current) if current else ""
         prompt_str = f"    {label} [{display}]: " if display else f"    {label}: "
         val = input(prompt_str).strip()
@@ -1290,7 +1316,7 @@ def apply_session_to_args(args, session):
     for field in SESSION_FIELDS:
         cli_val = getattr(args, field, None)
         sess_val = session.get(field)
-        if field in ("extra_paths",):
+        if field in ("extra_paths", "exclude"):
             if not cli_val and sess_val:
                 setattr(args, field, sess_val)
         elif field == "only_paths":
@@ -1305,11 +1331,11 @@ def merge_cli_into_session(args, session):
     """Update session dict with any CLI-provided session-level args."""
     for field in SESSION_FIELDS:
         cli_val = getattr(args, field, None)
-        if field in ("extra_paths",) and cli_val:
+        if field in ("extra_paths", "exclude") and cli_val:
             session[field] = cli_val
         elif field == "only_paths" and cli_val is not None:
             session[field] = cli_val
-        elif field not in ("extra_paths", "only_paths") and cli_val is not None:
+        elif field not in ("extra_paths", "exclude", "only_paths") and cli_val is not None:
             session[field] = cli_val
     return session
 
@@ -1344,7 +1370,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
                          scope_paths, conflict_policy, build_policy,
                          toolbox_name, subsystem, jira, upstream_version,
                          rhel_ver, output_dir, signed_off_by,
-                         assisted_by, cve=""):
+                         assisted_by, cve="", exclude_paths=None):
     """Reset to before the first conflicted commit and re-apply with patchpal."""
     conflicted = find_conflicted_commits(rhel_repo, base_commit)
     if not conflicted:
@@ -1399,6 +1425,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             rhel_ver, [], output_dir, idx, len(replay_set),
             signed_off_by=signed_off_by,
             assisted_by=assisted_by, cve=cve,
+            exclude_paths=exclude_paths,
         )
         if result == "skip":
             warn(f"  skipped {uh[:12]}")
@@ -1467,6 +1494,7 @@ _CONFIRM_FIELDS = [
     ("e", "editor",           "Editor",           "text"),
     ("o", "only_paths",       "Only paths",       "paths"),
     ("f", "extra_paths",      "Extra paths",      "paths"),
+    ("-", "exclude",          "Exclude paths",    "paths"),
 ]
 
 
@@ -2121,11 +2149,15 @@ def find_divergence_point(rhel_repo, upstream_repo, scope_paths):
     return earliest_h
 
 
-def list_pending_commits(upstream_repo, divergence, scope_paths, rhel_repo):
+def list_pending_commits(upstream_repo, divergence, scope_paths, rhel_repo,
+                         exclude_paths=None):
     """List upstream commits since divergence touching scope_paths,
     excluding those already on RHEL main."""
     with Spinner("Listing upstream commits since divergence ..."):
         path_args = " ".join(scope_paths)
+        if exclude_paths:
+            excl_args = " ".join(f"':!{e}'" for e in exclude_paths)
+            path_args = f"{path_args} {excl_args}"
         r = git(f"log --no-merges --reverse --format='%H' "
                 f"{divergence}..HEAD -- {path_args}",
                 cwd=upstream_repo)
@@ -3073,7 +3105,7 @@ def check_duplicate_definitions(rhel_repo):
     return fixes
 
 
-def scope_index(rhel_repo, scope_paths):
+def scope_index(rhel_repo, scope_paths, exclude_paths=None):
     """Unstage files outside the scope paths from the index.
 
     Handles two cases for out-of-scope files:
@@ -3083,10 +3115,15 @@ def scope_index(rhel_repo, scope_paths):
     r = git("diff --cached --name-only", cwd=rhel_repo, check=False)
     staged = [f for f in r.stdout.strip().split("\n") if f]
     in_scope_prefixes = tuple(p.rstrip("/") for p in scope_paths)
+    excl_prefixes = (tuple(e.rstrip("/") for e in exclude_paths)
+                     if exclude_paths else ())
     removed = []
 
     for f in staged:
-        if f == "MAINTAINERS" or not f.startswith(in_scope_prefixes):
+        out_of_scope = (f == "MAINTAINERS"
+                        or not f.startswith(in_scope_prefixes)
+                        or f.startswith(excl_prefixes))
+        if out_of_scope:
             exists_in_head = git(
                 f"cat-file -e HEAD:{f}", cwd=rhel_repo, check=False
             ).returncode == 0
@@ -3353,7 +3390,8 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                        conflict_policy, build_policy, toolbox_name,
                        subsystem, jira, upstream_version, rhel_ver,
                        omit_list, output_dir, applied_count, total_count,
-                       signed_off_by, assisted_by="", cve=""):
+                       signed_off_by, assisted_by="", cve="",
+                       exclude_paths=None):
     """Cherry-pick a single commit with conflict resolution and optional build.
     Returns (success, conflict_notes)."""
 
@@ -3393,7 +3431,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             )
 
     with Spinner("Scoping and indexing ..."):
-        removed = scope_index(rhel_repo, scope_paths)
+        removed = scope_index(rhel_repo, scope_paths, exclude_paths)
         total_oos = len(removed) + oos_conflict_count
         if total_oos:
             is_treewide = bool(re.search(r'tree[\s-]?wide', subject, re.I))
@@ -4545,6 +4583,14 @@ def main():
         )
     else:
         scope_paths = []
+    if args.exclude and scope_paths:
+        excl = tuple(e.rstrip("/") for e in args.exclude)
+        before = len(scope_paths)
+        scope_paths = [p for p in scope_paths
+                       if not p.rstrip("/").startswith(excl)]
+        if len(scope_paths) < before:
+            info(f"Excluded {before - len(scope_paths)} path(s): "
+                 f"{', '.join(args.exclude)}")
     if not scope_paths and args.command != "pick":
         die("No valid scope paths found. Check --subsystem and upstream repo.")
 
@@ -4615,6 +4661,7 @@ def main():
             args.rhel, [], output_dir, 0, 1,
             signed_off_by=args.signed_off_by,
             assisted_by=args.assisted_by, cve=args.cve,
+            exclude_paths=args.exclude or None,
         )
         if result == "skip":
             warn("Commit skipped.")
@@ -4647,6 +4694,7 @@ def main():
         "scope_paths": scope_paths,
         "only_paths": args.only_paths or [],
         "extra_paths": args.extra_paths or [],
+        "exclude": args.exclude or [],
         "dry_run": args.dry_run,
     }
 
@@ -4670,6 +4718,7 @@ def main():
         args.jira = params.get("jira", args.jira)
         args.only_paths = params.get("only_paths") or None
         args.extra_paths = params.get("extra_paths") or []
+        args.exclude = params.get("exclude") or []
         args.upstream_version = params.get("upstream_version",
                                            args.upstream_version)
         if params.get("_step"):
@@ -4700,6 +4749,7 @@ def main():
                     output_dir,
                     params.get("signed_off_by", args.signed_off_by),
                     args.assisted_by, cve=args.cve,
+                    exclude_paths=args.exclude or None,
                 )
                 return
             else:
@@ -4737,6 +4787,7 @@ def main():
                 )
             pending = list_pending_commits(
                 upstream_repo, divergence, scope_paths, rhel_repo,
+                exclude_paths=args.exclude or None,
             )
             if not pending:
                 die("No pending commits found. Nothing to backport.")
@@ -4899,6 +4950,7 @@ def main():
                 args.rhel, omit, output_dir, idx, len(keep),
                 signed_off_by=args.signed_off_by,
                 assisted_by=args.assisted_by, cve=args.cve,
+                exclude_paths=args.exclude or None,
             )
 
             if result == "skip":
