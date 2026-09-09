@@ -1432,6 +1432,9 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
         if result == "skip":
             warn(f"  skipped {uh[:12]}")
             continue
+        if result == "menu":
+            info("  Returning to interactive menu.")
+            return
         if not result:
             die(f"Replay failed on {uh[:12]}. Resolve manually.")
         status(f"  applied {'with resolved conflicts' if notes else '(clean)'}")
@@ -2733,6 +2736,318 @@ def _get_editor():
     return "vi"
 
 
+def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
+    """Deep analysis of a conflicted file using git blame.
+
+    Identifies upstream prerequisite commits that introduced the conflicting
+    code and checks whether they are present in RHEL.
+
+    Returns a dict:
+      {
+        "file": cf,
+        "classification": str,       # context drift, missing prerequisite, etc.
+        "diff_summary": str,         # compact unified diff (resolved vs upstream)
+        "missing_prereqs": [(hash, subject), ...],
+        "present_prereqs": [(hash, subject), ...],
+        "rhel_specific_count": int,  # lines with KABI/RHEL markers
+        "hunk_count": int,
+      }
+    """
+    import difflib
+    result = {
+        "file": cf,
+        "classification": "unknown",
+        "diff_summary": "",
+        "missing_prereqs": [],
+        "present_prereqs": [],
+        "rhel_specific_count": 0,
+        "hunk_count": 0,
+    }
+
+    if not commit_hash or not upstream_repo:
+        result["classification"] = "in-scope conflict (no upstream context)"
+        return result
+
+    # Get upstream version of the file after this commit
+    us_r = git(f"show {commit_hash}:{cf}",
+               cwd=upstream_repo, check=False)
+    if us_r.returncode != 0:
+        result["classification"] = "file absent in upstream at this commit"
+        return result
+
+    # Get the resolved version from the index or working tree
+    our_r = git(f"show :0:{cf}", cwd=rhel_repo, check=False)
+    if our_r.returncode != 0:
+        our_path = os.path.join(rhel_repo, cf)
+        if os.path.isfile(our_path):
+            with open(our_path) as fh:
+                ours = fh.read()
+        else:
+            result["classification"] = "file removed during resolution"
+            return result
+    else:
+        ours = our_r.stdout
+
+    upstream = us_r.stdout
+    us_lines = upstream.splitlines(keepends=True)
+    our_lines = ours.splitlines(keepends=True)
+
+    # Generate unified diff: resolved vs upstream
+    diff_lines = list(difflib.unified_diff(
+        us_lines, our_lines,
+        fromfile=f"upstream ({commit_hash[:12]})",
+        tofile=f"resolved (RHEL)",
+        n=3,
+    ))
+    result["diff_summary"] = "".join(diff_lines)
+
+    hunk_headers = [l for l in diff_lines if l.startswith("@@")]
+    result["hunk_count"] = len(hunk_headers)
+
+    if result["hunk_count"] == 0:
+        result["classification"] = "resolved (identical to upstream)"
+        return result
+
+    # Count RHEL-specific markers
+    added = [l for l in diff_lines
+             if l.startswith("+") and not l.startswith("+++")]
+    result["rhel_specific_count"] = sum(
+        1 for l in added
+        if "RH_KABI" in l or "RHEL" in l or "redhat" in l.lower()
+    )
+
+    # --- Git blame analysis for prerequisite detection ---
+    # Find which line ranges in the upstream file differ from RHEL.
+    # Use the zero-context diff to identify exact upstream line numbers.
+    zero_diff = list(difflib.unified_diff(us_lines, our_lines, n=0))
+    blame_lines = set()
+    for hdr in zero_diff:
+        if not hdr.startswith("@@"):
+            continue
+        # Parse @@ -start,count +start,count @@
+        m = re.match(r"@@ -(\d+)(?:,(\d+))? ", hdr)
+        if m:
+            start = int(m.group(1))
+            count = int(m.group(2)) if m.group(2) else 1
+            for i in range(start, start + count):
+                blame_lines.add(i)
+
+    if not blame_lines:
+        result["classification"] = (
+            f"{result['hunk_count']} hunk(s) differ from upstream"
+        )
+        return result
+
+    # Run git blame on the upstream file for the parent of this commit
+    # to find which commits introduced the conflicting context.
+    parent = f"{commit_hash}~1"
+    blame_hashes = set()
+    for line_no in sorted(blame_lines):
+        r = git(f"blame -L {line_no},{line_no} --porcelain "
+                f"{parent} -- {cf}",
+                cwd=upstream_repo, check=False)
+        if r.returncode != 0:
+            continue
+        for bl in r.stdout.split("\n"):
+            bm = re.match(r"^([0-9a-f]{40})\s", bl)
+            if bm:
+                h = bm.group(1)
+                # Skip boundary commits (all zeros or the commit itself)
+                if h != "0" * 40 and h != commit_hash:
+                    blame_hashes.add(h)
+
+    # Cross-reference blame hashes with RHEL history
+    for bh in sorted(blame_hashes):
+        subj_r = git(f"log --format='%s' -1 {bh}",
+                     cwd=upstream_repo, check=False)
+        if subj_r.returncode != 0:
+            continue
+        subj = subj_r.stdout.strip()
+
+        # Check if this commit hash appears in RHEL commit messages
+        grep_r = git(f"log --all --format='%H' --grep={bh} -1",
+                     cwd=rhel_repo, check=False)
+        if grep_r.returncode == 0 and grep_r.stdout.strip():
+            result["present_prereqs"].append((bh, subj))
+        else:
+            result["missing_prereqs"].append((bh, subj))
+
+    # Classify based on findings
+    if result["missing_prereqs"]:
+        n = len(result["missing_prereqs"])
+        result["classification"] = (
+            f"missing prerequisite ({n} upstream commit(s) not in RHEL)"
+        )
+    elif result["rhel_specific_count"]:
+        result["classification"] = (
+            f"{result['hunk_count']} hunk(s) differ from upstream "
+            f"({result['rhel_specific_count']} RHEL-specific)"
+        )
+    else:
+        result["classification"] = (
+            f"context drift ({result['hunk_count']} hunk(s) differ)"
+        )
+
+    return result
+
+
+def _write_resolution_report(output_dir, commit_hash, subject, analyses):
+    """Write a detailed conflict resolution report file.
+
+    Args:
+        output_dir: directory for the report file
+        commit_hash: upstream commit hash
+        subject: upstream commit subject line
+        analyses: list of dicts from _analyze_conflict()
+
+    Returns the path to the written report file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.join(
+        output_dir, f"conflict-report-{commit_hash[:12]}.txt"
+    )
+
+    with open(report_path, "w") as fh:
+        fh.write(f"Conflict Resolution Report\n")
+        fh.write(f"{'=' * 70}\n\n")
+        fh.write(f"Upstream commit: {commit_hash[:12]} {subject}\n")
+        fh.write(f"Date:            {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.write(f"Files with conflicts: {len(analyses)}\n\n")
+
+        all_missing = []
+        for a in analyses:
+            fh.write(f"{'─' * 70}\n")
+            fh.write(f"File: {a['file']}\n")
+            fh.write(f"Classification: {a['classification']}\n")
+            fh.write(f"Hunks differing from upstream: {a['hunk_count']}\n")
+            if a["rhel_specific_count"]:
+                fh.write(f"RHEL-specific lines: "
+                         f"{a['rhel_specific_count']}\n")
+
+            if a["missing_prereqs"]:
+                fh.write(f"\nMISSING PREREQUISITES "
+                         f"({len(a['missing_prereqs'])}):\n")
+                fh.write(f"  These upstream commits modified the "
+                         f"conflicting lines but are\n")
+                fh.write(f"  NOT present in the RHEL branch. "
+                         f"Consider backporting them first.\n\n")
+                for h, s in a["missing_prereqs"]:
+                    fh.write(f"  {h[:12]} {s}\n")
+                    all_missing.append((h, s))
+
+            if a["present_prereqs"]:
+                fh.write(f"\nPrerequisites already in RHEL "
+                         f"({len(a['present_prereqs'])}):\n")
+                for h, s in a["present_prereqs"]:
+                    fh.write(f"  {h[:12]} {s}\n")
+
+            if a["diff_summary"]:
+                fh.write(f"\nDiff (resolved vs upstream):\n")
+                fh.write(f"{'.' * 40}\n")
+                fh.write(a["diff_summary"])
+                if not a["diff_summary"].endswith("\n"):
+                    fh.write("\n")
+                fh.write(f"{'.' * 40}\n")
+
+            fh.write("\n")
+
+        # Summary section at the end
+        if all_missing:
+            seen = set()
+            unique = []
+            for h, s in all_missing:
+                if h not in seen:
+                    seen.add(h)
+                    unique.append((h, s))
+            fh.write(f"{'=' * 70}\n")
+            fh.write(f"ACTION REQUIRED: {len(unique)} missing "
+                     f"prerequisite(s) detected\n\n")
+            fh.write(f"The following upstream commits introduced code "
+                     f"that this commit\n")
+            fh.write(f"depends on, but they are not in the RHEL "
+                     f"branch:\n\n")
+            for h, s in unique:
+                fh.write(f"  isb pick {h}\n")
+                fh.write(f"    # {s}\n\n")
+            fh.write(f"Consider backporting these first, then "
+                     f"retrying this commit.\n")
+
+    return report_path
+
+
+def _show_review_menu(commit_hash, subject, analyses, report_path):
+    """Display post-conflict review and present A/B/C menu.
+
+    Shows:
+      - Summary of each conflicted file and its classification
+      - Path to the full resolution report
+      - Compact diff summary (hunk counts)
+      - Missing prerequisites warning if any
+
+    Returns:
+      "accept"  -- user accepted the resolution
+      "redo"    -- user wants to re-do the resolution
+      "skip"    -- user aborted, skip to next commit
+      "menu"    -- user aborted, return to interactive menu
+      "exit"    -- user aborted, exit isb
+    """
+    while True:
+        print(f"\n{CAU}{'=' * 70}{OFF}")
+        print(f"  {BLD}Conflict Review: {commit_hash[:12]} {subject}{OFF}")
+        print(f"  {'─' * 66}")
+
+        all_missing = []
+        for a in analyses:
+            icon = f"{STA}✓{OFF}" if a["hunk_count"] == 0 else f"{WRN}△{OFF}"
+            print(f"  {icon} {INF}{a['file']}{OFF}")
+            print(f"      {a['classification']}")
+            if a["missing_prereqs"]:
+                for h, s in a["missing_prereqs"]:
+                    print(f"      {WRN}⚠ missing: {h[:12]} {s}{OFF}")
+                    all_missing.append((h, s))
+
+        if all_missing:
+            seen = set()
+            unique = [(h, s) for h, s in all_missing
+                      if h not in seen and not seen.add(h)]
+            print(f"\n  {WRN}WARNING: {len(unique)} missing "
+                  f"prerequisite(s) detected.{OFF}")
+            print(f"  {WRN}See report for 'isb pick' commands.{OFF}")
+
+        print(f"\n  Report: {INF}{report_path}{OFF}")
+        print(f"  {'─' * 66}")
+        print(f"  {MNU}A{OFF}  Re-do resolution (reopen in editor/patchpal)")
+        print(f"  {MNU}B{OFF}  Accept and continue")
+        print(f"  {MNU}C{OFF}  Abort this cherry-pick")
+        print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+
+        ch = _getch()
+        print()
+
+        if ch in ('b', 'B'):
+            return "accept"
+        elif ch in ('a', 'A'):
+            return "redo"
+        elif ch in ('c', 'C', '\x03'):
+            # Abort sub-menu
+            print(f"\n  {CAU}Abort — what next?{OFF}")
+            print(f"  {MNU}A{OFF}  Skip to the next commit")
+            print(f"  {MNU}B{OFF}  Return to the interactive menu")
+            print(f"  {MNU}C{OFF}  Exit isb")
+            print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+            ch2 = _getch()
+            print()
+            if ch2 in ('a', 'A'):
+                return "skip"
+            elif ch2 in ('b', 'B'):
+                return "menu"
+            elif ch2 in ('c', 'C', '\x03'):
+                return "exit"
+            else:
+                # Default to skip on unrecognized
+                return "skip"
+
+
 def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     """Analyze a resolved conflict file and return a short classification.
 
@@ -2799,7 +3114,9 @@ def _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
                           commit_hash=None, upstream_repo=None):
     """Open conflicted files in the user's editor for manual resolution.
 
-    Returns a list of conflict note strings.
+    Returns (notes, conflicted_files) where notes is a list of conflict
+    note strings and conflicted_files is the list of in-scope file paths
+    that had conflicts.
     """
     editor = _get_editor()
     notes = []
@@ -2856,7 +3173,7 @@ def _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
             notes.append(f"{cf}: deleted during manual edit")
         git(f"add -- {cf}", cwd=rhel_repo, check=False)
 
-    return notes
+    return notes, list(in_scope_conflicts)
 
 
 def _raise_patchpal_window():
@@ -2883,7 +3200,9 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
                               commit_hash=None, upstream_repo=None):
     """Launch patchpal as git mergetool for in-scope conflicted files.
 
-    Returns a list of conflict note strings.
+    Returns (notes, conflicted_files) where notes is a list of conflict
+    note strings and conflicted_files is the list of in-scope file paths
+    that had conflicts.
     """
     notes = []
     for cf in in_scope_conflicts:
@@ -2923,7 +3242,7 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
         detail = _classify_conflict(cf, rhel_repo, commit_hash,
                                     upstream_repo)
         notes.append(f"{cf}: patchpal — {detail}")
-    return notes
+    return notes, list(in_scope_conflicts)
 
 
 def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
@@ -3000,20 +3319,22 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
             die(f"Conflict in {cf} and --conflict-policy=abort. "
                 f"Aborting cherry-pick.")
 
+    inscope_conflicted = []
     if in_scope_deferred:
         if conflict_policy == "patchpal":
-            deferred_notes = _resolve_inscope_patchpal(
+            deferred_notes, deferred_files = _resolve_inscope_patchpal(
                 in_scope_deferred, rhel_repo,
                 commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
         else:
-            deferred_notes = _resolve_inscope_edit(
+            deferred_notes, deferred_files = _resolve_inscope_edit(
                 in_scope_deferred, rhel_repo,
                 commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
         notes.extend(deferred_notes)
+        inscope_conflicted = deferred_files
 
-    return notes, len(oos_excluded)
+    return notes, len(oos_excluded), inscope_conflicted
 
 
 def check_duplicate_definitions(rhel_repo):
@@ -3422,65 +3743,122 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 "       The commit object may not be reachable from "
                 "the RHEL repo.")
 
-    # -- Conflict resolution and scope filtering --
+    # -- Conflict resolution, scope filtering, and review loop --
     conflict_notes = []
     oos_conflict_count = 0
-    if had_conflict:
-        with Spinner("Resolving conflicts ..."):
-            conflict_notes, oos_conflict_count = resolve_conflicts(
-                rhel_repo, scope_paths, conflict_policy, rhel_ver,
-                commit_hash=commit_hash, upstream_repo=upstream_repo,
-            )
+    inscope_conflicted = []
 
-    with Spinner("Scoping and indexing ..."):
-        removed = scope_index(rhel_repo, scope_paths, exclude_paths)
-        total_oos = len(removed) + oos_conflict_count
-        if total_oos:
-            is_treewide = bool(re.search(r'tree[\s-]?wide', subject, re.I))
-            if is_treewide:
+    _redo_resolution = True
+    while _redo_resolution:
+        _redo_resolution = False
+
+        if had_conflict:
+            with Spinner("Resolving conflicts ..."):
+                conflict_notes, oos_conflict_count, inscope_conflicted = \
+                    resolve_conflicts(
+                        rhel_repo, scope_paths, conflict_policy, rhel_ver,
+                        commit_hash=commit_hash, upstream_repo=upstream_repo,
+                    )
+
+        with Spinner("Scoping and indexing ..."):
+            removed = scope_index(rhel_repo, scope_paths, exclude_paths)
+            total_oos = len(removed) + oos_conflict_count
+            if total_oos:
+                is_treewide = bool(
+                    re.search(r'tree[\s-]?wide', subject, re.I))
+                if is_treewide:
+                    conflict_notes.append(
+                        f"treewide commit scoped to {subsystem}; "
+                        f"{total_oos} out-of-scope file(s) excluded"
+                    )
+                else:
+                    conflict_notes.append(
+                        f"{total_oos} out-of-scope file(s) excluded"
+                    )
+
+            # Annotate in-scope new files
+            r = git("diff --cached --name-only --diff-filter=A",
+                    cwd=rhel_repo, check=False)
+            new_files = [f for f in r.stdout.strip().split("\n") if f]
+            for nf in new_files:
                 conflict_notes.append(
-                    f"treewide commit scoped to {subsystem}; "
-                    f"{total_oos} out-of-scope file(s) excluded"
-                )
-            else:
+                    f"{nf}: new upstream file, included")
+
+            # Annotate in-scope deleted files
+            r = git("diff --cached --name-only --diff-filter=D",
+                    cwd=rhel_repo, check=False)
+            del_files = [f for f in r.stdout.strip().split("\n") if f]
+            if del_files:
+                n = len(del_files)
                 conflict_notes.append(
-                    f"{total_oos} out-of-scope file(s) excluded"
+                    f"{n} in-scope file(s) removed per upstream"
                 )
 
-        # Annotate in-scope new files
-        r = git("diff --cached --name-only --diff-filter=A", cwd=rhel_repo,
-                check=False)
-        new_files = [f for f in r.stdout.strip().split("\n") if f]
-        for nf in new_files:
-            conflict_notes.append(f"{nf}: new upstream file, included")
+            dup_fixes = check_duplicate_definitions(rhel_repo)
+            for hdr, kind, name, kept, _ in dup_fixes:
+                conflict_notes.append(
+                    f"{hdr}: removed duplicate {kind} {name} "
+                    f"definition (artifact of conflict resolution)"
+                )
 
-        # Annotate in-scope deleted files
-        r = git("diff --cached --name-only --diff-filter=D", cwd=rhel_repo,
-                check=False)
-        del_files = [f for f in r.stdout.strip().split("\n") if f]
-        if del_files:
-            n = len(del_files)
-            conflict_notes.append(
-                f"{n} in-scope file(s) removed per upstream"
+        # After scoping, verify something remains staged
+        r_post = git("diff --cached --name-only",
+                     cwd=rhel_repo, check=False)
+        if not r_post.stdout.strip():
+            warn(f"  No in-scope changes remain after scoping "
+                 f"for {commit_hash[:12]}.")
+            warn(f"  This commit may already be applied or touches "
+                 f"no in-scope files.")
+            git("reset HEAD", cwd=rhel_repo, check=False)
+            _cherrypick_repo = None
+            return "skip", conflict_notes
+
+        # -- Post-conflict review --
+        if inscope_conflicted:
+            with Spinner("Analyzing conflict resolutions ..."):
+                analyses = [
+                    _analyze_conflict(cf, commit_hash,
+                                      upstream_repo, rhel_repo)
+                    for cf in inscope_conflicted
+                ]
+            report_path = _write_resolution_report(
+                output_dir, commit_hash, subject, analyses,
             )
 
-        dup_fixes = check_duplicate_definitions(rhel_repo)
-        for hdr, kind, name, kept, _ in dup_fixes:
-            conflict_notes.append(
-                f"{hdr}: removed duplicate {kind} {name} "
-                f"definition (artifact of conflict resolution)"
+            decision = _show_review_menu(
+                commit_hash, subject, analyses, report_path,
             )
 
-    # After scoping, verify something remains staged
-    r_post = git("diff --cached --name-only", cwd=rhel_repo, check=False)
-    if not r_post.stdout.strip():
-        warn(f"  No in-scope changes remain after scoping "
-             f"for {commit_hash[:12]}.")
-        warn(f"  This commit may already be applied or touches "
-             f"no in-scope files.")
-        git("reset HEAD", cwd=rhel_repo, check=False)
-        _cherrypick_repo = None
-        return "skip", conflict_notes
+            if decision == "redo":
+                # Reset the cherry-pick and re-apply
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                with Spinner(
+                        f"Re-applying {commit_hash[:12]} ..."):
+                    run_quiet(
+                        f"git cherry-pick --no-commit {commit_hash}",
+                        cwd=rhel_repo,
+                    )
+                conflict_notes = []
+                inscope_conflicted = []
+                _redo_resolution = True
+                continue
+
+            elif decision == "skip":
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                _cherrypick_repo = None
+                return "skip", conflict_notes
+
+            elif decision == "menu":
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                _cherrypick_repo = None
+                return "menu", conflict_notes
+
+            elif decision == "exit":
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                _cherrypick_repo = None
+                _cleanup_and_exit()
+
+            # "accept" falls through to build
 
     should_build = (
         (build_policy == "every") or
@@ -4667,6 +5045,8 @@ def main():
         )
         if result == "skip":
             warn("Commit skipped.")
+        elif result == "menu":
+            info("Returning to interactive menu.")
         elif result:
             if notes:
                 status("Pick complete (with conflicts resolved).")
@@ -4962,6 +5342,15 @@ def main():
                     "base_commit": base_commit,
                 })
                 continue
+
+            if result == "menu":
+                save_state(output_dir, {
+                    "next_idx": idx,
+                    "base_commit": base_commit,
+                })
+                info("  Returning to interactive menu.")
+                _step_loop = True
+                break
 
             if not result:
                 fail_count += 1
