@@ -811,6 +811,36 @@ _HELP_TOPICS = {
             'p' in the interactive menu.
         """),
     ),
+    "ailog": (
+        "--ailog / --no-ailog",
+        "AI-generated conflict explanation in commit messages (default: on).",
+        textwrap.dedent("""\
+            When enabled (the default), isb uses the Cursor SDK to call
+            Claude after every conflict resolution.  Claude reads the
+            upstream diff, the resolved diff, git-blame data, and any
+            missing-prerequisite information, then produces a concise
+            human-readable explanation that is:
+
+              1. Appended to the Conflicts stanza in the commit message.
+              2. Included in the conflict report file written to the
+                 output directory.
+
+            This is orthogonal to the conflict resolution policy
+            (patchpal / edit / abort).  patchpal resolves the *files*;
+            --ailog explains *why* the resolution was needed and what
+            changed.
+
+            Requires the cursor-sdk Python package (pip install cursor-sdk)
+            and CURSOR_API_KEY in the environment.  If either is missing,
+            isb falls back to the local heuristic analysis silently.
+
+            Interactive menu hotkey: i
+
+            Examples:
+              isb --no-ailog          # disable AI explanation
+              isb --ailog             # explicitly enable (already default)
+        """),
+    ),
 }
 
 
@@ -845,7 +875,7 @@ def _show_general_help():
                 "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
-                "divergence", "toolbox", "regen"):
+                "divergence", "toolbox", "regen", "ailog"):
         usage, summary, _ = _HELP_TOPICS[opt]
         print(f"  {usage.split()[0]:<22s} {summary}")
     print(f"\nRun 'isb help <topic>' for details on any command or option.")
@@ -928,6 +958,10 @@ def parse_args():
                          "(skips auto-detection)")
     p.add_argument("--toolbox", default=None,
                     help="Toolbox container name (default: rhel<RHEL>)")
+    p.add_argument("--ailog", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="AI-generated conflict explanation in commit "
+                         "messages (default: on, --no-ailog to disable)")
     p.add_argument("-h", "--help", action=_ManPageAction,
                     help="Show the man page (or short help if piped)")
 
@@ -965,6 +999,7 @@ SESSION_FIELDS = [
     "subsystem", "rhel", "upstream_repo", "upstream_version",
     "signed_off_by", "cve", "jira", "toolbox", "only_paths", "extra_paths",
     "exclude", "conflict_policy", "build_policy", "editor", "assisted_by",
+    "ailog",
 ]
 
 REQUIRED_SESSION = [
@@ -1372,7 +1407,8 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
                          scope_paths, conflict_policy, build_policy,
                          toolbox_name, subsystem, jira, upstream_version,
                          rhel_ver, output_dir, signed_off_by,
-                         assisted_by, cve="", exclude_paths=None):
+                         assisted_by, cve="", exclude_paths=None,
+                         ailog=True):
     """Reset to before the first conflicted commit and re-apply with patchpal."""
     conflicted = find_conflicted_commits(rhel_repo, base_commit)
     if not conflicted:
@@ -1428,6 +1464,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             signed_off_by=signed_off_by,
             assisted_by=assisted_by, cve=cve,
             exclude_paths=exclude_paths,
+            ailog=ailog,
         )
         if result == "skip":
             warn(f"  skipped {uh[:12]}")
@@ -1500,6 +1537,7 @@ _CONFIRM_FIELDS = [
     ("o", "only_paths",       "Only paths",       "paths"),
     ("f", "extra_paths",      "Extra paths",      "paths"),
     ("-", "exclude",          "Exclude paths",    "paths"),
+    ("i", "ailog",            "AI conflict log",  "toggle"),
 ]
 
 
@@ -1541,6 +1579,8 @@ def show_confirmation_menu(params):
                     and not _has_display()):
                 display = (f"{DIM}patchpal{OFF} "
                            f"{WRN}(requires GUI) **{OFF}")
+            elif isinstance(val, bool):
+                display = f"{STA}on{OFF}" if val else f"{WRN}off{OFF}"
             elif isinstance(val, list):
                 display = " ".join(val) if val else f"{WRN}(not set){OFF}"
             elif val:
@@ -1713,6 +1753,14 @@ def show_confirmation_menu(params):
                                   f"{OFF}")
                     elif val:
                         warn(f"    Invalid choice, keeping '{cur}'")
+                elif ftype == "toggle":
+                    cur_state = "on" if params[field] else "off"
+                    val = input(f"    {label} [{cur_state}] "
+                                f"(on/off): ").strip().lower()
+                    if val in ("on", "yes", "true", "1"):
+                        params[field] = True
+                    elif val in ("off", "no", "false", "0"):
+                        params[field] = False
                 else:
                     prompt_str = (f"    {label} [{cur}]: " if cur
                                   else f"    {label}: ")
@@ -1795,6 +1843,10 @@ def show_confirmation_menu(params):
                     new_tb = _pick_toolbox(params[field])
                     if new_tb is not None:
                         params[field] = new_tb
+                elif ftype == "toggle":
+                    params[field] = not params[field]
+                    state = "on" if params[field] else "off"
+                    status(f"  {label}: {state}")
                 elif ftype == "paths":
                     cur = params[field] or []
                     display = " ".join(cur) if cur else "(none)"
@@ -2891,7 +2943,103 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
     return result
 
 
-def _write_resolution_report(output_dir, commit_hash, subject, analyses):
+def _cursor_sdk_available():
+    """Return True if cursor-sdk is installed and CURSOR_API_KEY is set."""
+    if not os.environ.get("CURSOR_API_KEY"):
+        return False
+    try:
+        import cursor_sdk  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
+    """Use the Cursor SDK to generate an AI explanation of conflict resolutions.
+
+    Calls Claude with the diff, blame, and prerequisite data from each
+    analysis dict and returns a concise explanation string suitable for
+    inclusion in the commit message Conflicts stanza.
+
+    Returns:
+        str: AI-generated explanation, or "" if the SDK call fails.
+    """
+    if not _cursor_sdk_available():
+        return ""
+
+    from cursor_sdk import Agent, AgentOptions
+
+    # Build a structured prompt with all conflict context
+    sections = []
+    for a in analyses:
+        sec = [f"File: {a['file']}",
+               f"Classification: {a['classification']}",
+               f"Hunks: {a['hunk_count']}"]
+        if a["rhel_specific_count"]:
+            sec.append(f"RHEL-specific lines: {a['rhel_specific_count']}")
+        if a["missing_prereqs"]:
+            sec.append("Missing prerequisites:")
+            for h, s in a["missing_prereqs"]:
+                sec.append(f"  {h[:12]} {s}")
+        if a["present_prereqs"]:
+            sec.append("Present prerequisites:")
+            for h, s in a["present_prereqs"]:
+                sec.append(f"  {h[:12]} {s}")
+        if a["diff_summary"]:
+            # Truncate very long diffs to keep token usage reasonable
+            diff = a["diff_summary"]
+            if len(diff) > 4000:
+                diff = diff[:4000] + "\n... (truncated)\n"
+            sec.append(f"Diff (resolved vs upstream):\n{diff}")
+        sections.append("\n".join(sec))
+
+    prompt = f"""\
+You are analyzing a kernel backport conflict resolution.
+
+Upstream commit: {commit_hash[:12]} {subject}
+
+The following files had conflicts when cherry-picking this upstream commit
+into the RHEL kernel branch.  Each conflict has been resolved (by patchpal
+or a human editor).  Your job is to write a concise, technical explanation
+of WHY each conflict occurred and WHAT the resolution did differently from
+the upstream version.
+
+For each file, explain:
+1. The root cause of the conflict (context drift, missing prerequisite,
+   RHEL-specific code, API differences, etc.)
+2. What the resolution changed relative to the upstream version
+3. Whether any missing prerequisites should be backported first
+
+Be terse and technical — this text goes into a git commit message Conflicts
+stanza.  Use at most 3-4 lines per file.  Do NOT repeat the diff verbatim.
+Do NOT use markdown formatting.  Plain text only.
+
+{"=" * 60}
+{chr(10).join(f"{chr(10)}{'-' * 40}{chr(10)}{s}" for s in sections)}
+{"=" * 60}
+
+Write the explanation now.  Start directly with the first file name."""
+
+    try:
+        from cursor_sdk import LocalAgentOptions
+        result = Agent.prompt(
+            prompt,
+            AgentOptions(
+                api_key=os.environ["CURSOR_API_KEY"],
+                model="claude-4-sonnet",
+                local=LocalAgentOptions(cwd=os.getcwd()),
+            ),
+        )
+        if result.status == "finished" and result.result:
+            return result.result.strip()
+        return ""
+    except Exception as e:
+        info(f"  AI analysis unavailable: {e}")
+        return ""
+
+
+def _write_resolution_report(output_dir, commit_hash, subject, analyses,
+                             ai_explanation=""):
     """Write a detailed conflict resolution report file.
 
     Args:
@@ -2899,6 +3047,7 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses):
         commit_hash: upstream commit hash
         subject: upstream commit subject line
         analyses: list of dicts from _analyze_conflict()
+        ai_explanation: optional AI-generated explanation string
 
     Returns the path to the written report file.
     """
@@ -2951,6 +3100,16 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses):
 
             fh.write("\n")
 
+        # AI explanation section
+        if ai_explanation:
+            fh.write(f"{'=' * 70}\n")
+            fh.write(f"AI CONFLICT ANALYSIS (Claude)\n")
+            fh.write(f"{'─' * 70}\n")
+            fh.write(ai_explanation)
+            if not ai_explanation.endswith("\n"):
+                fh.write("\n")
+            fh.write("\n")
+
         # Summary section at the end
         if all_missing:
             seen = set()
@@ -2975,7 +3134,8 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses):
     return report_path
 
 
-def _show_review_menu(commit_hash, subject, analyses, report_path):
+def _show_review_menu(commit_hash, subject, analyses, report_path,
+                      ai_explanation=""):
     """Display post-conflict review and present A/B/C menu.
 
     Shows:
@@ -2983,6 +3143,7 @@ def _show_review_menu(commit_hash, subject, analyses, report_path):
       - Path to the full resolution report
       - Compact diff summary (hunk counts)
       - Missing prerequisites warning if any
+      - AI explanation if available
 
     Returns:
       "accept"  -- user accepted the resolution
@@ -3013,6 +3174,11 @@ def _show_review_menu(commit_hash, subject, analyses, report_path):
             print(f"\n  {WRN}WARNING: {len(unique)} missing "
                   f"prerequisite(s) detected.{OFF}")
             print(f"  {WRN}See report for 'isb pick' commands.{OFF}")
+
+        if ai_explanation:
+            print(f"\n  {BLD}AI Analysis:{OFF}")
+            for ln in ai_explanation.splitlines():
+                print(f"    {DIM}{ln}{OFF}")
 
         print(f"\n  Report: {INF}{report_path}{OFF}")
         print(f"  {'─' * 66}")
@@ -3714,7 +3880,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                        subsystem, jira, upstream_version, rhel_ver,
                        omit_list, output_dir, applied_count, total_count,
                        signed_off_by, assisted_by="", cve="",
-                       exclude_paths=None):
+                       exclude_paths=None, ailog=True):
     """Cherry-pick a single commit with conflict resolution and optional build.
     Returns (success, conflict_notes)."""
 
@@ -3821,12 +3987,27 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                                       upstream_repo, rhel_repo)
                     for cf in inscope_conflicted
                 ]
+
+            ai_explanation = ""
+            if ailog:
+                with Spinner("AI conflict analysis (Claude) ..."):
+                    ai_explanation = _ai_explain_conflicts(
+                        analyses, commit_hash, subject, upstream_repo,
+                    )
+                if ai_explanation:
+                    for ai_line in ai_explanation.splitlines():
+                        ai_line = ai_line.strip()
+                        if ai_line:
+                            conflict_notes.append(ai_line)
+
             report_path = _write_resolution_report(
                 output_dir, commit_hash, subject, analyses,
+                ai_explanation=ai_explanation,
             )
 
             decision = _show_review_menu(
                 commit_hash, subject, analyses, report_path,
+                ai_explanation=ai_explanation,
             )
 
             if decision == "redo":
@@ -4823,6 +5004,8 @@ def main():
             args.conflict_policy = "edit"
     if args.build_policy is None:
         args.build_policy = "conflict"
+    if args.ailog is None:
+        args.ailog = True
     _save()
 
     if args.conflict_policy == "patchpal":
@@ -5042,6 +5225,7 @@ def main():
             signed_off_by=args.signed_off_by,
             assisted_by=args.assisted_by, cve=args.cve,
             exclude_paths=args.exclude or None,
+            ailog=args.ailog,
         )
         if result == "skip":
             warn("Commit skipped.")
@@ -5077,6 +5261,7 @@ def main():
         "only_paths": args.only_paths or [],
         "extra_paths": args.extra_paths or [],
         "exclude": args.exclude or [],
+        "ailog": args.ailog,
         "dry_run": args.dry_run,
     }
 
@@ -5101,6 +5286,7 @@ def main():
         args.only_paths = params.get("only_paths") or None
         args.extra_paths = params.get("extra_paths") or []
         args.exclude = params.get("exclude") or []
+        args.ailog = params.get("ailog", args.ailog)
         args.upstream_version = params.get("upstream_version",
                                            args.upstream_version)
         if params.get("_step"):
@@ -5132,6 +5318,7 @@ def main():
                     params.get("signed_off_by", args.signed_off_by),
                     args.assisted_by, cve=args.cve,
                     exclude_paths=args.exclude or None,
+                    ailog=args.ailog,
                 )
                 return
             else:
@@ -5333,6 +5520,7 @@ def main():
                 signed_off_by=args.signed_off_by,
                 assisted_by=args.assisted_by, cve=args.cve,
                 exclude_paths=args.exclude or None,
+                ailog=args.ailog,
             )
 
             if result == "skip":

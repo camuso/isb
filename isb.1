@@ -175,6 +175,35 @@ without re-running the entire backport.
 Also available interactively via the
 .B p
 key in the confirmation menu.
+.TP
+.B \-\-ailog\fR, \fB\-\-no\-ailog
+Enable or disable AI-generated conflict explanation in commit messages
+(default: on).
+When enabled,
+.B isb
+uses the Cursor SDK to call Claude after every conflict resolution.
+Claude reads the upstream diff, the resolved diff, git-blame data, and
+missing-prerequisite information, then produces a concise explanation that
+is appended to the Conflicts stanza in the commit message and included in
+the conflict report file.
+This is orthogonal to the conflict resolution policy
+.RB ( patchpal / edit / abort ):
+the policy resolves the files;
+.B \-\-ailog
+explains why the resolution was needed and what changed.
+.IP
+Requires the
+.B cursor-sdk
+Python package and the
+.B CURSOR_API_KEY
+environment variable.
+If either is missing,
+.B isb
+falls back to local heuristic analysis silently.
+.IP
+Also available interactively via the
+.B i
+key in the confirmation menu.
 .SH DEPENDENCIES
 On startup,
 .B isb

@@ -39,6 +39,11 @@ RHEL-compliant commit messages suitable for merge requests.
   with full conflict resolution and commit message formatting. Detects
   already-backported commits by searching the RHEL log for the upstream
   hash before cherry-picking.
+- **AI conflict explanation** — `--ailog` (on by default) calls Claude
+  via the Cursor SDK after every conflict resolution to generate a concise
+  explanation of *why* the conflict occurred and *what* the resolution
+  changed, appended to the commit message Conflicts stanza and the
+  conflict report file. Disable with `--no-ailog`.
 - **Dry-run mode** — `--dry-run` classifies and lists upstream commits
   without applying anything.
 - **Built-in help** — `isb help` shows a summary of all commands and
@@ -54,6 +59,8 @@ RHEL-compliant commit messages suitable for merge requests.
 - [toolbox](https://containertoolbx.org/) (for build testing)
 - [patchpal](https://github.com/camuso/patchpal) (optional, for GUI
   conflict resolution)
+- [cursor-sdk](https://pypi.org/project/cursor-sdk/) + `CURSOR_API_KEY`
+  (optional, for AI conflict explanation via `--ailog`)
 
 ## Installation
 
@@ -109,6 +116,7 @@ Get help on any command or option:
 isb help                   # full summary
 isb help pick              # details on the pick command
 isb help conflict-policy   # details on conflict resolution options
+isb help ailog             # details on AI conflict explanation
 ```
 
 See `man isb` or `isb -h` for the full man page.
