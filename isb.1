@@ -177,20 +177,31 @@ Also available interactively via the
 key in the confirmation menu.
 .TP
 .B \-\-ailog\fR, \fB\-\-no\-ailog
-Enable or disable AI-generated conflict explanation in commit messages
+Enable or disable AI-assisted conflict explanation and build-fix
 (default: on).
 When enabled,
 .B isb
-uses the Cursor SDK to call Claude after every conflict resolution.
-Claude reads the upstream diff, the resolved diff, git-blame data, and
-missing-prerequisite information, then produces a concise explanation that
-is appended to the Conflicts stanza in the commit message and included in
-the conflict report file.
-This is orthogonal to the conflict resolution policy
-.RB ( patchpal / edit / abort ):
-the policy resolves the files;
-.B \-\-ailog
-explains why the resolution was needed and what changed.
+uses the Cursor SDK to call Claude in two situations:
+.RS
+.TP
+.B Conflict explanation
+After every conflict resolution, Claude reads the upstream diff,
+the resolved diff, git-blame data, and missing-prerequisite information,
+then produces a concise explanation appended to the Conflicts stanza in
+the commit message and the conflict report file.
+.TP
+.B Iterative build-fix
+When a build fails and the pattern-based auto-fix
+.RB ( api\-replacements.json )
+cannot resolve it,
+.B isb
+spawns a Cursor agent that examines the compiler errors, reads the
+failing source files, and applies minimal fixes.
+It then rebuilds and retries up to 3 times.
+If all AI attempts fail,
+.B isb
+falls through to the manual Skip / Fix / Abort menu.
+.RE
 .IP
 Requires the
 .B cursor-sdk

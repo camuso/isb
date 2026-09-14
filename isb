@@ -813,31 +813,42 @@ _HELP_TOPICS = {
     ),
     "ailog": (
         "--ailog / --no-ailog",
-        "AI-generated conflict explanation in commit messages (default: on).",
+        "AI-generated conflict explanation and build-fix (default: on).",
         textwrap.dedent("""\
             When enabled (the default), isb uses the Cursor SDK to call
-            Claude after every conflict resolution.  Claude reads the
-            upstream diff, the resolved diff, git-blame data, and any
-            missing-prerequisite information, then produces a concise
-            human-readable explanation that is:
+            Claude in two situations:
 
-              1. Appended to the Conflicts stanza in the commit message.
-              2. Included in the conflict report file written to the
-                 output directory.
+            1. CONFLICT EXPLANATION
+               After every conflict resolution, Claude reads the upstream
+               diff, the resolved diff, git-blame data, and any
+               missing-prerequisite information, then produces a concise
+               human-readable explanation that is:
 
-            This is orthogonal to the conflict resolution policy
-            (patchpal / edit / abort).  patchpal resolves the *files*;
-            --ailog explains *why* the resolution was needed and what
-            changed.
+                 a. Appended to the Conflicts stanza in the commit message.
+                 b. Included in the conflict report file written to the
+                    output directory.
+
+               This is orthogonal to the conflict resolution policy
+               (patchpal / edit / abort).  patchpal resolves the *files*;
+               --ailog explains *why* the resolution was needed.
+
+            2. ITERATIVE BUILD-FIX
+               When a build fails after cherry-pick and the pattern-based
+               auto-fix (api-replacements.json) cannot resolve it, isb
+               spawns a Cursor agent that reads the compiler errors,
+               examines the failing source files, and applies minimal
+               fixes.  isb then rebuilds and retries up to 3 times.
+               If all AI attempts fail, isb falls back to the manual
+               Skip / Fix / Abort menu.
 
             Requires the cursor-sdk Python package (pip install cursor-sdk)
             and CURSOR_API_KEY in the environment.  If either is missing,
-            isb falls back to the local heuristic analysis silently.
+            isb falls back to local heuristic analysis silently.
 
             Interactive menu hotkey: i
 
             Examples:
-              isb --no-ailog          # disable AI explanation
+              isb --no-ailog          # disable AI features
               isb --ailog             # explicitly enable (already default)
         """),
     ),
@@ -3697,6 +3708,88 @@ def try_fix_missing_api(build_output, rhel_repo):
     return bool(fixes_applied), fixes_applied
 
 
+AI_FIX_MAX_RETRIES = 3
+
+
+def _ai_fix_build(build_output, rhel_repo, commit_hash, subject,
+                   subsystem, toolbox_name):
+    """Use the Cursor SDK agent to attempt an AI-driven build fix.
+
+    Spawns a local Cursor agent that can read and edit files in the repo.
+    The agent analyses the compiler errors and edits the failing source
+    files.  The caller is responsible for staging, amending, and
+    rebuilding.
+
+    Returns:
+        (True, note)  if the agent edited at least one file
+        (False, "")   if the SDK is unavailable or the agent made no edits
+    """
+    if not _cursor_sdk_available():
+        return False, ""
+
+    from cursor_sdk import Agent, AgentOptions, LocalAgentOptions
+
+    # Trim build output to the last 200 lines to stay within token limits
+    lines = build_output.splitlines()
+    if len(lines) > 200:
+        trimmed = "\n".join(lines[-200:])
+    else:
+        trimmed = build_output
+
+    prompt = f"""\
+You are fixing a C build error in a RHEL kernel backport.
+
+Commit being backported: {commit_hash[:12]} {subject}
+Subsystem: {subsystem}
+Repository root: {rhel_repo}
+
+COMPILER OUTPUT (last 200 lines):
+{trimmed}
+
+INSTRUCTIONS:
+1. Read the failing source file(s) mentioned in the errors above.
+2. Diagnose the root cause (missing API, changed function signature,
+   removed struct field, missing include, RHEL-specific difference, etc.).
+3. Apply the MINIMUM fix needed to make the build pass.  Prefer
+   RHEL-compatible equivalents of upstream APIs.  Do NOT rewrite large
+   sections of code.
+4. Do NOT run any shell commands.  Do NOT run make or build anything.
+   Only edit the source files that need fixing.
+5. After editing, write a one-line summary of what you changed and why.
+"""
+
+    try:
+        result = Agent.prompt(
+            prompt,
+            AgentOptions(
+                api_key=os.environ["CURSOR_API_KEY"],
+                model="claude-4-sonnet",
+                local=LocalAgentOptions(cwd=rhel_repo),
+            ),
+        )
+
+        # Check if the agent actually modified any tracked files
+        r = git("diff --name-only", cwd=rhel_repo, check=False)
+        changed = [f for f in r.stdout.strip().split("\n") if f]
+        if not changed:
+            return False, ""
+
+        note = ""
+        if result.status == "finished" and result.result:
+            # Extract the last non-empty line as the summary
+            for ln in reversed(result.result.strip().splitlines()):
+                ln = ln.strip()
+                if ln:
+                    note = ln
+                    break
+
+        return True, note or f"AI fix applied to {', '.join(changed)}"
+
+    except Exception as e:
+        info(f"  AI build fix unavailable: {e}")
+        return False, ""
+
+
 def diagnose_build_failure(build_output, commit_hash, subject,
                            rhel_repo, upstream_repo, scope_paths,
                            toolbox_name, subsystem, omit_list,
@@ -4065,7 +4158,55 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             if fixed:
                 status(f"  Auto-fixed: {fix_note}")
                 conflict_notes.append(fix_note)
-            else:
+            elif ailog:
+                # AI iterative build-fix loop
+                ai_fix_ok = False
+                for attempt in range(1, AI_FIX_MAX_RETRIES + 1):
+                    info(f"  AI build-fix attempt {attempt}/"
+                         f"{AI_FIX_MAX_RETRIES} ...")
+                    with Spinner("AI analyzing build error ..."):
+                        ai_edited, ai_note = _ai_fix_build(
+                            build_output, rhel_repo, commit_hash,
+                            subject, subsystem, toolbox_name,
+                        )
+                    if not ai_edited:
+                        warn("  AI could not propose a fix.")
+                        break
+
+                    info(f"  AI fix: {ai_note}")
+                    git("add -u", cwd=rhel_repo, check=False)
+                    git("commit --amend --no-edit",
+                        cwd=rhel_repo, check=False)
+
+                    tb = (f" in toolbox '{toolbox_name}'"
+                          if toolbox_name else "")
+                    with Spinner(f"Rebuilding {subsystem}{tb} "
+                                 f"(AI attempt {attempt}) ..."):
+                        build_ok, build_output = build_test(
+                            rhel_repo, toolbox_name, subsystem,
+                        )
+                    if build_ok:
+                        status(f"  AI build-fix succeeded on "
+                               f"attempt {attempt}.")
+                        conflict_notes.append(
+                            f"AI build-fix ({attempt} attempt(s)): "
+                            f"{ai_note}"
+                        )
+                        ai_fix_ok = True
+                        break
+                    else:
+                        warn(f"  Still failing after AI "
+                             f"attempt {attempt}.")
+
+                if ai_fix_ok:
+                    pass  # fall through to commit
+                else:
+                    if not build_ok:
+                        warn("  AI fix exhausted — manual intervention "
+                             "needed.")
+                    # fall through to manual menu below
+
+            if not build_ok and not fixed:
                 report_path = os.path.join(output_dir,
                                            "build-failure-report.txt")
                 bad_files = _extract_failing_files(build_output)

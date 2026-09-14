@@ -39,11 +39,17 @@ RHEL-compliant commit messages suitable for merge requests.
   with full conflict resolution and commit message formatting. Detects
   already-backported commits by searching the RHEL log for the upstream
   hash before cherry-picking.
-- **AI conflict explanation** — `--ailog` (on by default) calls Claude
-  via the Cursor SDK after every conflict resolution to generate a concise
-  explanation of *why* the conflict occurred and *what* the resolution
-  changed, appended to the commit message Conflicts stanza and the
-  conflict report file. Disable with `--no-ailog`.
+- **AI conflict explanation & build-fix** — `--ailog` (on by default) calls
+  Claude via the Cursor SDK for two purposes:
+  1. After every conflict resolution, generates a concise explanation of
+     *why* the conflict occurred and *what* the resolution changed,
+     appended to the commit message Conflicts stanza and the conflict
+     report file.
+  2. When a build fails and pattern-based auto-fix cannot resolve it,
+     spawns a Cursor agent to read the compiler errors, examine the
+     failing source, apply minimal fixes, and rebuild — retrying up to
+     3 times before falling back to the manual menu.
+  Disable with `--no-ailog`.
 - **Dry-run mode** — `--dry-run` classifies and lists upstream commits
   without applying anything.
 - **Built-in help** — `isb help` shows a summary of all commands and
