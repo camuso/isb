@@ -1488,6 +1488,7 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             assisted_by=assisted_by, cve=cve,
             exclude_paths=exclude_paths,
             ailog=ailog,
+            subject=subj,
         )
         if result == "skip":
             warn(f"  skipped {uh[:12]}")
@@ -3713,6 +3714,8 @@ def scope_index(rhel_repo, scope_paths, exclude_paths=None):
                      if exclude_paths else ())
     removed = []
 
+    restore = []
+    rm_new = []
     for f in staged:
         out_of_scope = (f == "MAINTAINERS"
                         or not f.startswith(in_scope_prefixes)
@@ -3722,12 +3725,18 @@ def scope_index(rhel_repo, scope_paths, exclude_paths=None):
                 f"cat-file -e HEAD:{f}", cwd=rhel_repo, check=False
             ).returncode == 0
             if exists_in_head:
-                git(f"checkout HEAD -- {f}", cwd=rhel_repo, check=False)
+                restore.append(f)
             else:
-                git(f"rm -f {f}", cwd=rhel_repo, check=False)
-            removed.append(f)
+                rm_new.append(f)
 
-    return removed
+    if restore:
+        git(f"checkout HEAD -- {' '.join(restore)}",
+            cwd=rhel_repo, check=False)
+    if rm_new:
+        git(f"rm -f {' '.join(rm_new)}",
+            cwd=rhel_repo, check=False)
+
+    return restore + rm_new
 
 
 def build_test(rhel_repo, toolbox_name, subsystem):
@@ -3994,18 +4003,20 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                         jira, upstream_version, conflict_notes,
                         signed_off_by, assisted_by="", cve=""):
     """Build an RHEL kernel compliant commit message."""
-    r = git(f"log --format='%an <%ae>' -1 {commit_hash}",
+    # Single git call to fetch author, date, and body
+    sep = "---8<---"
+    r = git(f"log --format='%an <%ae>{sep}"
+            f"%ad{sep}%B' "
+            f"--date=format:'%a %b %d %H:%M:%S %Y %z' "
+            f"-1 {commit_hash}",
             cwd=upstream_repo, check=False)
     if r.returncode != 0:
         die(f"Cannot read upstream commit {commit_hash[:12]}. "
             f"Is the upstream repo accessible?")
-    author = r.stdout.strip()
-    r = git(f"log --format='%ad' --date=format:'%a %b %d %H:%M:%S %Y %z' "
-            f"-1 {commit_hash}", cwd=upstream_repo, check=False)
-    date = r.stdout.strip() if r.returncode == 0 else "unknown"
-    r = git(f"log --format='%B' -1 {commit_hash}",
-            cwd=upstream_repo, check=False)
-    body = r.stdout.rstrip() if r.returncode == 0 else subject
+    parts = r.stdout.split(sep, 2)
+    author = parts[0].strip()
+    date = parts[1].strip() if len(parts) > 1 else "unknown"
+    body = parts[2].rstrip() if len(parts) > 2 else subject
 
     indented_body = textwrap.indent(body, "    ")
 
@@ -4067,12 +4078,13 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                        subsystem, jira, upstream_version, rhel_ver,
                        omit_list, output_dir, applied_count, total_count,
                        signed_off_by, assisted_by="", cve="",
-                       exclude_paths=None, ailog=True):
+                       exclude_paths=None, ailog=True, subject=None):
     """Cherry-pick a single commit with conflict resolution and optional build.
     Returns (success, conflict_notes)."""
 
-    r = git(f"log --format='%s' -1 {commit_hash}", cwd=upstream_repo)
-    subject = r.stdout.strip()
+    if not subject:
+        r = git(f"log --format='%s' -1 {commit_hash}", cwd=upstream_repo)
+        subject = r.stdout.strip()
 
     global _cherrypick_repo
     _cherrypick_repo = rhel_repo
@@ -5766,12 +5778,9 @@ def main():
             info(f"{num} {h[:12]} {subj}")
 
             # Quick duplicate check: skip if already backported
-            dup_r = run_quiet(
-                f"git log --format='%H %s' -- {' '.join(scope_paths)}"
-                f" | grep -m1 -F {h}",
-                cwd=rhel_repo,
-            )
-            if dup_r[0] == 0 and dup_r[1].strip():
+            dup_r = git(f"log --grep={h} --format='%H %s' -1",
+                        cwd=rhel_repo, check=False)
+            if dup_r.returncode == 0 and dup_r.stdout.strip():
                 warn(f"  Already applied — skipping.")
                 save_state(output_dir, {
                     "next_idx": idx + 1,
@@ -5789,6 +5798,7 @@ def main():
                 assisted_by=args.assisted_by, cve=args.cve,
                 exclude_paths=args.exclude or None,
                 ailog=args.ailog,
+                subject=subj,
             )
 
             if result == "skip":
