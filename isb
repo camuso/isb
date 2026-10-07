@@ -1607,10 +1607,10 @@ def show_confirmation_menu(params):
                 print(f"  {MNU}{j}{OFF}  {WRN}{sp}{OFF}")
             else:
                 print(f"  {MNU}{j}{OFF}  {INF}{sp}{OFF}")
-        print(f"  {MNU}+{OFF}  Add path/file    "
-              f"{MNU}-{OFF}  Remove entry")
-        print(f"  {MNU}!{OFF}  Exclude path/file "
-              f"{MNU}c{OFF}  Re-discover")
+        print(f"  {MNU}+{OFF}  Add path/file")
+        print(f"  {MNU}-{OFF}  Remove entry")
+        print(f"  {MNU}!{OFF}  Exclude path/file")
+        print(f"  {MNU}c{OFF}  Re-discover")
         print(f"    {'─' * 50}")
 
         cached = _session.get("_cached")
