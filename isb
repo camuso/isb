@@ -1536,11 +1536,10 @@ _CONFIRM_FIELDS = [
     ("3", "rhel_repo",        "RHEL repo",        "text"),
     ("4", "upstream_repo",    "Upstream repo",     "text"),
     ("5", "upstream_version", "Upstream version",  "text"),
-    ("v", "cve",              "CVE",              "text"),
-    ("6", "jira",             "JIRA",             "text"),
-    ("7", "branch",           "Branch",           "text"),
-    ("8", "output_dir",       "Output dir",       "text"),
-    ("9", "signed_off_by",    "Signed-off-by",    "text"),
+    ("6", "cve",              "CVE",              "text"),
+    ("7", "jira",             "JIRA",             "text"),
+    ("8", "branch",           "Branch",           "text"),
+    ("9", "output_dir",       "Output dir",       "text"),
     ("t", "toolbox",          "Toolbox",          "toolbox"),
     ("c", "conflict_policy",  "Conflict policy",  "cycle"),
     ("b", "build_policy",     "Build policy",     "cycle"),
@@ -1559,6 +1558,110 @@ def _params_to_session(params):
     for extra in ("branch", "output_dir"):
         if extra in params:
             _session[extra] = params[extra]
+
+
+def _scope_submenu(scope_paths, params, session):
+    """Interactive submenu for editing scope paths and exclusions.
+
+    Returns (scope_paths, exclude) after the user exits with Enter.
+    """
+    exclude = list(params.get("exclude") or [])
+
+    while True:
+        all_scope = list(scope_paths) + [f"! {e}" for e in exclude]
+        print(f"\n{MNU}    Scope Paths{OFF}  {CAU}*{OFF}")
+        print(f"    {'─' * 50}")
+        for j, sp in enumerate(all_scope, 1):
+            if sp.startswith("! "):
+                print(f"  {MNU}{j}{OFF}  {WRN}{sp}{OFF}")
+            else:
+                print(f"  {MNU}{j}{OFF}  {INF}{sp}{OFF}")
+        if not all_scope:
+            print(f"    {WRN}(empty){OFF}")
+        print(f"    {'─' * 50}")
+        print(f"  {MNU}+{OFF}  Add path/file")
+        print(f"  {MNU}-{OFF}  Remove entry")
+        print(f"  {MNU}!{OFF}  Exclude path/file")
+        print(f"  {MNU}R{OFF}  Re-discover from subsystem")
+        print(f"  Enter  Return to main menu")
+        print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+
+        ch = _getch()
+        print()
+
+        if ch in ('\r', '\n'):
+            break
+
+        elif ch == '+':
+            val = input("  Add path/file: ").strip()
+            if val:
+                scope_paths.append(val)
+                params["scope_paths"] = scope_paths
+                invalidate_cached_results(session)
+                _params_to_session(params)
+                _save()
+                status(f"  Added: {val}")
+
+        elif ch == '-':
+            if not all_scope:
+                warn("  No entries to remove.")
+                continue
+            if len(all_scope) <= 9:
+                print(f"  {BLD}Remove #{OFF} ", end="", flush=True)
+                num_ch = _getch()
+                print(num_ch)
+                idx = int(num_ch) - 1 if num_ch.isdigit() else -1
+            else:
+                try:
+                    idx = int(input(
+                        f"  {BLD}Remove #{OFF} ").strip()) - 1
+                except (ValueError, EOFError):
+                    idx = -1
+            if 0 <= idx < len(all_scope):
+                entry = all_scope[idx]
+                if entry.startswith("! "):
+                    removed = entry[2:]
+                    exclude.remove(removed)
+                    params["exclude"] = exclude
+                    status(f"  Removed exclusion: {removed}")
+                else:
+                    scope_paths.pop(idx)
+                    params["scope_paths"] = scope_paths
+                    status(f"  Removed: {entry}")
+                invalidate_cached_results(session)
+                _params_to_session(params)
+                _save()
+            elif idx >= 0:
+                warn(f"  No entry #{idx + 1}")
+
+        elif ch == '!':
+            val = input("  Exclude path/file: ").strip()
+            if val:
+                exclude.append(val)
+                params["exclude"] = exclude
+                invalidate_cached_results(session)
+                _params_to_session(params)
+                _save()
+                status(f"  Excluded: {val}")
+
+        elif ch in ('R', 'r'):
+            subsys = params.get("subsystem", "")
+            up_repo = params.get("upstream_repo", "")
+            if subsys and up_repo:
+                scope_paths = discover_scope_paths(subsys, up_repo, [])
+                exclude = []
+                params["scope_paths"] = scope_paths
+                params["exclude"] = []
+                invalidate_cached_results(session)
+                _params_to_session(params)
+                _save()
+                status(f"  Re-discovered {len(scope_paths)} path(s) "
+                       f"from {subsys}")
+            else:
+                warn("  Need subsystem and upstream repo to "
+                     "re-discover.")
+
+    return scope_paths, exclude
 
 
 def show_confirmation_menu(params):
@@ -1598,19 +1701,12 @@ def show_confirmation_menu(params):
             mark = f"{CAU}*{OFF}" if field in REQUISITE_FIELDS else " "
             print(f"  {MNU}{key}{OFF}{mark}{label:<18s}: {INF}{display}{OFF}")
 
-        print(f"\n{MNU}    {'Scope Paths'}{OFF}  {CAU}*{OFF}")
-        print(f"    {'─' * 50}")
         exclude = params.get("exclude") or []
         all_scope = list(scope_paths) + [f"! {e}" for e in exclude]
-        for j, sp in enumerate(all_scope, 1):
-            if sp.startswith("! "):
-                print(f"  {MNU}{j}{OFF}  {WRN}{sp}{OFF}")
-            else:
-                print(f"  {MNU}{j}{OFF}  {INF}{sp}{OFF}")
-        print(f"  {MNU}+{OFF}  Add path/file")
-        print(f"  {MNU}-{OFF}  Remove entry")
-        print(f"  {MNU}!{OFF}  Exclude path/file")
-        print(f"  {MNU}c{OFF}  Re-discover")
+        scope_summary = ", ".join(all_scope) if all_scope else "(none)"
+        mark = f"{CAU}*{OFF}"
+        print(f"  {MNU}P{OFF}{mark}{'Scope paths':<18s}: "
+              f"{INF}{scope_summary}{OFF}")
         print(f"    {'─' * 50}")
 
         cached = _session.get("_cached")
@@ -1728,7 +1824,8 @@ def show_confirmation_menu(params):
                 except Exception:
                     pass
             if not sob:
-                warn("  Signed-off-by is required. Set it first (9).")
+                warn("  Signed-off-by could not be determined. "
+                     "Check git config user.name / user.email.")
                 continue
             _params_to_session(params)
             _save()
@@ -1807,74 +1904,11 @@ def show_confirmation_menu(params):
             _save()
             status("  Session reset.")
 
-        elif ch == '+':
-            val = input("  Add path/file: ").strip()
-            if val:
-                scope_paths.append(val)
-                params["scope_paths"] = scope_paths
-                invalidate_cached_results(_session)
-                _params_to_session(params)
-                _save()
-                status(f"  Added: {val}")
-
-        elif ch == '-':
-            exclude = params.get("exclude") or []
-            all_scope = list(scope_paths) + [f"! {e}" for e in exclude]
-            if not all_scope:
-                warn("  No entries to remove.")
-                continue
-            if len(all_scope) <= 9:
-                print(f"  {BLD}Remove #{OFF} ", end="", flush=True)
-                num_ch = _getch()
-                print(num_ch)
-                idx = int(num_ch) - 1 if num_ch.isdigit() else -1
-            else:
-                try:
-                    idx = int(input(f"  {BLD}Remove #{OFF} ").strip()) - 1
-                except (ValueError, EOFError):
-                    idx = -1
-            if 0 <= idx < len(all_scope):
-                entry = all_scope[idx]
-                if entry.startswith("! "):
-                    removed = entry[2:]
-                    exclude.remove(removed)
-                    params["exclude"] = exclude
-                    status(f"  Removed exclusion: {removed}")
-                else:
-                    scope_paths.pop(idx)
-                    params["scope_paths"] = scope_paths
-                    status(f"  Removed: {entry}")
-                invalidate_cached_results(_session)
-                _params_to_session(params)
-                _save()
-            elif idx >= 0:
-                warn(f"  No entry #{idx + 1}")
-
-        elif ch == '!':
-            val = input("  Exclude path/file: ").strip()
-            if val:
-                exclude = params.get("exclude") or []
-                exclude.append(val)
-                params["exclude"] = exclude
-                invalidate_cached_results(_session)
-                _params_to_session(params)
-                _save()
-                status(f"  Excluded: {val}")
-
-        elif ch == 'c':
-            subsys = params.get("subsystem", "")
-            up_repo = params.get("upstream_repo", "")
-            if subsys and up_repo:
-                scope_paths = discover_scope_paths(subsys, up_repo, [])
-                params["scope_paths"] = scope_paths
-                params["exclude"] = []
-                invalidate_cached_results(_session)
-                _params_to_session(params)
-                _save()
-                status(f"  Re-discovered {len(scope_paths)} path(s) "
-                       f"from {subsys}")
-            else:
-                warn("  Need subsystem and upstream repo to re-discover.")
+        elif ch == 'P':
+            scope_paths, exclude = _scope_submenu(
+                scope_paths, params, _session)
+            params["scope_paths"] = scope_paths
+            params["exclude"] = exclude
 
         else:
             hit = None
@@ -5275,27 +5309,33 @@ def main():
             _session[req_field] = val
             _save()
 
-    # Auto-detect Signed-off-by from git config if not set.
+    # Auto-detect Signed-off-by from git config.
     if not args.signed_off_by:
         try:
             uname = git("config user.name").stdout.strip().strip('"')
             email = git("config user.email").stdout.strip()
             if uname and email:
                 args.signed_off_by = f"{uname} <{email}>"
-                _session["signed_off_by"] = args.signed_off_by
-                _save()
-                info(f"  Signed-off-by auto-detected: {args.signed_off_by}")
         except Exception:
-            pass
+            uname = email = ""
+
     if not args.signed_off_by:
-        print(f"  {WRN}Signed-off-by is not set and could not be "
-              f"auto-detected from git config.{OFF}")
-        val = input("  Signed-off-by (Name <email>): ").strip()
-        if not val:
-            die("Signed-off-by is required.")
-        args.signed_off_by = val
-        _session["signed_off_by"] = val
-        _save()
+        print(f"\n  {WRN}Git user.name / user.email not configured.{OFF}")
+        print(f"  These are required for Signed-off-by and commit "
+              f"authorship.\n")
+        uname = input("  Your name: ").strip()
+        if not uname:
+            die("Name is required.")
+        email = input("  Your email: ").strip()
+        if not email:
+            die("Email is required.")
+        git(f'config --global user.name "{uname}"', check=False)
+        git(f"config --global user.email {email}", check=False)
+        args.signed_off_by = f"{uname} <{email}>"
+        status(f"  Written to ~/.gitconfig: {args.signed_off_by}")
+
+    _session["signed_off_by"] = args.signed_off_by
+    _save()
 
     # Upstream version is optional; default to PLACEHOLDER if not set.
     if not args.upstream_version:
