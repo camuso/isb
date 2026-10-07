@@ -1759,7 +1759,7 @@ def show_confirmation_menu(params):
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
 
         ch = _getch()
-        print()
+        print(ch)
 
         if ch == 'g':
             params["scope_paths"] = scope_paths
@@ -1804,7 +1804,7 @@ def show_confirmation_menu(params):
                               base_commit, keep_list)
             continue
 
-        elif ch in ('p', 'P'):
+        elif ch == 'p':
             base_commit = _session.get("_base_commit")
             out_dir = params.get("output_dir", "")
             if not base_commit and out_dir:
@@ -4702,11 +4702,13 @@ def regen_patches(rhel_repo, output_dir, base_commit,
     r = git(f"rev-list --reverse {base_commit}..HEAD",
             cwd=rhel_repo, check=False)
     if r.returncode != 0:
-        die(f"Cannot list commits from {base_commit[:12]}..HEAD "
-            f"— base commit may be stale.")
+        warn(f"Cannot list commits from {base_commit[:12]}..HEAD "
+             f"— base commit may be stale.")
+        return
     commits = [c for c in r.stdout.strip().split("\n") if c]
     if not commits:
-        die("No commits found since base -- nothing to regenerate.")
+        warn("No commits found since base -- nothing to regenerate.")
+        return
 
     info(f"  Rewriting {len(commits)} commit message(s) ...")
     if cve:
@@ -5909,7 +5911,7 @@ def main():
                           f"{MNU}a{OFF}  Abort")
                     print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
                     continue
-            elif ch in ('p', 'P'):
+            elif ch == 'p':
                 print("proceed")
                 warn("  Proceeding with failing build.")
                 break
