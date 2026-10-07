@@ -5533,40 +5533,30 @@ def main():
         omit_file = os.path.join(output_dir, "omit_commits.txt")
         _write_commit_list(keep_file, keep, omit_file, omit)
 
-        # Pause to let user review/edit commit lists in another terminal
+        # Show commit list locations; the main menu already collected
+        # the user's g/x choice so no second g/x prompt is needed.
         if not args.yes and args.command != "continue":
+            mode = "single-step" if args.step else "apply all"
             print(f"\n  Commit lists written to:")
             print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
             print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
             print(f"  Edit in another terminal to add, remove, or "
                   f"reorder.")
-            print(f"\n{MNU}    Apply{OFF}")
-            print(f"    {'─' * 50}")
-            print(f"  {MNU}g{OFF}  Apply all commits")
-            print(f"  {MNU}x{OFF}  Single-step (one commit at a time)")
-            print(f"  {MNU}q{OFF}  Quit isb")
-            print(f"  {MNU}r{OFF}  Return to main menu")
+            print(f"\n  Mode: {BLD}{mode}{OFF}")
+            print(f"  Press any key to proceed, "
+                  f"{MNU}q{OFF} quit, "
+                  f"{MNU}r{OFF} return to main menu")
             print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
-            while True:
-                ch = _getch()
-                if ch in ('g', 'G'):
-                    print("g")
-                    args.step = False
-                    break
-                elif ch in ('x', 'X'):
-                    print("x")
-                    args.step = True
-                    break
-                elif ch in ('q', 'Q', '\x03'):
-                    print("q")
-                    _cleanup_and_exit()
-                elif ch in ('r', 'R'):
-                    print("r")
-                    _step_loop = True
-                    break
-                # ignore unrecognized keys
-            if _step_loop:
+            ch = _getch()
+            if ch in ('q', 'Q', '\x03'):
+                print("q")
+                _cleanup_and_exit()
+            elif ch in ('r', 'R'):
+                print("r")
+                _step_loop = True
                 continue
+            else:
+                print()
 
         # If resuming, reload the commit list (user may have edited it)
         if os.path.isfile(keep_file):
@@ -5669,6 +5659,20 @@ def main():
             h, subj, _ = keep[idx]
             num = f"[{idx + 1}/{len(keep)}]"
             info(f"{num} {h[:12]} {subj}")
+
+            # Quick duplicate check: skip if already backported
+            dup_r = run_quiet(
+                f"git log --format='%H %s' -- {' '.join(scope_paths)}"
+                f" | grep -m1 -F {h}",
+                cwd=rhel_repo,
+            )
+            if dup_r[0] == 0 and dup_r[1].strip():
+                warn(f"  Already applied — skipping.")
+                save_state(output_dir, {
+                    "next_idx": idx + 1,
+                    "base_commit": base_commit,
+                })
+                continue
 
             result, notes = cherry_pick_commit(
                 h, upstream_repo, rhel_repo, scope_paths,
