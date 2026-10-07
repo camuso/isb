@@ -5771,6 +5771,16 @@ def main():
         build_fixes = 0
         fail_count = 0
 
+        # Build set of already-applied upstream hashes once (fast)
+        _dup_r = git("log --format='%b'", cwd=rhel_repo, check=False)
+        _applied_hashes = set(
+            m.group(1)
+            for m in re.finditer(
+                r'cherry picked from commit ([0-9a-f]{40})',
+                _dup_r.stdout,
+            )
+        )
+
         for idx in range(start_idx, len(keep)):
             _loop_idx = idx
             h, subj, _ = keep[idx]
@@ -5778,9 +5788,7 @@ def main():
             info(f"{num} {h[:12]} {subj}")
 
             # Quick duplicate check: skip if already backported
-            dup_r = git(f"log --grep={h} --format='%H %s' -1",
-                        cwd=rhel_repo, check=False)
-            if dup_r.returncode == 0 and dup_r.stdout.strip():
+            if h in _applied_hashes:
                 warn(f"  Already applied — skipping.")
                 save_state(output_dir, {
                     "next_idx": idx + 1,
