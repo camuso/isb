@@ -5771,8 +5771,9 @@ def main():
         build_fixes = 0
         fail_count = 0
 
-        # Build set of already-applied upstream hashes once (fast)
-        _dup_r = git("log --format='%b'", cwd=rhel_repo, check=False)
+        # Build set of already-applied upstream hashes (only isb's commits)
+        _dup_r = git(f"log {base_commit}..HEAD --format='%b'",
+                     cwd=rhel_repo, check=False)
         _applied_hashes = set(
             m.group(1)
             for m in re.finditer(
