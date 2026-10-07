@@ -5533,28 +5533,40 @@ def main():
         omit_file = os.path.join(output_dir, "omit_commits.txt")
         _write_commit_list(keep_file, keep, omit_file, omit)
 
-        # Show commit list locations; the main menu already collected
-        # the user's g/x choice so no second prompt is needed.
+        # Pause to let user review/edit commit lists in another terminal
         if not args.yes and args.command != "continue":
-            mode = "single-step" if args.step else "apply all"
             print(f"\n  Commit lists written to:")
             print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
             print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
-            print(f"  Edit in another terminal, then press any key "
-                  f"to {mode}.")
-            print(f"  Or: {MNU}e{OFF} exit  {MNU}r{OFF} return to "
-                  f"main menu")
+            print(f"  Edit in another terminal to add, remove, or "
+                  f"reorder.")
+            print(f"\n{MNU}    Apply{OFF}")
+            print(f"    {'─' * 50}")
+            print(f"  {MNU}g{OFF}  Apply all commits")
+            print(f"  {MNU}x{OFF}  Single-step (one commit at a time)")
+            print(f"  {MNU}q{OFF}  Quit isb")
+            print(f"  {MNU}r{OFF}  Return to main menu")
             print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
-            ch = _getch()
-            if ch in ('e', 'E', '\x03'):
-                print("e")
-                _cleanup_and_exit()
-            elif ch in ('r', 'R'):
-                print("r")
-                _step_loop = True
+            while True:
+                ch = _getch()
+                if ch in ('g', 'G'):
+                    print("g")
+                    args.step = False
+                    break
+                elif ch in ('x', 'X'):
+                    print("x")
+                    args.step = True
+                    break
+                elif ch in ('q', 'Q', '\x03'):
+                    print("q")
+                    _cleanup_and_exit()
+                elif ch in ('r', 'R'):
+                    print("r")
+                    _step_loop = True
+                    break
+                # ignore unrecognized keys
+            if _step_loop:
                 continue
-            else:
-                print()  # echo newline for the keypress
 
         # If resuming, reload the commit list (user may have edited it)
         if os.path.isfile(keep_file):
