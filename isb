@@ -609,60 +609,46 @@ _HELP_TOPICS = {
             Interactive menu hotkey: 6
         """),
     ),
-    "extra-paths": (
-        "--extra-paths path [path ...]",
-        "Additional scope paths beyond auto-discovered ones (space-separated).",
+    "add": (
+        "--add path [path ...]",
+        "Add paths/files to scope (space-separated).",
         textwrap.dedent("""\
-            Appended to the paths that isb discovers from the subsystem
-            Makefile.  Useful for including headers or DT bindings that
-            are not automatically found.  Paths can be directories or
+            Appended to the paths that isb discovers from the subsystem.
+            Useful for including headers, DT bindings, or individual
+            files not automatically found.  Paths can be directories or
             individual files.
 
-            Interactive menu hotkey: f
+            Interactive menu hotkey: +
 
-            Note: these paths control which files are kept in each
-            cherry-pick.  Builds always compile the full --subsystem
-            directory (make M=<subsystem>), regardless of scope paths.
-        """),
-    ),
-    "only": (
-        "--only path [path ...]",
-        "Use only these scope paths, skip auto-discovery (space-separated).",
-        textwrap.dedent("""\
-            Overrides all auto-discovery and uses exactly the given
-            paths.  Paths can be directories or individual files.
-
-            Interactive menu hotkey: o
-
-            Note: these paths control which files are kept in each
-            cherry-pick.  Builds always compile the full --subsystem
-            directory (make M=<subsystem>), regardless of scope paths.
-
-            Example:
-              isb --only drivers/char/ipmi include/linux/ipmi.h
-        """),
-    ),
-    "exclude": (
-        "--exclude path [path ...]",
-        "Exclude paths/files from scope (space-separated).",
-        textwrap.dedent("""\
-            Removes matching paths from the scope.  Applied after
-            auto-discovery (or --only) and --extra-paths, so it can
-            subtract from any source.  Paths can be directories or
-            individual files.  A scope file is excluded if it starts
-            with any of the exclude prefixes.
-
-            Interactive menu hotkey: -
-
-            Note: like --only and --extra-paths, this controls which
-            files are kept in each cherry-pick and which upstream
-            commits are discovered.  Builds always compile the full
-            --subsystem directory (make M=<subsystem>).
+            Note: scope paths control which files are kept in each
+            cherry-pick and which upstream commits are discovered.
+            Builds always compile the full --subsystem directory
+            (make M=<subsystem>), regardless of scope paths.
 
             Examples:
-              isb --subsystem drivers/i2c --exclude drivers/i2c/busses
-              isb --exclude drivers/i2c/busses drivers/i2c/muxes
-              isb --exclude drivers/char/ipmi/ipmb_dev_int.c
+              isb --add include/linux/i2c.h
+              isb --add drivers/i2c Documentation/i2c
+        """),
+    ),
+    "drop": (
+        "--drop path [path ...]",
+        "Exclude paths/files from scope (space-separated).",
+        textwrap.dedent("""\
+            Removes matching paths/files from the scope.  Applied after
+            auto-discovery and --add, so it can subtract from any source.
+            Paths can be directories or individual files.  A scope file
+            is excluded if it starts with any of the exclude prefixes.
+
+            Interactive menu hotkey: !
+
+            Note: scope paths control which files are kept in each
+            cherry-pick and which upstream commits are discovered.
+            Builds always compile the full --subsystem directory
+            (make M=<subsystem>), regardless of scope paths.
+
+            Examples:
+              isb --drop drivers/i2c/busses
+              isb --drop drivers/char/ipmi/ipmb_dev_int.c
         """),
     ),
     "branch": (
@@ -855,11 +841,19 @@ _HELP_TOPICS = {
 }
 
 
+_HELP_ALIASES = {
+    "extra-paths": "add",
+    "exclude": "drop",
+    "only": "add",
+}
+
+
 def _show_topic_help(topic):
     """Print help for a single topic and exit."""
     key = topic.lstrip("-")
     if key == "s":
         key = "signed-off-by"
+    key = _HELP_ALIASES.get(key, key)
     if key not in _HELP_TOPICS:
         print(f"Unknown topic: {topic}")
         print(f"Available topics: {', '.join(sorted(_HELP_TOPICS))}")
@@ -882,7 +876,7 @@ def _show_general_help():
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
-                "cve", "jira", "extra-paths", "only", "exclude",
+                "cve", "jira", "add", "drop",
                 "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
@@ -930,14 +924,20 @@ def parse_args():
                     help="CVE identifier (e.g. CVE-2026-64191)")
     p.add_argument("--jira", default="RHEL-PLACEHOLDER",
                     help="JIRA URL (default: RHEL-PLACEHOLDER)")
-    p.add_argument("--extra-paths", nargs="*", default=[],
-                    help="Additional scope paths beyond auto-discovered ones")
+    p.add_argument("--add", nargs="+", default=[], dest="extra_paths",
+                    help="Add paths/files to scope "
+                         "(e.g. --add drivers/i2c include/linux/i2c.h)")
+    p.add_argument("--drop", nargs="+", default=[], dest="exclude",
+                    help="Exclude paths/files from scope "
+                         "(e.g. --drop drivers/char/ipmi/ipmb_dev_int.c)")
     p.add_argument("--only", nargs="+", default=None, dest="only_paths",
-                    help="Use only these scope paths, skip auto-discovery "
-                         "(e.g. --only Documentation/devicetree/bindings/ipmi)")
-    p.add_argument("--exclude", nargs="+", default=[],
-                    help="Exclude these paths/files from scope "
-                         "(e.g. --exclude drivers/i2c/busses)")
+                    help=argparse.SUPPRESS)
+    p.add_argument("--extra-paths", nargs="*", default=None,
+                    dest="extra_paths_legacy",
+                    help=argparse.SUPPRESS)
+    p.add_argument("--exclude", nargs="+", default=None,
+                    dest="exclude_legacy",
+                    help=argparse.SUPPRESS)
     p.add_argument("--branch", default=None,
                     help="Branch name (default: leaf of subsystem path)")
     p.add_argument("--output-dir", default=None,
@@ -1545,9 +1545,6 @@ _CONFIRM_FIELDS = [
     ("c", "conflict_policy",  "Conflict policy",  "cycle"),
     ("b", "build_policy",     "Build policy",     "cycle"),
     ("e", "editor",           "Editor",           "text"),
-    ("o", "only_paths",       "Only paths",       "paths"),
-    ("f", "extra_paths",      "Extra paths",      "paths"),
-    ("-", "exclude",          "Exclude paths",    "paths"),
     ("i", "ailog",            "AI conflict log",  "toggle"),
 ]
 
@@ -1603,9 +1600,17 @@ def show_confirmation_menu(params):
 
         print(f"\n{MNU}    {'Scope Paths'}{OFF}  {CAU}*{OFF}")
         print(f"    {'─' * 50}")
-        for j, sp in enumerate(scope_paths):
-            print(f"  {MNU}{chr(ord('A') + j)}{OFF}. {INF}{sp}{OFF}")
-        print(f"  {MNU}+{OFF}  Add a scope path")
+        exclude = params.get("exclude") or []
+        all_scope = list(scope_paths) + [f"! {e}" for e in exclude]
+        for j, sp in enumerate(all_scope, 1):
+            if sp.startswith("! "):
+                print(f"  {MNU}{j}{OFF}  {WRN}{sp}{OFF}")
+            else:
+                print(f"  {MNU}{j}{OFF}  {INF}{sp}{OFF}")
+        print(f"  {MNU}+{OFF}  Add path/file    "
+              f"{MNU}-{OFF}  Remove entry")
+        print(f"  {MNU}!{OFF}  Exclude path/file "
+              f"{MNU}c{OFF}  Re-discover")
         print(f"    {'─' * 50}")
 
         cached = _session.get("_cached")
@@ -1803,7 +1808,7 @@ def show_confirmation_menu(params):
             status("  Session reset.")
 
         elif ch == '+':
-            val = input("  New scope path: ").strip()
+            val = input("  Add path/file: ").strip()
             if val:
                 scope_paths.append(val)
                 params["scope_paths"] = scope_paths
@@ -1812,21 +1817,64 @@ def show_confirmation_menu(params):
                 _save()
                 status(f"  Added: {val}")
 
-        elif ch.isupper() and ord(ch) - ord('A') < len(scope_paths):
-            idx = ord(ch) - ord('A')
-            old_path = scope_paths[idx]
-            val = input(f"  [{old_path}] new path (empty to remove): ").strip()
-            old_paths = scope_paths[:]
-            if val:
-                scope_paths[idx] = val
+        elif ch == '-':
+            exclude = params.get("exclude") or []
+            all_scope = list(scope_paths) + [f"! {e}" for e in exclude]
+            if not all_scope:
+                warn("  No entries to remove.")
+                continue
+            if len(all_scope) <= 9:
+                print(f"  {BLD}Remove #{OFF} ", end="", flush=True)
+                num_ch = _getch()
+                print(num_ch)
+                idx = int(num_ch) - 1 if num_ch.isdigit() else -1
             else:
-                scope_paths.pop(idx)
-                status(f"  Removed: {old_path}")
-            params["scope_paths"] = scope_paths
-            if sorted(scope_paths) != sorted(old_paths):
+                try:
+                    idx = int(input(f"  {BLD}Remove #{OFF} ").strip()) - 1
+                except (ValueError, EOFError):
+                    idx = -1
+            if 0 <= idx < len(all_scope):
+                entry = all_scope[idx]
+                if entry.startswith("! "):
+                    removed = entry[2:]
+                    exclude.remove(removed)
+                    params["exclude"] = exclude
+                    status(f"  Removed exclusion: {removed}")
+                else:
+                    scope_paths.pop(idx)
+                    params["scope_paths"] = scope_paths
+                    status(f"  Removed: {entry}")
                 invalidate_cached_results(_session)
-            _params_to_session(params)
-            _save()
+                _params_to_session(params)
+                _save()
+            elif idx >= 0:
+                warn(f"  No entry #{idx + 1}")
+
+        elif ch == '!':
+            val = input("  Exclude path/file: ").strip()
+            if val:
+                exclude = params.get("exclude") or []
+                exclude.append(val)
+                params["exclude"] = exclude
+                invalidate_cached_results(_session)
+                _params_to_session(params)
+                _save()
+                status(f"  Excluded: {val}")
+
+        elif ch == 'c':
+            subsys = params.get("subsystem", "")
+            up_repo = params.get("upstream_repo", "")
+            if subsys and up_repo:
+                scope_paths = discover_scope_paths(subsys, up_repo, [])
+                params["scope_paths"] = scope_paths
+                params["exclude"] = []
+                invalidate_cached_results(_session)
+                _params_to_session(params)
+                _save()
+                status(f"  Re-discovered {len(scope_paths)} path(s) "
+                       f"from {subsys}")
+            else:
+                warn("  Need subsystem and upstream repo to re-discover.")
 
         else:
             hit = None
@@ -4752,6 +4800,13 @@ def print_summary(params, total_evaluated, keep_count, omit_count,
 
 def main():
     args = parse_args()
+
+    # Merge legacy --extra-paths / --exclude into --add / --drop
+    if getattr(args, "extra_paths_legacy", None):
+        args.extra_paths = (args.extra_paths or []) + args.extra_paths_legacy
+    if getattr(args, "exclude_legacy", None):
+        args.exclude = (args.exclude or []) + args.exclude_legacy
+
     _check_and_install_deps()
 
     # Handle help subcommand before anything else
