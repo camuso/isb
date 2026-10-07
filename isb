@@ -582,7 +582,7 @@ _HELP_TOPICS = {
         "Upstream version tag, e.g. v7.1-rc3.",
         textwrap.dedent("""\
             Recorded in the RHEL kernel compliant commit message as the upstream
-            status.  Optional; defaults to UPSTREAM_VERSION if not set.
+            status.  Optional; left empty if not set.
 
             Interactive menu hotkey: 5
         """),
@@ -601,7 +601,7 @@ _HELP_TOPICS = {
     ),
     "jira": (
         "--jira URL",
-        "JIRA ticket URL (default: RHEL-PLACEHOLDER).",
+        "JIRA ticket URL.",
         textwrap.dedent("""\
             Recorded in the RHEL kernel compliant commit message.  Can be updated
             later via the interactive menu or --regen.
@@ -922,8 +922,8 @@ def parse_args():
                     help="Upstream version tag, e.g. v7.1-rc3")
     p.add_argument("--cve", default="",
                     help="CVE identifier (e.g. CVE-2026-64191)")
-    p.add_argument("--jira", default="RHEL-PLACEHOLDER",
-                    help="JIRA URL (default: RHEL-PLACEHOLDER)")
+    p.add_argument("--jira", default=None,
+                    help="JIRA ticket URL")
     p.add_argument("--add", nargs="+", default=[], dest="extra_paths",
                     help="Add paths/files to scope "
                          "(e.g. --add drivers/i2c include/linux/i2c.h)")
@@ -1034,6 +1034,12 @@ def _session_path(repo_root):
     return os.path.join(repo_root, SESSION_FILE)
 
 
+_STALE_PLACEHOLDERS = {
+    "jira": "RHEL-PLACEHOLDER",
+    "upstream_version": "UPSTREAM_VERSION",
+}
+
+
 def load_session(repo_root):
     """Load .backport/session.json or return empty dict."""
     path = _session_path(repo_root)
@@ -1041,10 +1047,16 @@ def load_session(repo_root):
         return {}
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, ValueError):
         warn(f"Corrupted session file {path} — starting fresh.")
         return {}
+
+    # Clean up stale placeholder values from older sessions
+    for field, placeholder in _STALE_PLACEHOLDERS.items():
+        if data.get(field) == placeholder:
+            data[field] = ""
+    return data
 
 
 def save_session(repo_root, session):
@@ -1752,8 +1764,8 @@ def show_confirmation_menu(params):
               f"{MNU}p{OFF}  Regen patches")
         print(f"  {MNU}r{OFF}  Reset to commit           "
               f"{MNU}h{OFF}  Help")
-        print(f"  {MNU}x{OFF}  Single-step (one commit)  "
-              f"{MNU}g{OFF}  Go / proceed")
+        print(f"  {MNU}g{OFF}  Go (apply all)            "
+              f"{MNU}x{OFF}  Single-step (one commit)")
         print(f"  {MNU}q{OFF}  Quit")
         print()
         print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
@@ -1831,8 +1843,8 @@ def show_confirmation_menu(params):
             _save()
             regen_patches(
                 _session_repo, out_dir, base_commit,
-                params.get("jira", "RHEL-PLACEHOLDER"),
-                params.get("upstream_version", "UPSTREAM_VERSION"),
+                params.get("jira", ""),
+                params.get("upstream_version", ""),
                 sob,
                 params.get("assisted_by", ""),
                 cve=params.get("cve", ""),
@@ -4967,9 +4979,9 @@ def main():
                 "session menu.")
         regen_patches(
             rhel_repo, output_dir, base_commit,
-            args.jira or _session.get("jira", "RHEL-PLACEHOLDER"),
+            args.jira or _session.get("jira", ""),
             (args.upstream_version
-             or _session.get("upstream_version", "UPSTREAM_VERSION")),
+             or _session.get("upstream_version", "")),
             args.signed_off_by,
             args.assisted_by or _session.get("assisted_by", ""),
             cve=args.cve or _session.get("cve", ""),
@@ -5339,11 +5351,9 @@ def main():
     _session["signed_off_by"] = args.signed_off_by
     _save()
 
-    # Upstream version is optional; default to PLACEHOLDER if not set.
+    # Upstream version is optional; leave empty if not set.
     if not args.upstream_version:
-        args.upstream_version = "UPSTREAM_VERSION"
-        info("  --upstream-version not set; using placeholder. "
-             "Set it in the session menu (v) or via --upstream-version.")
+        args.upstream_version = ""
 
     upstream_repo = os.path.abspath(args.upstream_repo)
 
@@ -5633,14 +5643,12 @@ def main():
         # Show commit list locations; the main menu already collected
         # the user's g/x choice so no second g/x prompt is needed.
         if not args.yes and args.command != "continue":
-            mode = "single-step" if args.step else "apply all"
             print(f"\n  Commit lists written to:")
             print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
             print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
             print(f"  Edit in another terminal to add, remove, or "
                   f"reorder.")
-            print(f"\n  Mode: {BLD}{mode}{OFF}")
-            print(f"  Press any key to proceed, "
+            print(f"\n  Press any key to proceed, "
                   f"{MNU}q{OFF} quit, "
                   f"{MNU}r{OFF} return to main menu")
             print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
