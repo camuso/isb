@@ -5540,30 +5540,38 @@ def main():
             print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
             print(f"  Edit in another terminal to add, remove, or "
                   f"reorder.")
-            print(f"\n{MNU}    Apply{OFF}")
-            print(f"    {'─' * 50}")
-            print(f"  {MNU}g{OFF}  Apply all commits")
-            print(f"  {MNU}x{OFF}  Single-step (one commit at a time)")
-            print(f"  {MNU}e{OFF}  Exit isb")
-            print(f"  {MNU}r{OFF}  Return to main menu")
-            print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
-            while True:
-                ch = _getch()
-                print()
-                if ch in ('g', 'G'):
-                    args.step = False
-                    break
-                elif ch in ('x', 'X'):
-                    args.step = True
-                    break
-                elif ch in ('e', 'E', '\x03'):
-                    _cleanup_and_exit()
-                elif ch in ('r', 'R'):
-                    _step_loop = True
-                    break
-                # ignore unrecognized keys
-            if _step_loop:
-                continue
+
+            if args.step:
+                # Honour single-step already chosen from main menu
+                info("  Single-step mode (from main menu).")
+            else:
+                print(f"\n{MNU}    Apply{OFF}")
+                print(f"    {'─' * 50}")
+                print(f"  {MNU}g{OFF}  Apply all commits")
+                print(f"  {MNU}x{OFF}  Single-step (one commit at a time)")
+                print(f"  {MNU}e{OFF}  Exit isb")
+                print(f"  {MNU}r{OFF}  Return to main menu")
+                print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+                while True:
+                    ch = _getch()
+                    if ch in ('g', 'G'):
+                        print("g")
+                        args.step = False
+                        break
+                    elif ch in ('x', 'X'):
+                        print("x")
+                        args.step = True
+                        break
+                    elif ch in ('e', 'E', '\x03'):
+                        print("e")
+                        _cleanup_and_exit()
+                    elif ch in ('r', 'R'):
+                        print("r")
+                        _step_loop = True
+                        break
+                    # ignore unrecognized keys
+                if _step_loop:
+                    continue
 
         # If resuming, reload the commit list (user may have edited it)
         if os.path.isfile(keep_file):
