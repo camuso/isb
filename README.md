@@ -35,6 +35,9 @@ RHEL-compliant commit messages suitable for merge requests.
   and reused across runs with an interactive single-keypress menu.
 - **Resumable** — interrupted runs save progress and resume automatically
   with `--continue`.
+- **Automatic commit-graph** — on first run, isb writes a git commit-graph
+  for both the RHEL and upstream repos if one doesn't exist, dramatically
+  speeding up ancestry walks (cherry-pick, merge-base, log) on large repos.
 - **Single-commit mode** — `isb pick HASH` cherry-picks one upstream commit
   with full conflict resolution and commit message formatting. Detects
   already-backported commits by searching the RHEL log for the upstream

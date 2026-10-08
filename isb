@@ -370,6 +370,24 @@ def _detect_upstream_from_alternates(rhel_repo):
     return None
 
 
+def _ensure_commit_graph(repo):
+    """Write a commit-graph file if one doesn't already exist.
+
+    Commit-graphs accelerate ancestry walks (merge-base, log, cherry-pick)
+    dramatically on large repos like the Linux kernel.  The file is written
+    once and updated automatically by future git gc / fetch operations.
+    """
+    graph_path = os.path.join(repo, ".git", "objects", "info",
+                              "commit-graph")
+    chain_dir = os.path.join(repo, ".git", "objects", "info",
+                             "commit-graphs")
+    if os.path.exists(graph_path) or os.path.isdir(chain_dir):
+        return
+    info(f"  Writing commit-graph for {os.path.basename(repo)} "
+         f"(one-time, speeds up git operations) ...")
+    git("commit-graph write --reachable", cwd=repo, check=False)
+
+
 def ensure_upstream_objects(rhel_repo, upstream_repo):
     """Make upstream objects visible via git alternates (zero-copy).
 
@@ -403,6 +421,10 @@ def ensure_upstream_objects(rhel_repo, upstream_repo):
         fh.write(upstream_objects + "\n")
     info(f"Linked upstream objects via alternates "
          f"({upstream_objects})")
+
+    # Ensure commit-graphs exist for fast ancestry walks
+    _ensure_commit_graph(rhel_repo)
+    _ensure_commit_graph(upstream_repo)
 
 
 def info(msg):
