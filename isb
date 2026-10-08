@@ -3417,18 +3417,46 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     if n_hunks == 0:
         return "resolved (identical to upstream)"
 
-    # Look for common patterns in the diff
-    added = [l for l in diff_hunks if l.startswith("+") and not l.startswith("+++")]
-    removed = [l for l in diff_hunks if l.startswith("-") and not l.startswith("---")]
+    # Extract function/context names from hunk headers for specificity
+    func_names = []
+    for hdr in hunk_headers:
+        m = re.search(r'@@.*@@\s*(.*)', hdr)
+        if m:
+            ctx = m.group(1).strip()
+            # Extract function name from context like "static int foo(..."
+            fm = re.match(r'.*?\b(\w+)\s*\(', ctx)
+            if fm and fm.group(1) not in ('if', 'for', 'while', 'switch',
+                                           'return', 'sizeof', 'typeof'):
+                func_names.append(fm.group(1) + "()")
 
-    # Check for KABI or RHEL-specific guards
+    func_names = list(dict.fromkeys(func_names))  # dedupe, preserve order
+
+    added = [l for l in diff_hunks
+             if l.startswith("+") and not l.startswith("+++")]
+    removed = [l for l in diff_hunks
+               if l.startswith("-") and not l.startswith("---")]
+
+    # Characterize the changes
+    parts = []
     rhel_markers = sum(1 for l in added
                        if "RH_KABI" in l or "RHEL" in l or "redhat" in l.lower())
-    if rhel_markers:
-        return (f"{n_hunks} hunk(s) differ from upstream "
-                f"({rhel_markers} RHEL-specific)")
+    only_added = len(added) > 0 and len(removed) == 0
+    only_removed = len(removed) > 0 and len(added) == 0
 
-    return f"{n_hunks} hunk(s) differ from upstream"
+    if rhel_markers:
+        parts.append(f"RHEL-specific code ({rhel_markers} line(s))")
+    elif only_removed:
+        parts.append("upstream hunks dropped")
+    elif only_added:
+        parts.append("RHEL additions kept")
+    else:
+        parts.append("adapted for RHEL")
+
+    if func_names:
+        shown = func_names[:3]
+        parts.append("in " + ", ".join(shown))
+
+    return "; ".join(parts)
 
 
 def _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
