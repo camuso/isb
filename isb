@@ -3051,12 +3051,14 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
                     h_part, s_part = line.split(sep, 1)
                     hash_subjects[h_part.strip()] = s_part.strip()
 
-        # Check RHEL presence: single grep in Python against a
-        # shallow log of cherry-pick references (last 5000 commits).
-        rhel_bodies = git("log --format='%b' -5000",
-                          cwd=rhel_repo, check=False).stdout
+        # Check RHEL presence: use the same method as isb pick —
+        # pipe full git log through grep for each hash.  Capped to
+        # _PREREQ_CAP hashes so this is at most 10 calls.
         for bh, subj in sorted(hash_subjects.items()):
-            if bh in rhel_bodies:
+            rc, out, _ = run_quiet(
+                f"git log | grep -m1 -F {bh}",
+                cwd=rhel_repo)
+            if rc == 0 and out.strip():
                 result["present_prereqs"].append((bh, subj))
             else:
                 result["missing_prereqs"].append((bh, subj))
@@ -3310,7 +3312,13 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                       if h not in seen and not seen.add(h)]
             print(f"\n  {WRN}WARNING: {len(unique)} missing "
                   f"prerequisite(s) detected.{OFF}")
-            print(f"  {WRN}See report for 'isb pick' commands.{OFF}")
+            print(f"  You can exit isb and pick them from the "
+                  f"command line:")
+            for h, s in unique:
+                if h:
+                    print(f"    {BLD}isb pick {h}{OFF}")
+            print(f"  Then resume with {BLD}isb continue{OFF} "
+                  f"or from the main menu.")
 
         if ai_explanation:
             print(f"\n  {BLD}AI Analysis:{OFF}")
