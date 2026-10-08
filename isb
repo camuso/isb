@@ -4808,6 +4808,10 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
     conflicted = {rh for rh, _ in find_conflicted_commits(rhel_repo,
                                                            base_commit)}
 
+    # Show the base commit (pre-backport) for starting over
+    base_subj = git(f"log --format='%h %s' -1 {base_commit}",
+                    cwd=rhel_repo, check=False).stdout.strip()
+
     print(f"\n{MNU}    Applied commits (newest first)  "
           f"{CAU}*{OFF} = had conflicts{OFF}")
     print(f"    {'─' * 56}")
@@ -4818,7 +4822,12 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
         marker = f"{CAU}*{OFF}" if full_h in conflicted else " "
         print(f"    {MNU}{i:3d}{OFF} {marker} {INF}{display}{OFF}")
     print(f"    {'─' * 56}")
-    print(f"  Enter number to reset to (or {MNU}q{OFF} to cancel): ",
+    print(f"    {MNU}  0{OFF}   {DIM}{base_subj}  "
+          f"(start over){OFF}")
+    print(f"    {'─' * 56}")
+    print(f"  Enter number to reset to, "
+          f"{MNU}0{OFF} to start over, "
+          f"or {MNU}q{OFF} to cancel: ",
           end="", flush=True)
 
     raw = input().strip()
@@ -4830,8 +4839,21 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
     except ValueError:
         warn(f"  Invalid input: '{raw}'")
         return
-    if idx < 1 or idx > len(lines):
-        warn(f"  Number out of range (1-{len(lines)}).")
+    if idx < 0 or idx > len(lines):
+        warn(f"  Number out of range (0-{len(lines)}).")
+        return
+
+    if idx == 0:
+        # Start over: reset to base_commit
+        git(f"reset --hard {base_commit}", cwd=rhel_repo)
+        save_state(output_dir, {
+            "next_idx": 0,
+            "base_commit": base_commit,
+        })
+        _session.pop("_completed_head", None)
+        _save()
+        status(f"Reset to base: {base_subj}")
+        info(f"  Next run will start from commit [1/{len(keep)}].")
         return
 
     full_hash = lines[idx - 1].split()[0]
