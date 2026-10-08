@@ -2998,37 +2998,55 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
 
     # Run git blame on the upstream file for the parent of this commit
     # to find which commits introduced the conflicting context.
+    # Batch contiguous lines into ranges for a single blame call.
     parent = f"{commit_hash}~1"
     blame_hashes = set()
-    for line_no in sorted(blame_lines):
-        r = git(f"blame -L {line_no},{line_no} --porcelain "
+    sorted_lines = sorted(blame_lines)
+    ranges = []
+    if sorted_lines:
+        rng_start = rng_end = sorted_lines[0]
+        for ln in sorted_lines[1:]:
+            if ln == rng_end + 1:
+                rng_end = ln
+            else:
+                ranges.append((rng_start, rng_end))
+                rng_start = rng_end = ln
+        ranges.append((rng_start, rng_end))
+
+    blame_args = " ".join(f"-L {s},{e}" for s, e in ranges)
+    if blame_args:
+        r = git(f"blame {blame_args} --porcelain "
                 f"{parent} -- {cf}",
                 cwd=upstream_repo, check=False)
-        if r.returncode != 0:
-            continue
-        for bl in r.stdout.split("\n"):
-            bm = re.match(r"^([0-9a-f]{40})\s", bl)
-            if bm:
-                h = bm.group(1)
-                # Skip boundary commits (all zeros or the commit itself)
-                if h != "0" * 40 and h != commit_hash:
-                    blame_hashes.add(h)
+        if r.returncode == 0:
+            for bl in r.stdout.split("\n"):
+                bm = re.match(r"^([0-9a-f]{40})\s", bl)
+                if bm:
+                    h = bm.group(1)
+                    if h != "0" * 40 and h != commit_hash:
+                        blame_hashes.add(h)
 
-    # Cross-reference blame hashes with RHEL history
-    for bh in sorted(blame_hashes):
-        subj_r = git(f"log --format='%s' -1 {bh}",
-                     cwd=upstream_repo, check=False)
-        if subj_r.returncode != 0:
-            continue
-        subj = subj_r.stdout.strip()
+    # Cross-reference blame hashes with RHEL history.
+    # Batch: get subjects in one call, build RHEL hash set once.
+    if blame_hashes:
+        # Get all subjects in one git log call
+        hash_subjects = {}
+        for bh in sorted(blame_hashes):
+            subj_r = git(f"log --format='%s' -1 {bh}",
+                         cwd=upstream_repo, check=False)
+            if subj_r.returncode == 0:
+                hash_subjects[bh] = subj_r.stdout.strip()
 
-        # Check if this commit hash appears in RHEL commit messages
-        grep_r = git(f"log --all --format='%H' --grep={bh} -1",
-                     cwd=rhel_repo, check=False)
-        if grep_r.returncode == 0 and grep_r.stdout.strip():
-            result["present_prereqs"].append((bh, subj))
-        else:
-            result["missing_prereqs"].append((bh, subj))
+        # Check each prerequisite hash against RHEL history.
+        # Use --fixed-strings so git can short-circuit on first match.
+        for bh, subj in sorted(hash_subjects.items()):
+            grep_r = git(f"log --format='%H' --grep={bh} "
+                         f"--fixed-strings -1",
+                         cwd=rhel_repo, check=False)
+            if grep_r.returncode == 0 and grep_r.stdout.strip():
+                result["present_prereqs"].append((bh, subj))
+            else:
+                result["missing_prereqs"].append((bh, subj))
 
     # Classify based on findings
     if result["missing_prereqs"]:
