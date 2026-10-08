@@ -1509,7 +1509,12 @@ def replay_with_patchpal(rhel_repo, upstream_repo, base_commit,
             die(f"Replay failed on {uh[:12]}. Resolve manually.")
         status(f"  applied {'with resolved conflicts' if notes else '(clean)'}")
 
-    patch_count = generate_output(rhel_repo, output_dir, base_commit, [])
+    patch_count = generate_output(
+        rhel_repo, output_dir, base_commit, [],
+        rhel_ver=rhel_ver, subsystem=subsystem, jira=jira,
+        upstream_version=upstream_version,
+        signed_off_by=signed_off_by, cve=cve,
+    )
 
     completed_head = git("rev-parse HEAD",
                          cwd=rhel_repo, check=False).stdout.strip()
@@ -4989,8 +4994,10 @@ def regen_patches(rhel_repo, output_dir, base_commit,
 # Phase 5: output generation
 # ---------------------------------------------------------------------------
 
-def generate_output(rhel_repo, output_dir, base_commit, omit_list):
-    """Generate format-patch output and Omitted-fixes file."""
+def generate_output(rhel_repo, output_dir, base_commit, omit_list,
+                    rhel_ver="", subsystem="", jira="",
+                    upstream_version="", signed_off_by="", cve=""):
+    """Generate format-patch output, Omitted-fixes, and MR description."""
     header("Phase 5: Generating output")
 
     patches_dir = os.path.join(output_dir, "patches")
@@ -5015,6 +5022,24 @@ def generate_output(rhel_repo, output_dir, base_commit, omit_list):
             fh.write(f"{h[:12]} {subject}\n")
             fh.write(f"  Reason: {reason}\n\n")
     info(f"Wrote {omitted_path} ({len(omit_list)} entries)")
+
+    # Generate MR description
+    sub_name = os.path.basename(subsystem.rstrip("/")) if subsystem else ""
+    mr_path = os.path.join(output_dir, "mr-description.txt")
+    with open(mr_path, "w") as fh:
+        fh.write(f"[RHEL-{rhel_ver}] {sub_name} updates and fixes\n\n")
+        if jira:
+            fh.write(f"JIRA: {jira}\n")
+        if upstream_version:
+            fh.write(f"Upstream status: {upstream_version}\n")
+        if cve:
+            fh.write(f"CVE: {cve}\n")
+        if omit_list:
+            fh.write("\n")
+            for h, subject, _reason in omit_list:
+                fh.write(f"Omitted-fix: {h[:12]} {subject}\n")
+        fh.write(f"\nSigned-off-by: {signed_off_by}\n")
+    info(f"Wrote {mr_path}")
 
     return len(patch_files)
 
@@ -6180,7 +6205,13 @@ def main():
                     "State saved — re-run isb to resume.")
 
     # -- Phase 5 --
-    patch_count = generate_output(rhel_repo, output_dir, base_commit, omit)
+    patch_count = generate_output(
+        rhel_repo, output_dir, base_commit, omit,
+        rhel_ver=args.rhel, subsystem=args.subsystem,
+        jira=params["jira"],
+        upstream_version=params["upstream_version"],
+        signed_off_by=args.signed_off_by, cve=args.cve,
+    )
 
     # Mark completion in session
     completed_head = git("rev-parse HEAD",
