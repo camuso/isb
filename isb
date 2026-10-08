@@ -833,8 +833,8 @@ _HELP_TOPICS = {
 
             Setup:
               pip3 install cursor-sdk
-              # Generate a key in Cursor:
-              #   Settings -> General -> API Keys -> Generate New Key
+              # Generate a key at cursor.com/dashboard/api
+              # Click "New API Key" and copy the full secret (shown once)
               export CURSOR_API_KEY="your-key-here"   # add to ~/.bashrc
 
             Interactive menu hotkey: i

@@ -80,8 +80,10 @@ descriptions.
    pip3 install cursor-sdk
    ```
 
-2. Generate an API key in Cursor:
-   **Settings → General → API Keys → Generate New Key**
+2. Generate an API key at
+   [cursor.com/dashboard/api](https://cursor.com/dashboard/api):
+   click **New API Key** and copy the full secret immediately
+   (it is only shown once; format: `crsr_...`)
 
 3. Export it in your shell profile (`~/.bashrc` or `~/.bash_profile`):
 
