@@ -4182,15 +4182,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             if total_oos:
                 is_treewide = bool(
                     re.search(r'tree[\s-]?wide', subject, re.I))
-                if is_treewide:
-                    conflict_notes.append(
-                        f"treewide commit scoped to {subsystem}; "
-                        f"{total_oos} out-of-scope file(s) excluded"
-                    )
-                else:
-                    conflict_notes.append(
-                        f"{total_oos} out-of-scope file(s) excluded"
-                    )
+                scope_label = subsystem or ", ".join(scope_paths)
+                conflict_notes.append(
+                    f"Limited to {scope_label}"
+                )
 
             # Annotate in-scope new files
             r = git("diff --cached --name-only --diff-filter=A",
