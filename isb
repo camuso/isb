@@ -3133,31 +3133,37 @@ def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
         sections.append("\n".join(sec))
 
     prompt = f"""\
-You are analyzing a kernel backport conflict resolution.
+You are writing the Conflicts stanza for a RHEL kernel backport commit message.
 
 Upstream commit: {commit_hash[:12]} {subject}
 
 The following files had conflicts when cherry-picking this upstream commit
 into the RHEL kernel branch.  Each conflict has been resolved (by patchpal
-or a human editor).  Your job is to write a concise, technical explanation
-of WHY each conflict occurred and WHAT the resolution did differently from
-the upstream version.
+or a human editor).  The diff shows how the resolved RHEL version differs
+from the upstream version.
 
-For each file, explain:
-1. The root cause of the conflict (context drift, missing prerequisite,
-   RHEL-specific code, API differences, etc.)
-2. What the resolution changed relative to the upstream version
-3. Whether any missing prerequisites should be backported first
+Write ONE LINE per file in this exact format:
+  <filepath>: <concise explanation>
 
-Be terse and technical — this text goes into a git commit message Conflicts
-stanza.  Use at most 3-4 lines per file.  Do NOT repeat the diff verbatim.
-Do NOT use markdown formatting.  Plain text only.
+The explanation should tell a reviewer:
+- What was adapted, rejected, or kept from upstream and WHY
+- e.g. "adapted foo() call to RHEL's 3-arg variant"
+- e.g. "dropped hunk adding bar(); already present via prior backport"
+- e.g. "context drift in error path; resolution preserves RHEL's kabi wrapper"
+- e.g. "rejected new helper; depends on missing prerequisite abc123"
+
+Rules:
+- One line per file, no blank lines between them
+- No markdown, no bullet points, no numbering
+- Do NOT start with "File:" — just the bare path followed by colon
+- Be specific about function names, struct fields, etc.
+- Max ~100 chars per line
 
 {"=" * 60}
 {chr(10).join(f"{chr(10)}{'-' * 40}{chr(10)}{s}" for s in sections)}
 {"=" * 60}
 
-Write the explanation now.  Start directly with the first file name."""
+Write the per-file lines now."""
 
     try:
         from cursor_sdk import LocalAgentOptions
@@ -4240,10 +4246,23 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         analyses, commit_hash, subject, upstream_repo,
                     )
                 if ai_explanation:
+                    # Replace generic per-file notes with AI versions
+                    ai_files = set()
+                    ai_lines = []
                     for ai_line in ai_explanation.splitlines():
                         ai_line = ai_line.strip()
                         if ai_line:
-                            conflict_notes.append(ai_line)
+                            ai_lines.append(ai_line)
+                            # Extract the filepath prefix before ':'
+                            if ":" in ai_line:
+                                ai_files.add(
+                                    ai_line.split(":", 1)[0].strip())
+                    # Drop generic notes for files the AI covered
+                    conflict_notes = [
+                        n for n in conflict_notes
+                        if not any(n.startswith(f"{f}:") for f in ai_files)
+                    ]
+                    conflict_notes.extend(ai_lines)
 
             report_path = _write_resolution_report(
                 output_dir, commit_hash, subject, analyses,
