@@ -967,6 +967,9 @@ def parse_args():
     p.add_argument("--divergence", default=None,
                     help="Upstream commit hash to use as divergence point "
                          "(skips auto-detection)")
+    p.add_argument("--skip", nargs="+", default=[], metavar="HASH",
+                    help="Exclude specific commit(s) by hash prefix "
+                         "(e.g. --skip a9b5bb5c 3f12ab)")
     p.add_argument("--toolbox", default=None,
                     help="Toolbox container name (default: rhel<RHEL>)")
     p.add_argument("--ailog", action=argparse.BooleanOptionalAction,
@@ -2998,10 +3001,12 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
 
     # Run git blame on the upstream file for the parent of this commit
     # to find which commits introduced the conflicting context.
-    # Batch contiguous lines into ranges for a single blame call.
+    # Batch contiguous lines into ranges; cap at 50 lines to keep
+    # blame fast on large kernel repos.
+    _BLAME_LINE_CAP = 50
     parent = f"{commit_hash}~1"
     blame_hashes = set()
-    sorted_lines = sorted(blame_lines)
+    sorted_lines = sorted(blame_lines)[:_BLAME_LINE_CAP]
     ranges = []
     if sorted_lines:
         rng_start = rng_end = sorted_lines[0]
@@ -3026,24 +3031,32 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
                     if h != "0" * 40 and h != commit_hash:
                         blame_hashes.add(h)
 
-    # Cross-reference blame hashes with RHEL history.
-    # Batch: get subjects in one call, build RHEL hash set once.
+    _PREREQ_CAP = 10
     if blame_hashes:
-        # Get all subjects in one git log call
-        hash_subjects = {}
-        for bh in sorted(blame_hashes):
-            subj_r = git(f"log --format='%s' -1 {bh}",
-                         cwd=upstream_repo, check=False)
-            if subj_r.returncode == 0:
-                hash_subjects[bh] = subj_r.stdout.strip()
+        capped = sorted(blame_hashes)[:_PREREQ_CAP]
+        if len(blame_hashes) > _PREREQ_CAP:
+            result["missing_prereqs"].append(
+                ("", f"(+{len(blame_hashes) - _PREREQ_CAP} more "
+                     f"unchecked)"))
 
-        # Check each prerequisite hash against RHEL history.
-        # Use --fixed-strings so git can short-circuit on first match.
+        # Batch subject lookup: one git log --no-walk call
+        hash_subjects = {}
+        sep = "---8<---"
+        nw = git(f"log --no-walk --format='%H{sep}%s' "
+                 + " ".join(capped),
+                 cwd=upstream_repo, check=False)
+        if nw.returncode == 0:
+            for line in nw.stdout.strip().split("\n"):
+                if sep in line:
+                    h_part, s_part = line.split(sep, 1)
+                    hash_subjects[h_part.strip()] = s_part.strip()
+
+        # Check RHEL presence: single grep in Python against a
+        # shallow log of cherry-pick references (last 5000 commits).
+        rhel_bodies = git("log --format='%b' -5000",
+                          cwd=rhel_repo, check=False).stdout
         for bh, subj in sorted(hash_subjects.items()):
-            grep_r = git(f"log --format='%H' --grep={bh} "
-                         f"--fixed-strings -1",
-                         cwd=rhel_repo, check=False)
-            if grep_r.returncode == 0 and grep_r.stdout.strip():
+            if bh in rhel_bodies:
                 result["present_prereqs"].append((bh, subj))
             else:
                 result["missing_prereqs"].append((bh, subj))
@@ -4497,6 +4510,74 @@ def load_state(output_dir):
     return None
 
 
+def _review_commits(keep, omit, keep_path, omit_path, output_dir):
+    """Interactive commit review: toggle individual commits on/off.
+
+    Returns the (possibly modified) keep list.
+    """
+    # Track which indices are enabled
+    enabled = [True] * len(keep)
+
+    while True:
+        print(f"\n{CAU}{'=' * 70}{OFF}")
+        print(f"  {BLD}Commit Review — {sum(enabled)}/{len(keep)} "
+              f"selected{OFF}")
+        print(f"  {'─' * 66}")
+        for i, (h, subj, reason) in enumerate(keep):
+            mark = f"{STA}✓{OFF}" if enabled[i] else f"{WRN}✗{OFF}"
+            idx_label = f"{i + 1:3d}"
+            trunc = subj[:55] + "…" if len(subj) > 56 else subj
+            print(f"  {mark} {DIM}{idx_label}{OFF} {h[:12]} {trunc}")
+        print(f"  {'─' * 66}")
+        print(f"  Enter number to toggle, "
+              f"{MNU}a{OFF} select all, "
+              f"{MNU}n{OFF} select none, "
+              f"{MNU}d{OFF} done")
+        print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+
+        # Read input — single digit for <10, or line input for numbers
+        if len(keep) < 10:
+            ch = _getch()
+            print(ch)
+            inp = ch.strip()
+        else:
+            inp = input().strip()
+
+        if inp in ('d', 'D'):
+            break
+        elif inp in ('a', 'A'):
+            enabled = [True] * len(keep)
+            continue
+        elif inp in ('n', 'N'):
+            enabled = [False] * len(keep)
+            continue
+        else:
+            try:
+                num = int(inp)
+                if 1 <= num <= len(keep):
+                    enabled[num - 1] = not enabled[num - 1]
+                    state = "selected" if enabled[num - 1] else "deselected"
+                    status(f"  {num}: {state}")
+                else:
+                    warn(f"  Out of range (1-{len(keep)})")
+            except ValueError:
+                pass
+            continue
+
+    # Split into new keep/omit based on selections
+    new_keep = []
+    for i, (h, subj, reason) in enumerate(keep):
+        if enabled[i]:
+            new_keep.append((h, subj, reason))
+        else:
+            omit.append((h, subj, "user-excluded"))
+
+    removed = len(keep) - len(new_keep)
+    if removed:
+        info(f"  Removed {removed} commit(s) from cherry-pick list.")
+    return new_keep
+
+
 def _write_commit_list(keep_path, keep, omit_path, omit):
     """Write editable commit list files in git-log --oneline format."""
     with open(keep_path, "w") as fh:
@@ -5672,6 +5753,21 @@ def main():
                 print(f"  {WRN}OMIT{OFF} {h[:12]} {subj}  ({reason})")
             return
 
+        # Apply --skip exclusions
+        if args.skip:
+            skip_prefixes = [s.lower() for s in args.skip]
+            new_keep = []
+            for h, subj, reason in keep:
+                if any(h.lower().startswith(sp) for sp in skip_prefixes):
+                    omit.append((h, subj, "user-skipped (--skip)"))
+                    info(f"  Skipping {h[:12]} {subj}")
+                else:
+                    new_keep.append((h, subj, reason))
+            if len(keep) != len(new_keep):
+                info(f"  --skip removed {len(keep) - len(new_keep)} "
+                     f"commit(s)")
+                keep = new_keep
+
         # Write editable commit list
         os.makedirs(output_dir, exist_ok=True)
         keep_file = os.path.join(output_dir, "keep_commits.txt")
@@ -5681,25 +5777,36 @@ def main():
         # Show commit list locations; the main menu already collected
         # the user's g/x choice so no second g/x prompt is needed.
         if not args.yes and args.command != "continue":
-            print(f"\n  Commit lists written to:")
-            print(f"    {INF}{keep_file}{OFF}  ({len(keep)} commits)")
-            print(f"    {INF}{omit_file}{OFF}  ({len(omit)} commits)")
-            print(f"  Edit in another terminal to add, remove, or "
-                  f"reorder.")
-            print(f"\n  Press any key to proceed, "
-                  f"{MNU}q{OFF} quit, "
-                  f"{MNU}r{OFF} return to main menu")
-            print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
-            ch = _getch()
-            if ch in ('q', 'Q', '\x03'):
-                print("q")
-                _cleanup_and_exit()
-            elif ch in ('r', 'R'):
-                print("r")
-                _step_loop = True
+            while True:
+                print(f"\n  {BLD}{len(keep)} commits to cherry-pick{OFF}")
+                print(f"  Commit list: {INF}{keep_file}{OFF}")
+                print(f"\n  Press any key to proceed, "
+                      f"{MNU}v{OFF} review/edit commits, "
+                      f"{MNU}q{OFF} quit, "
+                      f"{MNU}r{OFF} return to main menu")
+                print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+                ch = _getch()
+                if ch in ('q', 'Q', '\x03'):
+                    print("q")
+                    _cleanup_and_exit()
+                elif ch in ('r', 'R'):
+                    print("r")
+                    _step_loop = True
+                    break
+                elif ch in ('v', 'V'):
+                    print("v")
+                    keep = _review_commits(keep, omit, keep_file,
+                                           omit_file, output_dir)
+                    _write_commit_list(keep_file, keep, omit_file, omit)
+                    save_cached_results(
+                        _session, divergence, pending, keep, omit)
+                    _save()
+                    continue
+                else:
+                    print()
+                    break
+            if _step_loop:
                 continue
-            else:
-                print()
 
         # If resuming, reload the commit list (user may have edited it)
         if os.path.isfile(keep_file):
