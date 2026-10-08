@@ -4118,12 +4118,20 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         _redo_resolution = False
 
         if had_conflict:
-            with Spinner("Resolving conflicts ..."):
+            if conflict_policy in ("patchpal", "edit"):
+                status("  Resolving conflicts ...")
                 conflict_notes, oos_conflict_count, inscope_conflicted = \
                     resolve_conflicts(
                         rhel_repo, scope_paths, conflict_policy, rhel_ver,
                         commit_hash=commit_hash, upstream_repo=upstream_repo,
                     )
+            else:
+                with Spinner("Resolving conflicts ..."):
+                    conflict_notes, oos_conflict_count, inscope_conflicted = \
+                        resolve_conflicts(
+                            rhel_repo, scope_paths, conflict_policy, rhel_ver,
+                            commit_hash=commit_hash, upstream_repo=upstream_repo,
+                        )
 
         with Spinner("Scoping and indexing ..."):
             removed = scope_index(rhel_repo, scope_paths, exclude_paths)
