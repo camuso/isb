@@ -68,6 +68,39 @@ RHEL-compliant commit messages suitable for merge requests.
 - [cursor-sdk](https://pypi.org/project/cursor-sdk/) + `CURSOR_API_KEY`
   (optional, for AI conflict explanation via `--ailog`)
 
+## Setting up the Cursor API Key
+
+AI-assisted features (`--ailog`) require the `CURSOR_API_KEY` environment
+variable. Without it, isb silently falls back to heuristic-based conflict
+descriptions.
+
+1. Install the SDK:
+
+   ```sh
+   pip3 install cursor-sdk
+   ```
+
+2. Generate an API key in Cursor:
+   **Settings → General → API Keys → Generate New Key**
+
+3. Export it in your shell profile (`~/.bashrc` or `~/.bash_profile`):
+
+   ```sh
+   export CURSOR_API_KEY="your-key-here"
+   ```
+
+4. Source the profile or open a new terminal:
+
+   ```sh
+   source ~/.bashrc
+   ```
+
+Verify it works:
+
+```sh
+python3 -c "import cursor_sdk; import os; print('OK' if os.environ.get('CURSOR_API_KEY') else 'NOT SET')"
+```
+
 ## Installation
 
 Copy or symlink the script to a directory on your `$PATH`:

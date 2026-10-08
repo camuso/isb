@@ -827,9 +827,15 @@ _HELP_TOPICS = {
                If all AI attempts fail, isb falls back to the manual
                Skip / Fix / Abort menu.
 
-            Requires the cursor-sdk Python package (pip install cursor-sdk)
-            and CURSOR_API_KEY in the environment.  If either is missing,
-            isb falls back to local heuristic analysis silently.
+            Requires the cursor-sdk Python package and CURSOR_API_KEY in the
+            environment.  If either is missing, isb falls back to local
+            heuristic analysis silently.
+
+            Setup:
+              pip3 install cursor-sdk
+              # Generate a key in Cursor:
+              #   Settings -> General -> API Keys -> Generate New Key
+              export CURSOR_API_KEY="your-key-here"   # add to ~/.bashrc
 
             Interactive menu hotkey: i
 
