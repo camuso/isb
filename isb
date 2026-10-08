@@ -5028,10 +5028,8 @@ def generate_output(rhel_repo, output_dir, base_commit, omit_list,
     mr_path = os.path.join(output_dir, "mr-description.txt")
     with open(mr_path, "w") as fh:
         fh.write(f"[RHEL-{rhel_ver}] {sub_name} updates and fixes\n\n")
-        if jira:
-            fh.write(f"JIRA: {jira}\n")
-        if upstream_version:
-            fh.write(f"Upstream status: {upstream_version}\n")
+        fh.write(f"JIRA: {jira}\n")
+        fh.write(f"Upstream status: {upstream_version}\n")
         if cve:
             fh.write(f"CVE: {cve}\n")
         if omit_list:
