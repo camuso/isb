@@ -207,11 +207,11 @@ def _cleanup_and_exit(*_args):
         subprocess.run("git cherry-pick --abort",
                        shell=True, cwd=_cherrypick_repo,
                        capture_output=True)
-        subprocess.run("git reset HEAD",
+        subprocess.run("git reset --hard HEAD",
                        shell=True, cwd=_cherrypick_repo,
                        capture_output=True)
         print(f"\n{WRN}Interrupted -- cherry-pick aborted, "
-              f"progress saved (will resume).{OFF}")
+              f"working tree cleaned, progress saved (will resume).{OFF}")
     else:
         print(f"\n{WRN}Interrupted -- session saved.{OFF}")
     sys.exit(130)
@@ -5767,6 +5767,15 @@ def main():
                 base_commit = saved_base or base_commit
                 status(f"Resuming from commit "
                        f"{start_idx + 1}/{len(keep)}")
+
+                # Clean up any dirty state left by a prior interrupted run
+                dirty = git("status --porcelain", cwd=rhel_repo,
+                            check=False).stdout.strip()
+                if dirty:
+                    warn("  Cleaning up dirty working tree from "
+                         "interrupted run ...")
+                    git("cherry-pick --abort", cwd=rhel_repo, check=False)
+                    git("reset --hard HEAD", cwd=rhel_repo, check=False)
 
         _loop_output_dir = output_dir
         _loop_base_commit = base_commit
