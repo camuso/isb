@@ -3327,35 +3327,39 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
 
         print(f"\n  Report: {INF}{report_path}{OFF}")
         print(f"  {'─' * 66}")
-        print(f"  {MNU}A{OFF}  Re-do resolution (reopen in editor/patchpal)")
-        print(f"  {MNU}B{OFF}  Accept and continue")
-        print(f"  {MNU}C{OFF}  Abort this cherry-pick")
+        print(f"  {MNU}1{OFF}  Accept and continue")
+        print(f"  {MNU}2{OFF}  Re-do resolution (reopen in editor/patchpal)")
+        print(f"  {MNU}3{OFF}  Abort this cherry-pick")
+        print(f"  {MNU}v{OFF}  View conflict report")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         ch = _getch()
-        print()
+        print(ch)
 
-        if ch in ('b', 'B'):
+        if ch == '1':
             return "accept"
-        elif ch in ('a', 'A'):
+        elif ch == '2':
             return "redo"
-        elif ch in ('c', 'C', '\x03'):
-            # Abort sub-menu
+        elif ch in ('v', 'V'):
+            editor = _get_editor()
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(f"{editor} {report_path}", shell=True)
+            continue
+        elif ch in ('3', '\x03'):
             print(f"\n  {CAU}Abort — what next?{OFF}")
-            print(f"  {MNU}A{OFF}  Skip to the next commit")
-            print(f"  {MNU}B{OFF}  Return to the interactive menu")
-            print(f"  {MNU}C{OFF}  Exit isb")
+            print(f"  {MNU}1{OFF}  Skip to the next commit")
+            print(f"  {MNU}2{OFF}  Return to the interactive menu")
+            print(f"  {MNU}3{OFF}  Exit isb")
             print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
             ch2 = _getch()
-            print()
-            if ch2 in ('a', 'A'):
+            print(ch2)
+            if ch2 == '1':
                 return "skip"
-            elif ch2 in ('b', 'B'):
+            elif ch2 == '2':
                 return "menu"
-            elif ch2 in ('c', 'C', '\x03'):
+            elif ch2 in ('3', '\x03'):
                 return "exit"
             else:
-                # Default to skip on unrecognized
                 return "skip"
 
 
