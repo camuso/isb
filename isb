@@ -3115,6 +3115,49 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
     return result
 
 
+def _group_prereq_series(missing_list):
+    """Group missing prerequisites by common subject keywords.
+
+    If multiple missing commits share distinctive keywords (e.g. all
+    contain "rdmsr" or "rename"), group them as a named series.
+    Singleton commits are returned individually.
+
+    Returns a list of (label, [(hash, subject), ...]) tuples.
+    label is a summary string for grouped items, or "" for singletons.
+    """
+    if len(missing_list) <= 1:
+        return [("", missing_list)]
+
+    # Find common words (3+ chars) across all subjects
+    word_sets = []
+    for _, subj in missing_list:
+        words = {w.lower() for w in re.findall(r'\b\w{3,}\b', subj)}
+        word_sets.append(words)
+
+    if not word_sets:
+        return [("", missing_list)]
+
+    common = word_sets[0]
+    for ws in word_sets[1:]:
+        common &= ws
+
+    # Remove very generic words
+    _GENERIC = {"the", "for", "and", "from", "with", "into", "that",
+                "this", "not", "use", "add", "fix", "move", "change",
+                "make", "remove", "drop", "kvm", "x86", "svm", "vmx"}
+    common -= _GENERIC
+
+    if common and len(missing_list) >= 2:
+        # Build a series label from the common words
+        label_words = sorted(common, key=lambda w: -len(w))[:3]
+        series_label = (f"{', '.join(label_words)} patch series "
+                        f"({len(missing_list)} commit(s))")
+        return [(series_label, missing_list)]
+
+    # No common theme — return as individual entries
+    return [("", missing_list)]
+
+
 def _cursor_sdk_available():
     """Return True if cursor-sdk is installed and CURSOR_API_KEY is set."""
     if not os.environ.get("CURSOR_API_KEY"):
@@ -3469,6 +3512,26 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     removed = [l for l in diff_hunks
                if l.startswith("-") and not l.startswith("---")]
 
+    # Detect API renames: lines where added/removed differ only in a
+    # function or macro name (e.g. rdmsrl -> rdmsrq)
+    rename_pairs = []
+    added_stripped = [l[1:].strip() for l in added]
+    removed_stripped = [l[1:].strip() for l in removed]
+    if len(added_stripped) == len(removed_stripped) and len(added_stripped) <= 20:
+        for a_line, r_line in zip(added_stripped, removed_stripped):
+            if a_line == r_line:
+                continue
+            # Find differing tokens
+            a_toks = re.findall(r'\b\w+\b', a_line)
+            r_toks = re.findall(r'\b\w+\b', r_line)
+            if len(a_toks) == len(r_toks):
+                diffs = [(r, a) for r, a in zip(r_toks, a_toks) if r != a]
+                if len(diffs) == 1:
+                    rename_pairs.append(diffs[0])
+
+    # Deduplicate rename pairs
+    rename_pairs = list(dict.fromkeys(rename_pairs))
+
     # Characterize the changes
     parts = []
     rhel_markers = sum(1 for l in added
@@ -3476,7 +3539,13 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     only_added = len(added) > 0 and len(removed) == 0
     only_removed = len(removed) > 0 and len(added) == 0
 
-    if rhel_markers:
+    if rename_pairs:
+        shown = rename_pairs[:3]
+        renames = ", ".join(f"{old}->{new}" for old, new in shown)
+        parts.append(renames)
+        if len(rename_pairs) > 3:
+            parts[-1] += f" (+{len(rename_pairs) - 3} more)"
+    elif rhel_markers:
         parts.append(f"RHEL-specific code ({rhel_markers} line(s))")
     elif only_removed:
         parts.append("upstream hunks dropped")
@@ -3485,7 +3554,7 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     else:
         parts.append("adapted for RHEL")
 
-    if func_names:
+    if func_names and not rename_pairs:
         shown = func_names[:3]
         parts.append("in " + ", ".join(shown))
 
@@ -3846,7 +3915,35 @@ def scope_index(rhel_repo, scope_paths, exclude_paths=None):
         git(f"rm -f {' '.join(rm_new)}",
             cwd=rhel_repo, check=False)
 
-    return restore + rm_new
+    all_removed = restore + rm_new
+
+    # Categorize dropped files for richer conflict notes
+    _removed_categories = {}
+    _ARCH_PREFIXES = {
+        "arch/loongarch": "loongarch",
+        "arch/riscv": "riscv",
+        "arch/arm64": "arm64",
+        "arch/arm": "arm",
+        "arch/s390": "s390",
+        "arch/powerpc": "ppc",
+        "arch/mips": "mips",
+        "tools/testing/selftests/kvm/loongarch": "loongarch",
+        "tools/testing/selftests/kvm/riscv": "riscv",
+        "tools/testing/selftests/kvm/arm64": "arm64",
+        "tools/testing/selftests/kvm/s390": "s390",
+    }
+    for f in all_removed:
+        cat = None
+        for prefix, label in _ARCH_PREFIXES.items():
+            if f.startswith(prefix):
+                cat = label
+                break
+        if cat is None:
+            cat = "_other"
+        _removed_categories.setdefault(cat, []).append(f)
+
+    scope_index._removed_categories = _removed_categories
+    return all_removed
 
 
 def build_test(rhel_repo, toolbox_name, subsystem):
@@ -4246,13 +4343,25 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         with Spinner("Scoping and indexing ..."):
             removed = scope_index(rhel_repo, scope_paths, exclude_paths)
             total_oos = len(removed) + oos_conflict_count
+            categories = getattr(scope_index, '_removed_categories', {})
+
             if total_oos:
-                is_treewide = bool(
-                    re.search(r'tree[\s-]?wide', subject, re.I))
                 scope_label = subsystem or ", ".join(scope_paths)
-                conflict_notes.append(
-                    f"Limited to {scope_label}"
-                )
+                # Name dropped architectures explicitly
+                arch_cats = {k: v for k, v in categories.items()
+                             if k != "_other"}
+                if arch_cats:
+                    dropped_archs = sorted(arch_cats.keys())
+                    conflict_notes.append(
+                        f"dropped {', '.join(dropped_archs)} hunks")
+                other = categories.get("_other", [])
+                if other and not arch_cats:
+                    conflict_notes.append(
+                        f"Limited to {scope_label}")
+                elif other:
+                    conflict_notes.append(
+                        f"remaining out-of-scope changes limited "
+                        f"to {scope_label}")
 
             # Annotate in-scope new files
             r = git("diff --cached --name-only --diff-filter=A",
@@ -4300,6 +4409,25 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     for cf in inscope_conflicted
                 ]
 
+            # Add missing prerequisite notes in reviewer style
+            all_missing = []
+            for a in analyses:
+                for h, s in a.get("missing_prereqs", []):
+                    if h and (h, s) not in all_missing:
+                        all_missing.append((h, s))
+            # Group by common subject patterns (e.g. rename series)
+            if all_missing:
+                _grouped = _group_prereq_series(all_missing)
+                for label, hashes in _grouped:
+                    if label:
+                        conflict_notes.append(
+                            f"missing {label}")
+                    else:
+                        for h, s in hashes:
+                            conflict_notes.append(
+                                f"missing commit {h[:12]} "
+                                f"(\"{s}\")")
+
             ai_explanation = ""
             if ailog:
                 with Spinner("AI conflict analysis (Claude) ..."):
@@ -4314,11 +4442,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         ai_line = ai_line.strip()
                         if ai_line:
                             ai_lines.append(ai_line)
-                            # Extract the filepath prefix before ':'
                             if ":" in ai_line:
                                 ai_files.add(
                                     ai_line.split(":", 1)[0].strip())
-                    # Drop generic notes for files the AI covered
                     conflict_notes = [
                         n for n in conflict_notes
                         if not any(n.startswith(f"{f}:") for f in ai_files)
