@@ -3818,17 +3818,43 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
             stderr=subprocess.DEVNULL,
         )
         if r.returncode != 0:
-            git("cherry-pick --abort", cwd=rhel_repo, check=False)
-            die(f"patchpal exited with error for {cf}. "
-                "Cherry-pick aborted.")
+            warn(f"  patchpal exited without saving for {cf}.")
+            print(f"  {MNU}r{OFF}  Retry patchpal   "
+                  f"{MNU}s{OFF}  Skip this commit   "
+                  f"{MNU}q{OFF}  Quit isb")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            ch = _getch()
+            print(ch)
+            if ch in ('r', 'R'):
+                # Re-run patchpal on same file — redo via caller
+                return [], list(in_scope_conflicts)
+            elif ch in ('q', 'Q', '\x03'):
+                git("cherry-pick --abort", cwd=rhel_repo, check=False)
+                die("Aborted by user.")
+            else:
+                # Skip: abort cherry-pick, signal skip to caller
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                return ["skipped by user"], []
         still_unmerged = git(
             f"diff --name-only --diff-filter=U -- {cf}",
             cwd=rhel_repo, check=False,
         ).stdout.strip()
         if still_unmerged:
-            git("cherry-pick --abort", cwd=rhel_repo, check=False)
-            die(f"{cf} still has unresolved conflicts after patchpal. "
-                "Cherry-pick aborted.")
+            warn(f"  {cf} still has unresolved conflicts.")
+            print(f"  {MNU}r{OFF}  Retry patchpal   "
+                  f"{MNU}s{OFF}  Skip this commit   "
+                  f"{MNU}q{OFF}  Quit isb")
+            print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+            ch = _getch()
+            print(ch)
+            if ch in ('r', 'R'):
+                return [], list(in_scope_conflicts)
+            elif ch in ('q', 'Q', '\x03'):
+                git("cherry-pick --abort", cwd=rhel_repo, check=False)
+                die("Aborted by user.")
+            else:
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                return ["skipped by user"], []
         detail = _classify_conflict(cf, rhel_repo, commit_hash,
                                     upstream_repo)
         notes.append(f"{cf}: patchpal {detail}")
@@ -4478,6 +4504,11 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                             rhel_repo, scope_paths, conflict_policy, rhel_ver,
                             commit_hash=commit_hash, upstream_repo=upstream_repo,
                         )
+
+            # User chose to skip from within patchpal/editor
+            if conflict_notes == ["skipped by user"]:
+                _cherrypick_repo = None
+                return "skip", conflict_notes
 
         with Spinner("Scoping and indexing ..."):
             removed = scope_index(rhel_repo, scope_paths, exclude_paths)
