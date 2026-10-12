@@ -4908,7 +4908,7 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         print(f"  Enter number to toggle, "
               f"{MNU}a{OFF} select all, "
               f"{MNU}n{OFF} select none, "
-              f"{MNU}d{OFF} done")
+              f"{MNU}q{OFF} quit")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         # Read input — single digit for <10, or line input for numbers
@@ -4919,7 +4919,7 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         else:
             inp = input().strip()
 
-        if inp in ('d', 'D'):
+        if inp in ('q', 'Q'):
             break
         elif inp in ('a', 'A'):
             enabled = [True] * total
