@@ -489,15 +489,11 @@ _HELP_TOPICS = {
               isb help conflict-policy    correct
               isb help --conflict-policy  WRONG (parsed as a flag)
 
-            TOPIC can be any subcommand or option name:
+            Run 'isb help topics' to see all available topics:
 
-              Commands:  help, pick, continue, status, reset, new
-              Options:   subsystem, rhel, upstream-repo, upstream-version,
-                         cve, jira, extra-paths, only, exclude,
-                         branch, output-dir,
-                         conflict-policy, editor, build-policy, dry-run,
-                         yes, signed-off-by (or just 's'), assisted-by,
-                         step, divergence, toolbox, regen
+              isb help topics            list all topics with summaries
+              isb help conflict-policy   detailed help for an option
+              isb help skip              how commit exclusion works
 
             The -h and --help flags still work and display the man page.
         """),
@@ -866,6 +862,27 @@ _HELP_TOPICS = {
               isb --ailog             # explicitly enable (already default)
         """),
     ),
+    "skip": (
+        "--skip HASH [HASH ...]",
+        "Exclude specific commit(s) by hash prefix.",
+        textwrap.dedent("""\
+            Commits whose full hash starts with any of the given prefixes
+            will be moved from KEEP to OMIT before cherry-picking begins.
+
+            User-skipped commits (from --skip, patchpal skip, or the
+            conflict review menu) are persisted in the state file.  They
+            survive resets: resetting to zero and replaying will still
+            skip them automatically, showing a ✘ indicator in the output.
+
+            To restore a skipped commit, use the commit review page
+            (v hotkey in the confirmation menu).  Toggling it back to ✓
+            removes it from the persisted skip list.
+
+            Examples:
+              isb --skip a9b5bb5c                 # skip one commit
+              isb --skip a9b5bb5c 3f12ab 0cd3e    # skip multiple
+        """),
+    ),
 }
 
 
@@ -876,15 +893,39 @@ _HELP_ALIASES = {
 }
 
 
+def _show_topics_list():
+    """Print all available help topics grouped by category and exit."""
+    print(f"\n{BLD}isb help topics{OFF}\n")
+    print(f"{BLD}Commands:{OFF}")
+    for cmd in ("help", "pick", "continue", "status", "reset", "new"):
+        _, summary, _ = _HELP_TOPICS[cmd]
+        print(f"  {cmd:<22s} {summary}")
+    print(f"\n{BLD}Options:{OFF}")
+    for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
+                "cve", "jira", "add", "drop",
+                "branch", "output-dir",
+                "conflict-policy", "editor", "build-policy", "dry-run",
+                "yes", "signed-off-by", "assisted-by", "step",
+                "divergence", "toolbox", "regen", "ailog", "skip"):
+        if opt not in _HELP_TOPICS:
+            continue
+        usage, summary, _ = _HELP_TOPICS[opt]
+        print(f"  {usage.split()[0]:<22s} {summary}")
+    print(f"\nRun 'isb help <topic>' for details on any topic.")
+    sys.exit(0)
+
+
 def _show_topic_help(topic):
     """Print help for a single topic and exit."""
     key = topic.lstrip("-")
     if key == "s":
         key = "signed-off-by"
+    if key == "topics":
+        _show_topics_list()
     key = _HELP_ALIASES.get(key, key)
     if key not in _HELP_TOPICS:
         print(f"Unknown topic: {topic}")
-        print(f"Available topics: {', '.join(sorted(_HELP_TOPICS))}")
+        print(f"Run 'isb help topics' to see all available topics.")
         sys.exit(1)
     usage, summary, detail = _HELP_TOPICS[key]
     print(f"\n  {BLD}{usage}{OFF}")
@@ -911,7 +952,8 @@ def _show_general_help():
                 "divergence", "toolbox", "regen", "ailog"):
         usage, summary, _ = _HELP_TOPICS[opt]
         print(f"  {usage.split()[0]:<22s} {summary}")
-    print(f"\nRun 'isb help <topic>' for details on any command or option.")
+    print(f"\nRun 'isb help topics' for this list, "
+          f"'isb help <topic>' for details.")
     sys.exit(0)
 
 
