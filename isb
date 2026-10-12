@@ -4869,21 +4869,41 @@ def load_state(output_dir):
 def _review_commits(keep, omit, keep_path, omit_path, output_dir):
     """Interactive commit review: toggle individual commits on/off.
 
+    Shows the keep list (numbered from 1) plus previously omitted commits
+    (numbered contiguously after keep) so the user can restore them.
+
     Returns the (possibly modified) keep list.
     """
-    # Track which indices are enabled
-    enabled = [True] * len(keep)
+    # Build a unified display list: keep entries then omit entries
+    # Each item: (hash, subject, reason, originally_kept)
+    combined = [(h, s, r, True) for h, s, r in keep] + \
+               [(h, s, r, False) for h, s, r in omit]
+    enabled = [orig for _, _, _, orig in combined]
+    total = len(combined)
+    keep_count = len(keep)
 
     while True:
+        n_selected = sum(enabled)
         print(f"\n{CAU}{'=' * 70}{OFF}")
-        print(f"  {BLD}Commit Review — {sum(enabled)}/{len(keep)} "
+        print(f"  {BLD}Commit Review — {n_selected}/{total} "
               f"selected{OFF}")
         print(f"  {'─' * 66}")
-        for i, (h, subj, reason) in enumerate(keep):
-            mark = f"{STA}✓{OFF}" if enabled[i] else f"{WRN}✗{OFF}"
+        for i, (h, subj, reason, _) in enumerate(combined):
+            mark = f"{STA}✓{OFF}" if enabled[i] else f"{CAU}✘{OFF}"
             idx_label = f"{i + 1:3d}"
-            trunc = subj[:55] + "…" if len(subj) > 56 else subj
-            print(f"  {mark} {DIM}{idx_label}{OFF} {h[:12]} {trunc}")
+            trunc = subj[:50] + "…" if len(subj) > 51 else subj
+            if enabled[i]:
+                print(f"  {mark} {DIM}{idx_label}{OFF} "
+                      f"{h[:12]} {trunc}")
+            else:
+                print(f"  {mark} {DIM}{idx_label} "
+                      f"{h[:12]} {trunc}{OFF}")
+                if reason and reason != "user-excluded":
+                    print(f"        {DIM}({reason}){OFF}")
+        if keep_count < total:
+            print(f"  {'─' * 66}")
+            print(f"  {DIM}Items {keep_count + 1}–{total} were "
+                  f"previously omitted{OFF}")
         print(f"  {'─' * 66}")
         print(f"  Enter number to toggle, "
               f"{MNU}a{OFF} select all, "
@@ -4892,7 +4912,7 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         # Read input — single digit for <10, or line input for numbers
-        if len(keep) < 10:
+        if total < 10:
             ch = _getch()
             print(ch)
             inp = ch.strip()
@@ -4902,35 +4922,42 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         if inp in ('d', 'D'):
             break
         elif inp in ('a', 'A'):
-            enabled = [True] * len(keep)
+            enabled = [True] * total
             continue
         elif inp in ('n', 'N'):
-            enabled = [False] * len(keep)
+            enabled = [False] * total
             continue
         else:
             try:
                 num = int(inp)
-                if 1 <= num <= len(keep):
+                if 1 <= num <= total:
                     enabled[num - 1] = not enabled[num - 1]
                     state = "selected" if enabled[num - 1] else "deselected"
                     status(f"  {num}: {state}")
                 else:
-                    warn(f"  Out of range (1-{len(keep)})")
+                    warn(f"  Out of range (1-{total})")
             except ValueError:
                 pass
             continue
 
-    # Split into new keep/omit based on selections
+    # Rebuild keep and omit from the combined list
     new_keep = []
-    for i, (h, subj, reason) in enumerate(keep):
+    new_omit = []
+    for i, (h, subj, reason, was_kept) in enumerate(combined):
         if enabled[i]:
             new_keep.append((h, subj, reason))
         else:
-            omit.append((h, subj, "user-excluded"))
+            tag = reason if not was_kept else "user-excluded"
+            new_omit.append((h, subj, tag))
 
-    removed = len(keep) - len(new_keep)
+    added = sum(1 for i in range(keep_count, total) if enabled[i])
+    removed = sum(1 for i in range(keep_count) if not enabled[i])
+    if added:
+        info(f"  Restored {added} previously omitted commit(s).")
     if removed:
-        info(f"  Removed {removed} commit(s) from cherry-pick list.")
+        info(f"  Excluded {removed} commit(s) from cherry-pick list.")
+    omit.clear()
+    omit.extend(new_omit)
     return new_keep
 
 
