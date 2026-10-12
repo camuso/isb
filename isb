@@ -3162,14 +3162,25 @@ def _group_prereq_series(missing_list):
     return [("", missing_list)]
 
 
+_sdk_warned = False
+
 def _cursor_sdk_available():
     """Return True if cursor-sdk is installed and CURSOR_API_KEY is set."""
+    global _sdk_warned
     if not os.environ.get("CURSOR_API_KEY"):
+        if not _sdk_warned:
+            _sdk_warned = True
+            warn("  CURSOR_API_KEY not set. "
+                 "Falling back to simpler conflict notes.")
         return False
     try:
         import cursor_sdk  # noqa: F401
         return True
     except ImportError:
+        if not _sdk_warned:
+            _sdk_warned = True
+            warn("  cursor-sdk not installed. "
+                 "Falling back to simpler conflict notes.")
         return False
 
 
