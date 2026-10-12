@@ -53,6 +53,26 @@ RHEL-compliant commit messages suitable for merge requests.
      failing source, apply minimal fixes, and rebuild — retrying up to
      3 times before falling back to the manual menu.
   Disable with `--no-ailog`.
+- **Reviewer-style conflict notes** — the Conflicts stanza in commit
+  messages produces descriptions reviewers expect:
+  - Dropped architecture hunks named explicitly
+    (e.g. `dropped loongarch, riscv hunks`)
+  - API renames detected from the diff
+    (e.g. `rdmsrl->rdmsrq; in kvm_init()`)
+  - Missing prerequisites grouped by series when they share keywords
+  - Known upstream-only APIs flagged via `api-replacements.json`
+  - Function names and change characterization
+    (e.g. `added return value capture in sev_init()`)
+- **Commit review with omit toggle** — the interactive commit review
+  page (`v` hotkey) shows previously omitted commits with a ✘ mark.
+  Toggle any entry by number to restore it to the keep list.
+- **Commit exclusion** — `--skip HASH ...` excludes specific commits
+  by hash prefix. User-skipped commits (from `--skip`, patchpal, or
+  the review menu) are persisted across resets, so resetting to zero
+  and replaying will still skip them. Restore via the commit review page.
+- **Graceful patchpal exit** — closing patchpal without saving presents
+  Retry / Skip / Quit instead of killing the session. Skipped commits
+  appear in the commit review page for later restoration.
 - **Dry-run mode** — `--dry-run` classifies and lists upstream commits
   without applying anything.
 - **Built-in help** — `isb help` shows a summary of all commands and
@@ -61,21 +81,27 @@ RHEL-compliant commit messages suitable for merge requests.
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.12+
 - Git
 - A RHEL or CentOS Stream kernel repository
 - An upstream Linux kernel repository
-- [toolbox](https://containertoolbx.org/) (for build testing)
+- [toolbox](https://containertoolbx.org/) (required for build testing
+  if not building natively, e.g. host OS differs from RHEL target)
 - [patchpal](https://github.com/camuso/patchpal) (optional, for GUI
-  conflict resolution)
+  conflict resolution; requires X11/Wayland display)
 - [cursor-sdk](https://pypi.org/project/cursor-sdk/) + `CURSOR_API_KEY`
   (optional, for AI conflict explanation via `--ailog`)
 
 ## Setting up the Cursor API Key
 
 AI-assisted features (`--ailog`) require the `CURSOR_API_KEY` environment
-variable. Without it, isb silently falls back to heuristic-based conflict
-descriptions.
+variable and a Cursor paid subscription. Without them, isb falls back to
+heuristic-based conflict descriptions and prints a one-time warning:
+
+    CURSOR_API_KEY not set. Falling back to simpler conflict notes.
+
+isb automatically selects the best available model from the Cursor API
+at runtime, so no model name needs to be configured.
 
 1. Install the SDK:
 
@@ -88,10 +114,14 @@ descriptions.
    click **New API Key** and copy the full secret immediately
    (it is only shown once; format: `crsr_...`)
 
-3. Export it in your shell profile (`~/.bashrc` or `~/.bash_profile`):
+3. Save the key to a file and export it from your shell profile:
 
    ```sh
-   export CURSOR_API_KEY="your-key-here"
+   # Save the key (paste your key when prompted):
+   read -sp "Cursor API key: " key && echo "$key" > ~/.cursor/cursor-worker-api-key && echo
+
+   # Add to ~/.bashrc or ~/.bash_profile:
+   [ -f ~/.cursor/cursor-worker-api-key ] && export CURSOR_API_KEY="$(cat ~/.cursor/cursor-worker-api-key)"
    ```
 
 4. Source the profile or open a new terminal:

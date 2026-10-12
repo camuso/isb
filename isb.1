@@ -62,6 +62,26 @@ Build failures also present an interactive menu allowing the user
 to fix failing files using their resolution strategy, skip the
 commit, or abort.
 .PP
+The Conflicts stanza in commit messages is generated with
+reviewer-style descriptions:
+.RS
+.IP \(bu 2
+Dropped architecture hunks named explicitly
+(e.g.\& \fIdropped loongarch, riscv hunks\fR).
+.IP \(bu 2
+API renames detected from the diff
+(e.g.\& \fIrdmsrl->rdmsrq; in kvm_init()\fR).
+.IP \(bu 2
+Missing prerequisites grouped by series when they share keywords
+(e.g.\& \fImissing rdmsrl, rename patch series (5 commit(s))\fR).
+.IP \(bu 2
+Known upstream-only APIs flagged via
+.BR api\-replacements.json .
+.IP \(bu 2
+Function names and change characterization
+(e.g.\& \fIadded return value capture in sev_init()\fR).
+.RE
+.PP
 After commit classification (Phase\ 3), the KEEP and OMIT lists are
 written to editable files
 .RI ( keep_commits.txt ", " omit_commits.txt )
@@ -205,12 +225,23 @@ falls through to the manual Skip / Fix / Abort menu.
 .IP
 Requires the
 .B cursor-sdk
-Python package and the
+Python package, the
 .B CURSOR_API_KEY
-environment variable.
-If either is missing,
+environment variable, and a Cursor paid subscription.
+If either the package or the key is missing,
 .B isb
-falls back to local heuristic analysis silently.
+prints a one-time warning and falls back to local heuristic analysis:
+.RS
+.nf
+CURSOR_API_KEY not set. Falling back to simpler conflict notes.
+.fi
+.RE
+.IP
+.B isb
+automatically queries
+.B Cursor.models.list()
+at runtime and selects the best available model; no model name
+needs to be configured.
 .IP
 To set up:
 .RS
@@ -220,8 +251,12 @@ pip3 install cursor-sdk
 # Generate a key at cursor.com/dashboard/api
 # Click "New API Key" and copy the full secret (shown once)
 
+# Save the key to a file:
+echo "your-key-here" > ~/.cursor/cursor-worker-api-key
+
 # Add to ~/.bashrc or ~/.bash_profile:
-export CURSOR_API_KEY="your-key-here"
+[ -f ~/.cursor/cursor-worker-api-key ] && \\
+  export CURSOR_API_KEY="$(cat ~/.cursor/cursor-worker-api-key)"
 .fi
 .RE
 .IP
@@ -238,8 +273,8 @@ Required.
 If the running interpreter is too old, isb exits immediately.
 .TP
 .B toolbox
-Optional (needed when build-policy is not
-.BR none ).
+Optional; required for build testing if not building natively
+(e.g.\& host OS differs from the RHEL target version).
 If missing, isb offers to install it via
 .BR "sudo dnf install toolbox" .
 .TP
@@ -253,6 +288,19 @@ detected, the patchpal option is shown in dim italic with a
 marker in interactive menus.
 The user may still select it, but isb will refuse to proceed at
 runtime if no display is available.
+.PP
+When patchpal exits without saving or leaves conflicts unresolved,
+.B isb
+presents a mini-menu:
+.B r
+(retry patchpal),
+.B s
+(skip this commit), or
+.B q
+(quit isb).
+Skipped commits are persisted and will be auto-skipped on subsequent
+runs, including after a reset to zero.
+They can be restored from the commit review page.
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to
@@ -417,6 +465,13 @@ Skip the interactive confirmation menu and proceed immediately.
 Assisted-by trailer added to commit messages, e.g.\&
 .IR "Claude <no-reply@anthropic.com>" .
 .TP
+.BI \-\-skip " HASH ..."
+Exclude specific commit(s) by hash prefix.
+Multiple hashes may be given.
+User-skipped commits are persisted in the state file and will be
+auto-skipped on subsequent runs, even after a reset to zero.
+They can be restored from the interactive commit review page.
+.TP
 .BI \-\-divergence " HASH"
 Upstream commit hash to use as the divergence point, skipping
 automatic detection.
@@ -505,6 +560,15 @@ Single-step mode: apply only the next commit and stop
 .TP
 .B h
 Display the man page.
+.TP
+.B v
+Commit review: display all KEEP and OMIT commits.
+Previously omitted commits appear with a red
+.B \(mu
+mark and their omit reason.
+Toggle any entry by number to move it between keep and omit.
+User-skipped commits restored here are also removed from the
+persisted skip list.
 .TP
 .B N
 New session: walk through all parameters sequentially for editing.
