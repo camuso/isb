@@ -896,6 +896,9 @@ _HELP_ALIASES = {
 def _show_topics_list():
     """Print all available help topics grouped by category and exit."""
     print(f"\n{BLD}isb help topics{OFF}\n")
+    print(f"Run 'isb help <topic>' for details (omit the leading dashes).")
+    print(f"  e.g.  isb help conflict-policy   "
+          f"{DIM}not{OFF}  isb help --conflict-policy\n")
     print(f"{BLD}Commands:{OFF}")
     for cmd in ("help", "pick", "continue", "status", "reset", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
@@ -911,10 +914,6 @@ def _show_topics_list():
             continue
         usage, summary, _ = _HELP_TOPICS[opt]
         print(f"  {usage.split()[0]:<22s} {summary}")
-    print(f"\nRun 'isb help <topic>' for details on any topic "
-          f"(omit the leading dashes).")
-    print(f"  e.g.  isb help conflict-policy   "
-          f"{DIM}not{OFF}  isb help --conflict-policy")
     sys.exit(0)
 
 
