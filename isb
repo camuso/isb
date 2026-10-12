@@ -3102,6 +3102,10 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
         result["classification"] = (
             f"missing prerequisite ({n} upstream commit(s) not in RHEL)"
         )
+    elif result["present_prereqs"] and result["rhel_specific_count"] == 0:
+        result["classification"] = (
+            f"context from related backport(s) already in RHEL"
+        )
     elif result["rhel_specific_count"]:
         result["classification"] = (
             f"{result['hunk_count']} hunk(s) differ from upstream "
@@ -3392,9 +3396,15 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
             seen = set()
             unique = [(h, s) for h, s in all_missing
                       if h not in seen and not seen.add(h)]
+            grouped = _group_prereq_series(unique)
             print(f"\n  {WRN}WARNING: {len(unique)} missing "
                   f"prerequisite(s) detected.{OFF}")
-            print(f"  You can exit isb and pick them from the "
+            for label, hashes in grouped:
+                if label:
+                    print(f"  {WRN}⚠ {label}{OFF}")
+                for h, s in hashes:
+                    print(f"    {DIM}{h[:12]} {s}{OFF}")
+            print(f"\n  You can exit isb and pick them from the "
                   f"command line:")
             for h, s in unique:
                 if h:
@@ -3539,12 +3549,34 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     only_added = len(added) > 0 and len(removed) == 0
     only_removed = len(removed) > 0 and len(added) == 0
 
+    # Cross-check against known API replacements from api-replacements.json
+    _api_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "api-replacements.json")
+    known_api_subs = set()
+    if os.path.isfile(_api_file):
+        try:
+            import json as _json
+            with open(_api_file) as fh:
+                api_data = _json.load(fh)
+            known_api_subs = set(api_data.get("replacements", {}).keys())
+        except Exception:
+            pass
+    # Check if any removed lines contain known upstream-only API calls
+    api_hits = set()
+    for rl in removed_stripped:
+        for api in known_api_subs:
+            if api in rl:
+                api_hits.add(api)
+
     if rename_pairs:
         shown = rename_pairs[:3]
         renames = ", ".join(f"{old}->{new}" for old, new in shown)
         parts.append(renames)
         if len(rename_pairs) > 3:
             parts[-1] += f" (+{len(rename_pairs) - 3} more)"
+    elif api_hits:
+        apis = ", ".join(sorted(api_hits)[:3])
+        parts.append(f"upstream API not in RHEL ({apis})")
     elif rhel_markers:
         parts.append(f"RHEL-specific code ({rhel_markers} line(s))")
     elif only_removed:
