@@ -3455,6 +3455,56 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                 return "skip"
 
 
+def _describe_diff_changes(added_lines, removed_lines):
+    """Produce a short human description of the diff between RHEL and upstream.
+
+    Examines the added/removed line content (already stripped of +/- prefix)
+    to identify common patterns like return-value captures, error checks,
+    variable additions, include differences, etc.
+
+    Returns a short string, or "" if no clear pattern detected.
+    """
+    all_lines = added_lines + removed_lines
+    if not all_lines:
+        return ""
+
+    # Pattern: added/changed return-value capture  (ret = foo(...))
+    ret_added = sum(1 for l in added_lines
+                    if re.search(r'\bret\s*=\s*\w+\s*\(', l)
+                    or re.search(r'\brc\s*=\s*\w+\s*\(', l)
+                    or re.search(r'\berr\s*=\s*\w+\s*\(', l))
+    ret_removed = sum(1 for l in removed_lines
+                      if re.search(r'\bret\s*=\s*\w+\s*\(', l)
+                      or re.search(r'\brc\s*=\s*\w+\s*\(', l)
+                      or re.search(r'\berr\s*=\s*\w+\s*\(', l))
+    if ret_added > ret_removed:
+        return "added return value capture"
+
+    # Pattern: added error/guard checks
+    guard_added = sum(1 for l in added_lines
+                      if re.search(r'\bif\s*\(\s*!?\s*(ret|rc|err)\b', l)
+                      or re.search(r'\bif\s*\(\s*IS_ERR', l))
+    if guard_added and not removed_lines:
+        return "added error handling"
+
+    # Pattern: added/removed #include
+    inc_added = [l for l in added_lines if l.strip().startswith("#include")]
+    inc_removed = [l for l in removed_lines if l.strip().startswith("#include")]
+    if inc_added and not inc_removed:
+        hdrs = [re.search(r'[<"]([^>"]+)[>"]', l) for l in inc_added]
+        names = [m.group(1) for m in hdrs if m]
+        if names:
+            return f"added #include {', '.join(names[:2])}"
+
+    # Pattern: struct field additions
+    field_added = sum(1 for l in added_lines
+                      if re.match(r'\s*\.\w+\s*=', l))
+    if field_added and not removed_lines:
+        return f"added {field_added} struct field initializer(s)"
+
+    return ""
+
+
 def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     """Analyze a resolved conflict file and return a short classification.
 
@@ -3580,11 +3630,19 @@ def _classify_conflict(cf, rhel_repo, commit_hash=None, upstream_repo=None):
     elif rhel_markers:
         parts.append(f"RHEL-specific code ({rhel_markers} line(s))")
     elif only_removed:
-        parts.append("upstream hunks dropped")
+        parts.append(f"{len(removed)} upstream line(s) dropped")
     elif only_added:
-        parts.append("RHEL additions kept")
+        parts.append(f"{len(added)} RHEL line(s) added")
     else:
-        parts.append("adapted for RHEL")
+        # Describe the change shape: what was added and removed
+        # Scan for recognizable patterns in the diff
+        _desc = _describe_diff_changes(added_stripped, removed_stripped)
+        if _desc:
+            parts.append(_desc)
+        else:
+            parts.append(
+                f"{len(added)} line(s) added, "
+                f"{len(removed)} removed")
 
     if func_names and not rename_pairs:
         shown = func_names[:3]
@@ -3651,7 +3709,7 @@ def _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
             else:
                 detail = _classify_conflict(cf, rhel_repo, commit_hash,
                                             upstream_repo)
-                notes.append(f"{cf}: editor — {detail}")
+                notes.append(f"{cf}: editor {detail}")
         else:
             notes.append(f"{cf}: deleted during manual edit")
         git(f"add -- {cf}", cwd=rhel_repo, check=False)
@@ -3724,7 +3782,7 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
                 "Cherry-pick aborted.")
         detail = _classify_conflict(cf, rhel_repo, commit_hash,
                                     upstream_repo)
-        notes.append(f"{cf}: patchpal — {detail}")
+        notes.append(f"{cf}: patchpal {detail}")
     return notes, list(in_scope_conflicts)
 
 
