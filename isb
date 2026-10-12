@@ -3173,6 +3173,44 @@ def _cursor_sdk_available():
         return False
 
 
+_MODEL_PREFERENCE = [
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-opus-4-6",
+    "default",
+]
+
+_cached_model = None
+
+def _select_model():
+    """Pick the best available model from the Cursor API.
+
+    Queries Cursor.models.list() once and caches the result.
+    Falls back through _MODEL_PREFERENCE, then to 'default'.
+    """
+    global _cached_model
+    if _cached_model is not None:
+        return _cached_model
+
+    api_key = os.environ.get("CURSOR_API_KEY", "")
+    try:
+        from cursor_sdk import Cursor
+        available = {m.id for m in Cursor().models.list(api_key=api_key)}
+    except Exception:
+        _cached_model = "default"
+        return _cached_model
+
+    for pref in _MODEL_PREFERENCE:
+        if pref in available:
+            _cached_model = pref
+            return _cached_model
+
+    _cached_model = "default"
+    return _cached_model
+
+
 def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
     """Use the Cursor SDK to generate an AI explanation of conflict resolutions.
 
@@ -3251,7 +3289,7 @@ Write the per-file lines now."""
             prompt,
             AgentOptions(
                 api_key=os.environ["CURSOR_API_KEY"],
-                model="claude-4-sonnet",
+                model=_select_model(),
                 local=LocalAgentOptions(cwd=os.getcwd()),
             ),
         )
@@ -4163,7 +4201,7 @@ INSTRUCTIONS:
             prompt,
             AgentOptions(
                 api_key=os.environ["CURSOR_API_KEY"],
-                model="claude-4-sonnet",
+                model=_select_model(),
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
         )
