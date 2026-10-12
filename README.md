@@ -1,4 +1,4 @@
-# isb — Intelligent Subsystem Backport
+# isb : Intelligent Subsystem Backport
 
 Automated RHEL kernel subsystem backport tool.
 
@@ -11,38 +11,38 @@ RHEL-compliant commit messages suitable for merge requests.
 
 ## Features
 
-- **Automatic scope discovery** — given a subsystem path (e.g.
+- **Automatic scope discovery** : given a subsystem path (e.g.
   `drivers/char/ipmi`), finds related source, headers, documentation,
   and device-tree binding paths.
-- **Divergence detection** — determines which upstream commits are already
+- **Divergence detection** : determines which upstream commits are already
   present in the RHEL tree and skips them.
-- **Conflict resolution** — three policies:
-  - `patchpal` — launch the [patchpal](https://github.com/camuso/patchpal)
+- **Conflict resolution** : three policies:
+  - `patchpal` : launch the [patchpal](https://github.com/camuso/patchpal)
     GUI for interactive three-way merge (default when a display is available)
-  - `edit` — open conflicted files in your editor
-  - `abort` — stop on any in-scope conflict
-- **Build testing** — runs `dist-configs` inside a toolbox container after
-  conflicts (configurable: after every commit, or never).
-- **Tree-wide commit handling** — out-of-scope files touched by tree-wide
+  - `edit` : open conflicted files in your editor
+  - `abort` : stop on any in-scope conflict
+- **Build testing** : runs `dist-configs` inside a toolbox container after
+  conflicts (configurable: after every conflict, after every commit, or never).
+- **Tree-wide commit handling** : out-of-scope files touched by tree-wide
   commits are automatically excluded.
-- **Extensible API replacement rules** — upstream-to-RHEL API mappings
-  (e.g. `kzalloc_obj` → `kzalloc(sizeof(...), GFP_KERNEL)`) are used to
+- **Extensible API replacement rules** : upstream-to-RHEL API mappings
+  (e.g. `kzalloc_obj` -> `kzalloc(sizeof(...), GFP_KERNEL)`) are used to
   filter commits during classification and auto-fix build errors. Rules
   are loaded from `api-replacements.json` shipped with `isb`; users can
   add their own in `~/.config/isb/api-replacements.json` without editing
   the tool.
-- **Session persistence** — parameters are saved to `.backport/session.json`
+- **Session persistence** : parameters are saved to `.backport/session.json`
   and reused across runs with an interactive single-keypress menu.
-- **Resumable** — interrupted runs save progress and resume automatically
+- **Resumable** : interrupted runs save progress and resume automatically
   with `--continue`.
-- **Automatic commit-graph** — on first run, isb writes a git commit-graph
+- **Automatic commit-graph** : on first run, isb writes a git commit-graph
   for both the RHEL and upstream repos if one doesn't exist, dramatically
   speeding up ancestry walks (cherry-pick, merge-base, log) on large repos.
-- **Single-commit mode** — `isb pick HASH` cherry-picks one upstream commit
+- **Single-commit mode** : `isb pick HASH` cherry-picks one upstream commit
   with full conflict resolution and commit message formatting. Detects
   already-backported commits by searching the RHEL log for the upstream
   hash before cherry-picking.
-- **AI conflict explanation & build-fix** — `--ailog` (on by default) calls
+- **AI conflict explanation & build-fix** : `--ailog` (on by default) calls
   Claude via the Cursor SDK for two purposes:
   1. After every conflict resolution, generates a concise explanation of
      *why* the conflict occurred and *what* the resolution changed,
@@ -50,10 +50,10 @@ RHEL-compliant commit messages suitable for merge requests.
      report file.
   2. When a build fails and pattern-based auto-fix cannot resolve it,
      spawns a Cursor agent to read the compiler errors, examine the
-     failing source, apply minimal fixes, and rebuild — retrying up to
+     failing source, apply minimal fixes, and rebuild : retrying up to
      3 times before falling back to the manual menu.
   Disable with `--no-ailog`.
-- **Reviewer-style conflict notes** — the Conflicts stanza in commit
+- **Reviewer-style conflict notes** : the Conflicts stanza in commit
   messages produces descriptions reviewers expect:
   - Dropped architecture hunks named explicitly
     (e.g. `dropped loongarch, riscv hunks`)
@@ -63,19 +63,19 @@ RHEL-compliant commit messages suitable for merge requests.
   - Known upstream-only APIs flagged via `api-replacements.json`
   - Function names and change characterization
     (e.g. `added return value capture in sev_init()`)
-- **Commit review with omit toggle** — the interactive commit review
+- **Commit review with omit toggle** : the interactive commit review
   page (`v` hotkey) shows previously omitted commits with a ✘ mark.
   Toggle any entry by number to restore it to the keep list.
-- **Commit exclusion** — `--skip HASH ...` excludes specific commits
+- **Commit exclusion** : `--skip HASH ...` excludes specific commits
   by hash prefix. User-skipped commits (from `--skip`, patchpal, or
   the review menu) are persisted across resets, so resetting to zero
   and replaying will still skip them. Restore via the commit review page.
-- **Graceful patchpal exit** — closing patchpal without saving presents
+- **Graceful patchpal exit** : closing patchpal without saving presents
   Retry / Skip / Quit instead of killing the session. Skipped commits
   appear in the commit review page for later restoration.
-- **Dry-run mode** — `--dry-run` classifies and lists upstream commits
+- **Dry-run mode** : `--dry-run` classifies and lists upstream commits
   without applying anything.
-- **Built-in help** — `isb help` shows a summary of all commands and
+- **Built-in help** : `isb help` shows a summary of all commands and
   options; `isb help <topic>` gives detailed help for any command or
   option (e.g. `isb help conflict-policy`).
 
