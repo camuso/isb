@@ -4881,8 +4881,22 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
 def save_state(output_dir, state):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, ".backport-state.json")
+    # Preserve user_skipped across calls unless explicitly overridden
+    if "user_skipped" not in state:
+        existing = load_state(output_dir)
+        if existing and "user_skipped" in existing:
+            state["user_skipped"] = existing["user_skipped"]
     with open(path, "w") as fh:
         json.dump(state, fh, indent=2)
+
+
+def _record_user_skip(output_dir, commit_hash):
+    """Add a commit hash to the persisted user-skipped set."""
+    state = load_state(output_dir) or {}
+    skipped = set(state.get("user_skipped", []))
+    skipped.add(commit_hash)
+    state["user_skipped"] = sorted(skipped)
+    save_state(output_dir, state)
 
 
 def load_state(output_dir):
@@ -4989,6 +5003,19 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         info(f"  Excluded {removed} commit(s) from cherry-pick list.")
     omit.clear()
     omit.extend(new_omit)
+
+    # Sync persisted user_skipped: add newly excluded, remove restored
+    if output_dir:
+        state = load_state(output_dir) or {}
+        skipped = set(state.get("user_skipped", []))
+        for h, _s, tag in new_omit:
+            if tag in ("user-excluded", "skipped by user"):
+                skipped.add(h)
+        for h, _s, _r in new_keep:
+            skipped.discard(h)
+        state["user_skipped"] = sorted(skipped)
+        save_state(output_dir, state)
+
     return new_keep
 
 
@@ -5207,6 +5234,12 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
         _session.pop("_completed_head", None)
         _save()
         status(f"Reset to base: {base_subj}")
+        _us_state = load_state(output_dir)
+        n_skipped = len(_us_state.get("user_skipped", [])
+                        ) if _us_state else 0
+        if n_skipped:
+            info(f"  {n_skipped} user-skipped commit(s) will be "
+                 f"excluded on replay (toggle in commit review).")
         info(f"  Next run will start from commit [1/{len(keep)}].")
         return
 
@@ -6378,10 +6411,28 @@ def main():
             )
         )
 
+        # Load persisted user-skipped hashes
+        _user_skipped = set()
+        _us_state = load_state(output_dir)
+        if _us_state:
+            _user_skipped = set(_us_state.get("user_skipped", []))
+
         for idx in range(start_idx, len(keep)):
             _loop_idx = idx
             h, subj, _ = keep[idx]
             num = f"[{idx + 1}/{len(keep)}]"
+
+            # Skip commits the user previously rejected
+            if h in _user_skipped:
+                info(f"{num} {CAU}✘{OFF} {h[:12]} {subj}  "
+                     f"{DIM}(skipped by user){OFF}")
+                omit.append((h, subj, "skipped by user"))
+                save_state(output_dir, {
+                    "next_idx": idx + 1,
+                    "base_commit": base_commit,
+                })
+                continue
+
             info(f"{num} {h[:12]} {subj}")
 
             # Quick duplicate check: skip if already backported
@@ -6407,7 +6458,12 @@ def main():
             )
 
             if result == "skip":
-                omit.append((h, subj, "skipped (build failure)"))
+                if notes == ["skipped by user"]:
+                    reason = "skipped by user"
+                    _record_user_skip(output_dir, h)
+                else:
+                    reason = "skipped (build failure)"
+                omit.append((h, subj, reason))
                 save_state(output_dir, {
                     "next_idx": idx + 1,
                     "base_commit": base_commit,
