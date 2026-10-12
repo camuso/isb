@@ -911,7 +911,10 @@ def _show_topics_list():
             continue
         usage, summary, _ = _HELP_TOPICS[opt]
         print(f"  {usage.split()[0]:<22s} {summary}")
-    print(f"\nRun 'isb help <topic>' for details on any topic.")
+    print(f"\nRun 'isb help <topic>' for details on any topic "
+          f"(omit the leading dashes).")
+    print(f"  e.g.  isb help conflict-policy   "
+          f"{DIM}not{OFF}  isb help --conflict-policy")
     sys.exit(0)
 
 
