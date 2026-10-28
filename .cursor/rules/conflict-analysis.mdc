@@ -61,6 +61,14 @@ divergence. Examples of good lines:
     kept 10.2's smi_recv_work (missing 305923bd3b61e rename to smi_work)
 ```
 
+## Model Selection
+
+Always use the latest Claude Opus model available for conflict analysis.
+Opus has the depth of reasoning needed to trace missing prerequisites,
+verify lock/unlock correctness across all code paths, and catch
+pre-existing bugs like lock mismatches. Sonnet is insufficient for
+this level of kernel code analysis.
+
 ## Rules
 
 - DO NOT modify files. Analysis only — produce the Conflicts stanza.

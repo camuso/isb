@@ -3228,7 +3228,17 @@ def _cursor_sdk_available():
         return False
 
 
-_MODEL_PREFERENCE = [
+# Opus for deep analysis (conflict explanation, prerequisite tracing)
+_OPUS_PREFERENCE = [
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "default",
+]
+
+# Sonnet for lighter tasks (build-fix)
+_SONNET_PREFERENCE = [
     "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
@@ -3237,33 +3247,34 @@ _MODEL_PREFERENCE = [
     "default",
 ]
 
-_cached_model = None
+_cached_models = {}
 
-def _select_model():
+def _select_model(task="analysis"):
     """Pick the best available model from the Cursor API.
 
     Queries Cursor.models.list() once and caches the result.
-    Falls back through _MODEL_PREFERENCE, then to 'default'.
+    task='analysis' prefers Opus (deep reasoning for conflict analysis).
+    task='fix' prefers Sonnet (faster for build-fix iterations).
     """
-    global _cached_model
-    if _cached_model is not None:
-        return _cached_model
+    if task in _cached_models:
+        return _cached_models[task]
 
     api_key = os.environ.get("CURSOR_API_KEY", "")
     try:
         from cursor_sdk import Cursor
         available = {m.id for m in Cursor().models.list(api_key=api_key)}
     except Exception:
-        _cached_model = "default"
-        return _cached_model
+        _cached_models[task] = "default"
+        return "default"
 
-    for pref in _MODEL_PREFERENCE:
+    prefs = _OPUS_PREFERENCE if task == "analysis" else _SONNET_PREFERENCE
+    for pref in prefs:
         if pref in available:
-            _cached_model = pref
-            return _cached_model
+            _cached_models[task] = pref
+            return pref
 
-    _cached_model = "default"
-    return _cached_model
+    _cached_models[task] = "default"
+    return "default"
 
 
 def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
@@ -3356,7 +3367,7 @@ Write the per-file lines now."""
             prompt,
             AgentOptions(
                 api_key=os.environ["CURSOR_API_KEY"],
-                model=_select_model(),
+                model=_select_model(task="analysis"),
                 local=LocalAgentOptions(cwd=os.getcwd()),
             ),
         )
@@ -4294,7 +4305,7 @@ INSTRUCTIONS:
             prompt,
             AgentOptions(
                 api_key=os.environ["CURSOR_API_KEY"],
-                model=_select_model(),
+                model=_select_model(task="fix"),
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
         )
