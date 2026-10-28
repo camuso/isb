@@ -3307,6 +3307,7 @@ def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
 
     prompt = f"""\
 You are writing the Conflicts stanza for a RHEL kernel backport commit message.
+DO NOT modify any files. Analysis and explanation only.
 
 Upstream commit: {commit_hash[:12]} {subject}
 
@@ -3315,22 +3316,33 @@ into the RHEL kernel branch.  Each conflict has been resolved (by patchpal
 or a human editor).  The diff shows how the resolved RHEL version differs
 from the upstream version.
 
-Write ONE LINE per file in this exact format:
+ANALYSIS METHOD:
+1. For each conflicted file, identify which functions contain the conflicts
+2. Trace missing prerequisites: upstream commits between the RHEL base and
+   this commit that changed the same code (shown in the data below)
+3. For each conflict region, explain WHY the code diverges — name the
+   missing commit that caused it (by short hash)
+4. Check lock/unlock correctness across all paths (normal, error, loop break)
+5. Check function name consistency with the RHEL tree
+
+Write ONE LINE per file (or per function if a file has multiple distinct
+conflicts) in this exact format:
   <filepath>: <concise explanation>
 
-The explanation should tell a reviewer:
-- What was adapted, rejected, or kept from upstream and WHY
-- e.g. "adapted foo() call to RHEL's 3-arg variant"
-- e.g. "dropped hunk adding bar(); already present via prior backport"
-- e.g. "context drift in error path; resolution preserves RHEL's kabi wrapper"
-- e.g. "rejected new helper; depends on missing prerequisite abc123"
+The explanation should tell a reviewer WHAT was done and WHY:
+- "kept RHEL's rcu_read_lock/in_shutdown guard (missing f2a31163d)"
+- "applied incoming flat IS_ERR alloc pattern"
+- "context drift from missing 305923bd3b6 (renamed recv_work to smi_work)"
+- "fixed error-path unlock: rcu_read_unlock -> srcu_read_unlock (lock mismatch)"
+- "dropped hunk; already present via prior backport"
 
 Rules:
-- One line per file, no blank lines between them
+- One line per file/function, no blank lines between them
 - No markdown, no bullet points, no numbering
 - Do NOT start with "File:" — just the bare path followed by colon
-- Be specific about function names, struct fields, etc.
-- Max ~100 chars per line
+- Be specific: name functions, variables, lock types, commit hashes
+- Max ~100 chars per line; wrap to indented continuation if needed
+- DO NOT modify any files
 
 {"=" * 60}
 {chr(10).join(f"{chr(10)}{'-' * 40}{chr(10)}{s}" for s in sections)}
@@ -4620,12 +4632,16 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
 
         # -- Post-conflict review --
         if inscope_conflicted:
-            with Spinner("Analyzing conflict resolutions ..."):
-                analyses = [
-                    _analyze_conflict(cf, commit_hash,
-                                      upstream_repo, rhel_repo)
-                    for cf in inscope_conflicted
-                ]
+            n_files = len(inscope_conflicted)
+            analyses = []
+            for fi, cf in enumerate(inscope_conflicted, 1):
+                label = (f"Analyzing conflicts [{fi}/{n_files}]: "
+                         f"{cf} ...")
+                with Spinner(label):
+                    analyses.append(
+                        _analyze_conflict(cf, commit_hash,
+                                          upstream_repo, rhel_repo)
+                    )
 
             # Add missing prerequisite notes in reviewer style
             all_missing = []
@@ -4648,7 +4664,15 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
 
             ai_explanation = ""
             if ailog:
-                with Spinner("AI conflict analysis (Claude) ..."):
+                total_hunks = sum(a.get("hunk_count", 0)
+                                  for a in analyses)
+                if total_hunks > 20:
+                    estimate = "this may take a minute or more"
+                elif total_hunks > 5:
+                    estimate = "~30 seconds"
+                else:
+                    estimate = "~15 seconds"
+                with Spinner(f"AI conflict analysis ({estimate}) ..."):
                     ai_explanation = _ai_explain_conflicts(
                         analyses, commit_hash, subject, upstream_repo,
                     )

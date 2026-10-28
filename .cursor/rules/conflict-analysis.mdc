@@ -1,0 +1,73 @@
+---
+description: RHEL kernel backport conflict analysis — produces reviewer-style Conflicts stanzas
+globs: "**/isb"
+alwaysApply: false
+---
+
+# Conflict Analysis for RHEL Kernel Backports
+
+When analyzing cherry-pick conflicts in `ipmi_msghandler.c` or any kernel
+file being backported from upstream to RHEL, follow this methodology.
+
+## Analysis Steps
+
+1. **Identify all conflict regions** — count them, note line ranges and
+   which functions they fall in.
+
+2. **Trace missing prerequisites** — for each conflict, use `git log`
+   on the upstream repo to find intermediate commits between the RHEL
+   base and the cherry-picked commit that modified the same lines.
+   Name them by hash and subject.
+
+3. **Characterize each divergence** — for each conflict region, explain
+   WHY the code differs:
+   - Missing prerequisite renamed a function (`free_user` → `free_ipmi_user`)
+   - Missing prerequisite changed locking (`srcu` → `mutex`)
+   - Missing prerequisite removed a guard (`in_shutdown` check)
+   - RHEL-specific code (KABI wrappers, RCU vs mutex)
+   - Already-applied content from a prior backport
+
+4. **Verify lock/unlock correctness** — when the resolution involves
+   locking primitives, trace the lock acquire and ALL unlock paths
+   (normal return, error return, loop break). Flag mismatches like
+   `srcu_read_lock` paired with `rcu_read_unlock` (deadlock).
+
+5. **Check function name consistency** — if the RHEL tree uses an older
+   name (e.g. `free_user`), the resolution must use that name, not the
+   upstream rename (e.g. `free_ipmi_user`), unless the rename commit
+   is also being backported.
+
+## Output Format — Conflicts Stanza
+
+Produce a `Conflicts:` stanza for the commit message. Format:
+
+```
+Conflicts:
+  - <filepath>: <concise explanation of resolution>
+```
+
+Each line should tell a reviewer WHAT was done and WHY. Reference
+missing prerequisite commits by short hash when they caused the
+divergence. Examples of good lines:
+
+```
+  - drivers/char/ipmi/ipmi_msghandler.c: handle_ipmb_get_msg_cmd
+    kept 10.2's rcu_read_lock/in_shutdown guard (missing f2a31163d6a32);
+    applied incoming flat IS_ERR alloc pattern
+  - drivers/char/ipmi/ipmi_msghandler.c: handle_read_event_rsp
+    fixed error-path unlock from rcu_read_unlock to srcu_read_unlock
+    (pre-existing lock mismatch, would deadlock on alloc failure)
+  - drivers/char/ipmi/ipmi_msghandler.c: deliver_smi_response
+    kept 10.2's smi_recv_work (missing 305923bd3b61e rename to smi_work)
+```
+
+## Rules
+
+- DO NOT modify files. Analysis only — produce the Conflicts stanza.
+- Be specific: name functions, variables, lock types, commit hashes.
+- Group by function when multiple conflicts are in the same file.
+- Keep each line under ~100 characters where possible; wrap to a
+  continuation line (indented) for complex explanations.
+- When listing missing prerequisites at the top, include hash + subject.
+- Note pre-existing bugs found during analysis (e.g. lock mismatches)
+  but do NOT fix them — flag them for separate follow-up.
