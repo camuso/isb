@@ -16,9 +16,14 @@ RHEL-compliant commit messages suitable for merge requests.
   and device-tree binding paths.
 - **Divergence detection** : determines which upstream commits are already
   present in the RHEL tree and skips them.
-- **Conflict resolution** : three policies:
+- **Conflict resolution** : four policies:
+  - `ai` (Cursor AI Rule) : Cursor Opus agent resolves conflicts
+    automatically, then presents a review menu (accept / redo in
+    editor / skip) — **default** when cursor-sdk and CURSOR_API_KEY
+    are available
   - `patchpal` : launch the [patchpal](https://github.com/camuso/patchpal)
-    GUI for interactive three-way merge (default when a display is available)
+    GUI for interactive three-way merge (fallback default when a display
+    is available but cursor-sdk is not)
   - `edit` : open conflicted files in your editor
   - `abort` : stop on any in-scope conflict
 - **Build testing** : runs `dist-configs` inside a toolbox container after
@@ -90,7 +95,8 @@ RHEL-compliant commit messages suitable for merge requests.
 - [patchpal](https://github.com/camuso/patchpal) (optional, for GUI
   conflict resolution; requires X11/Wayland display)
 - [cursor-sdk](https://pypi.org/project/cursor-sdk/) + `CURSOR_API_KEY`
-  (optional, for AI conflict explanation via `--ailog`)
+  (optional, for AI conflict explanation via `--ailog` and Cursor AI
+  Rule conflict resolution via `--conflict-policy ai`)
 
 ## Setting up the Cursor API Key
 
