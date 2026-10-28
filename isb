@@ -39,7 +39,13 @@ OFF = "\033[0m"
 SEP = "=" * 74
 SUB = "-" * 74
 
-CONFLICT_POLICIES = ["patchpal", "edit", "abort"]
+CONFLICT_POLICIES = ["patchpal", "edit", "ai", "abort"]
+CONFLICT_POLICY_LABELS = {
+    "ai": "Cursor AI Rule",
+    "patchpal": "patchpal",
+    "edit": "edit",
+    "abort": "abort",
+}
 BUILD_POLICIES = ["conflict", "every", "none"]
 
 _cherrypick_repo = None
@@ -691,17 +697,29 @@ _HELP_TOPICS = {
         """),
     ),
     "conflict-policy": (
-        "--conflict-policy {patchpal,edit,abort}",
+        "--conflict-policy {patchpal,edit,ai,abort}",
         "In-scope conflict resolution strategy.",
         textwrap.dedent("""\
+            Cursor AI Rule
+                      - Use a Cursor Opus agent to resolve conflicts
+                        automatically (internal name: ai).  Requires
+                        cursor-sdk and CURSOR_API_KEY.  After
+                        resolution, a review menu lets you accept,
+                        re-do (falls back to editor), or skip the
+                        commit.  The AI follows the methodology in
+                        .cursor/rules/conflict-analysis.mdc: preserve
+                        RHEL-specific code, apply upstream changes,
+                        verify lock/unlock correctness.
             patchpal  - Launch the patchpal GUI mergetool (requires a
                         graphical display and the patchpal executable).
             edit      - Open conflicted files in the configured editor.
             abort     - Abort on any in-scope conflict.
 
-            Default: patchpal if a display and the executable are found,
-            otherwise edit.  Out-of-scope files, MAINTAINERS, and
-            delete/modify conflicts are always resolved automatically.
+            Default: Cursor AI Rule if cursor-sdk and CURSOR_API_KEY
+            are available, then patchpal if a display and the
+            executable are found, otherwise edit.  Out-of-scope files,
+            MAINTAINERS, and delete/modify conflicts are always
+            resolved automatically.
 
             Interactive menu hotkey: c (cycles through policies)
         """),
@@ -1017,8 +1035,10 @@ def parse_args():
     p.add_argument("--conflict-policy", default=None,
                     choices=CONFLICT_POLICIES,
                     help="In-scope conflict resolution: patchpal (GUI), "
-                         "edit (manual), abort "
-                         "(default: patchpal if display present, else edit)")
+                         "edit (manual), ai (Cursor AI Rule), abort "
+                         "(default: Cursor AI Rule if cursor-sdk "
+                         "available, else patchpal if display, "
+                         "else edit)")
     p.add_argument("--editor", default=None,
                     help="Editor for --conflict-policy=edit "
                          "(default: vim, saved in session)")
@@ -1256,8 +1276,13 @@ def _format_value(field, val):
         return f"{WRN}(not set){OFF}"
     if isinstance(val, list):
         return " ".join(str(v) for v in val)
-    if field == "conflict_policy" and val == "patchpal" and not _has_display():
-        return f"{DIM}patchpal{OFF} {WRN}(requires GUI) **{OFF}"
+    if field == "conflict_policy" and val in CONFLICT_POLICY_LABELS:
+        plabel = CONFLICT_POLICY_LABELS[val]
+        if val == "patchpal" and not _has_display():
+            return f"{DIM}{plabel}{OFF} {WRN}(requires GUI) **{OFF}"
+        if val == "ai" and not _cursor_sdk_available():
+            return f"{DIM}{plabel}{OFF} {WRN}(requires cursor-sdk) **{OFF}"
+        return plabel
     return str(val)
 
 
@@ -1325,22 +1350,33 @@ def _pick_toolbox(current):
 def _edit_field(field, label, current, required):
     """Prompt the user to edit a single field. Returns the new value."""
     if field == "conflict_policy":
-        if _has_display():
-            opts = "/".join(CONFLICT_POLICIES)
-        else:
-            opts = "/".join(
-                f"{DIM}{p}{OFF}" if p == "patchpal" else p
-                for p in CONFLICT_POLICIES)
-        display = current or "(auto)"
+        label_to_key = {v.lower(): k for k, v in
+                        CONFLICT_POLICY_LABELS.items()}
+        opt_labels = []
+        for p in CONFLICT_POLICIES:
+            plabel = CONFLICT_POLICY_LABELS.get(p, p)
+            if p == "patchpal" and not _has_display():
+                opt_labels.append(f"{DIM}{plabel}{OFF}")
+            elif p == "ai" and not _cursor_sdk_available():
+                opt_labels.append(f"{DIM}{plabel}{OFF}")
+            else:
+                opt_labels.append(plabel)
+        opts = "/".join(opt_labels)
+        display = CONFLICT_POLICY_LABELS.get(current, current) or "(auto)"
         prompt_str = f"    {label} [{display}] ({opts}): "
         val = input(prompt_str).strip().lower()
         if val == "":
             return current
-        if val in CONFLICT_POLICIES:
-            if val == "patchpal" and not _has_display():
+        # Accept either internal key or display label
+        resolved = label_to_key.get(val, val)
+        if resolved in CONFLICT_POLICIES:
+            if resolved == "patchpal" and not _has_display():
                 print(f"  {WRN}Note: patchpal requires a graphical "
                       f"display (X11/Wayland){OFF}")
-            return val
+            if resolved == "ai" and not _cursor_sdk_available():
+                print(f"  {WRN}Note: Cursor AI Rule requires "
+                      f"cursor-sdk and CURSOR_API_KEY{OFF}")
+            return resolved
         warn(f"    Invalid choice '{val}', keeping '{display}'")
         return current
     elif field == "build_policy":
@@ -1779,10 +1815,16 @@ def show_confirmation_menu(params):
             suffix = ""
             if field == "build_policy" and val == "conflict":
                 suffix = " (DEFAULT)"
-            if (field == "conflict_policy" and val == "patchpal"
-                    and not _has_display()):
-                display = (f"{DIM}patchpal{OFF} "
-                           f"{WRN}(requires GUI) **{OFF}")
+            if field == "conflict_policy" and val in CONFLICT_POLICY_LABELS:
+                plabel = CONFLICT_POLICY_LABELS[val]
+                if val == "patchpal" and not _has_display():
+                    display = (f"{DIM}{plabel}{OFF} "
+                               f"{WRN}(requires GUI) **{OFF}")
+                elif val == "ai" and not _cursor_sdk_available():
+                    display = (f"{DIM}{plabel}{OFF} "
+                               f"{WRN}(requires cursor-sdk) **{OFF}")
+                else:
+                    display = f"{plabel}{suffix}"
             elif isinstance(val, bool):
                 display = f"{STA}on{OFF}" if val else f"{WRN}off{OFF}"
             elif isinstance(val, list):
@@ -1940,15 +1982,33 @@ def show_confirmation_menu(params):
                 old_val = params[field]
                 if ftype == "cycle":
                     vals = cycle_values[field]
-                    if (field == "conflict_policy"
-                            and not _has_display()):
-                        opts = "/".join(
-                            f"{DIM}{p}{OFF}" if p == "patchpal" else p
-                            for p in vals)
+                    if field == "conflict_policy":
+                        opt_labels = []
+                        for p in vals:
+                            plabel = CONFLICT_POLICY_LABELS.get(p, p)
+                            if p == "patchpal" and not _has_display():
+                                opt_labels.append(
+                                    f"{DIM}{plabel}{OFF}")
+                            elif (p == "ai"
+                                    and not _cursor_sdk_available()):
+                                opt_labels.append(
+                                    f"{DIM}{plabel}{OFF}")
+                            else:
+                                opt_labels.append(plabel)
+                        opts = "/".join(opt_labels)
+                        cur_display = CONFLICT_POLICY_LABELS.get(
+                            cur, cur)
                     else:
                         opts = "/".join(vals)
-                    prompt_str = f"    {label} [{cur}] ({opts}): "
-                    val = input(prompt_str).strip()
+                        cur_display = cur
+                    prompt_str = (f"    {label} [{cur_display}] "
+                                  f"({opts}): ")
+                    val = input(prompt_str).strip().lower()
+                    # Accept label or internal key
+                    if field == "conflict_policy":
+                        ltk = {v.lower(): k for k, v in
+                               CONFLICT_POLICY_LABELS.items()}
+                        val = ltk.get(val, val)
                     if val and val in vals:
                         params[field] = val
                         if (field == "conflict_policy"
@@ -2019,11 +2079,19 @@ def show_confirmation_menu(params):
                     except ValueError:
                         idx = -1
                     params[field] = vals[(idx + 1) % len(vals)]
-                    if (field == "conflict_policy"
-                            and params[field] == "patchpal"
-                            and not _has_display()):
-                        print(f"\n  {WRN}Note: patchpal requires a "
-                              f"graphical display (X11/Wayland){OFF}")
+                    if field == "conflict_policy":
+                        plabel = CONFLICT_POLICY_LABELS.get(
+                            params[field], params[field])
+                        if (params[field] == "patchpal"
+                                and not _has_display()):
+                            print(f"\n  {WRN}Note: {plabel} requires "
+                                  f"a graphical display "
+                                  f"(X11/Wayland){OFF}")
+                        elif (params[field] == "ai"
+                                and not _cursor_sdk_available()):
+                            print(f"\n  {WRN}Note: {plabel} requires "
+                                  f"cursor-sdk and "
+                                  f"CURSOR_API_KEY{OFF}")
                 elif ftype == "toolbox":
                     print()
                     new_tb = _pick_toolbox(params[field])
@@ -3928,6 +3996,152 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
     return notes, list(in_scope_conflicts)
 
 
+def _resolve_inscope_ai(in_scope_conflicts, rhel_repo,
+                        commit_hash=None, upstream_repo=None):
+    """Use a Cursor Opus agent to resolve in-scope conflict files.
+
+    The agent receives the conflict markers, upstream context, and RHEL
+    context, then edits each file to resolve the conflicts.  isb stages
+    the result but does NOT commit — the review menu lets the user
+    accept, redo (fall back to editor), or skip.
+
+    Returns (notes, conflicted_files).
+    """
+    if not _cursor_sdk_available():
+        warn("  Cursor AI Rule requires cursor-sdk + CURSOR_API_KEY.")
+        warn("  Falling back to editor.")
+        return _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
+                                     commit_hash=commit_hash,
+                                     upstream_repo=upstream_repo)
+
+    from cursor_sdk import Agent, AgentOptions, LocalAgentOptions
+
+    notes = []
+    file_list = " ".join(in_scope_conflicts)
+
+    # Get upstream diff context for the prompt
+    upstream_ctx = ""
+    if commit_hash and upstream_repo:
+        r = git(f"show --stat {commit_hash}",
+                cwd=upstream_repo, check=False)
+        if r.returncode == 0:
+            upstream_ctx = r.stdout[:3000]
+
+    # Get the conflict markers from each file
+    conflict_content = []
+    for cf in in_scope_conflicts:
+        fullpath = os.path.join(rhel_repo, cf)
+        if os.path.isfile(fullpath):
+            with open(fullpath) as fh:
+                content = fh.read()
+            # Only include lines around conflict markers to limit tokens
+            lines = content.splitlines()
+            marker_regions = []
+            in_region = False
+            region_start = 0
+            for i, line in enumerate(lines):
+                if line.startswith("<<<<<<<"):
+                    in_region = True
+                    region_start = max(0, i - 5)
+                if in_region:
+                    marker_regions.append((region_start, i))
+                if line.startswith(">>>>>>>"):
+                    # Include 5 lines after the end marker
+                    end = min(len(lines) - 1, i + 5)
+                    marker_regions.append((i, end))
+                    in_region = False
+            if marker_regions:
+                shown = set()
+                excerpts = []
+                for start, end in marker_regions:
+                    for j in range(start, end + 1):
+                        if j not in shown:
+                            shown.add(j)
+                            excerpts.append(f"{j + 1:5d}| {lines[j]}")
+                conflict_content.append(
+                    f"--- {cf} (conflict regions) ---\n"
+                    + "\n".join(excerpts))
+
+    conflict_text = "\n\n".join(conflict_content)
+    if len(conflict_text) > 12000:
+        conflict_text = conflict_text[:12000] + "\n... (truncated)"
+
+    prompt = f"""\
+You are resolving git cherry-pick conflicts in a RHEL kernel backport.
+The files below contain conflict markers (<<<<<<< / ======= / >>>>>>>).
+
+Upstream commit: {commit_hash[:12] if commit_hash else 'unknown'}
+
+RULES:
+1. Edit ONLY the conflicted files to remove ALL conflict markers
+2. Keep RHEL-specific code (KABI wrappers, RCU guards, in_shutdown checks)
+3. Apply the upstream change where it doesn't conflict with RHEL specifics
+4. Use RHEL's function/variable names, not upstream renames from missing prereqs
+5. Verify lock/unlock correctness: every lock acquire must have matching unlock
+   on ALL paths (normal, error, loop break)
+6. Do NOT touch files outside the conflict regions
+7. After editing, run: git add {file_list}
+
+Upstream commit summary:
+{upstream_ctx}
+
+Conflict regions:
+{conflict_text}
+
+Resolve all conflicts now. Edit each file to remove the markers,
+then run git add on the resolved files.
+"""
+
+    n_files = len(in_scope_conflicts)
+    total_markers = conflict_text.count("<<<<<<<")
+    if total_markers > 5:
+        estimate = "this may take a minute or more"
+    else:
+        estimate = "~30 seconds"
+
+    status(f"  Cursor AI Rule resolving {n_files} file(s), "
+           f"{total_markers} conflict region(s) ({estimate}) ...")
+
+    try:
+        result = Agent.prompt(
+            prompt,
+            AgentOptions(
+                api_key=os.environ["CURSOR_API_KEY"],
+                model=_select_model(task="analysis"),
+                local=LocalAgentOptions(cwd=rhel_repo),
+            ),
+        )
+    except Exception as e:
+        warn(f"  Cursor AI Rule failed: {e}")
+        warn("  Falling back to editor.")
+        return _resolve_inscope_edit(in_scope_conflicts, rhel_repo,
+                                     commit_hash=commit_hash,
+                                     upstream_repo=upstream_repo)
+
+    # Check each file for residual conflict markers
+    for cf in in_scope_conflicts:
+        fullpath = os.path.join(rhel_repo, cf)
+        if os.path.isfile(fullpath):
+            with open(fullpath) as fh:
+                content = fh.read()
+            has_markers = any(
+                line.startswith(m)
+                for line in content.splitlines()
+                for m in ("<<<<<<<", "=======", ">>>>>>>"))
+            if has_markers:
+                warn(f"  {WRN}AI left conflict markers in {cf}{OFF}")
+                notes.append(f"{cf}: Cursor AI Rule (residual markers — needs review)")
+            else:
+                detail = _classify_conflict(cf, rhel_repo,
+                                            commit_hash, upstream_repo)
+                notes.append(f"{cf}: Cursor AI Rule {detail}")
+            git(f"add -- {cf}", cwd=rhel_repo, check=False)
+        else:
+            notes.append(f"{cf}: removed by Cursor AI Rule")
+
+    return notes, list(in_scope_conflicts)
+
+
 def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
                       commit_hash=None, upstream_repo=None):
     """Resolve conflicts in the working tree.
@@ -3995,7 +4209,7 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
                     f"{cf}: upstream deleted, kept RHEL version "
                     f"(modify/delete conflict)")
 
-        elif conflict_policy in ("patchpal", "edit"):
+        elif conflict_policy in ("patchpal", "edit", "ai"):
             in_scope_deferred.append(cf)
 
         elif conflict_policy == "abort":
@@ -4006,6 +4220,11 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
     if in_scope_deferred:
         if conflict_policy == "patchpal":
             deferred_notes, deferred_files = _resolve_inscope_patchpal(
+                in_scope_deferred, rhel_repo,
+                commit_hash=commit_hash, upstream_repo=upstream_repo,
+            )
+        elif conflict_policy == "ai":
+            deferred_notes, deferred_files = _resolve_inscope_ai(
                 in_scope_deferred, rhel_repo,
                 commit_hash=commit_hash, upstream_repo=upstream_repo,
             )
@@ -4557,7 +4776,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         _redo_resolution = False
 
         if had_conflict:
-            if conflict_policy in ("patchpal", "edit"):
+            if conflict_policy in ("patchpal", "edit", "ai"):
                 status("  Resolving conflicts ...")
                 conflict_notes, oos_conflict_count, inscope_conflicted = \
                     resolve_conflicts(
@@ -4725,6 +4944,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     )
                 conflict_notes = []
                 inscope_conflicted = []
+                # If AI was the policy, fall back to editor for redo
+                if conflict_policy == "ai":
+                    conflict_policy = "edit"
                 _redo_resolution = True
                 continue
 
@@ -5927,7 +6149,9 @@ def main():
         _save()
 
     if args.conflict_policy is None:
-        if _has_display() and shutil.which("patchpal"):
+        if _cursor_sdk_available():
+            args.conflict_policy = "ai"
+        elif _has_display() and shutil.which("patchpal"):
             args.conflict_policy = "patchpal"
         else:
             args.conflict_policy = "edit"

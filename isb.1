@@ -29,19 +29,28 @@ In-scope conflicts are resolved according to the selected
 .BR patchpal (1)
 GUI for interactive three-way merge),
 .B edit
-(open conflicted files in the user's editor), or
+(open conflicted files in the user's editor),
+.B ai
+(Cursor AI Rule \(em Opus agent resolves automatically), or
 .B abort
 (stop on conflict).
 The default is
+.B ai
+(Cursor AI Rule)
+if cursor\-sdk and CURSOR_API_KEY are available, then
 .B patchpal
 if a graphical display and
 .BR patchpal (1)
-are available, otherwise
+are present, otherwise
 .BR edit .
 .PP
+The Cursor AI Rule
+.RB ( ai )
+policy uses a Cursor Opus agent to resolve conflicts automatically,
+presenting a review menu afterward.
 The
 .B patchpal
-policy is a key feature for developers who already use
+policy is an alternative for developers who prefer
 .BR patchpal (1)
 for cherry-pick conflict resolution.
 The
@@ -403,8 +412,11 @@ Default:
 .BI \-\-conflict\-policy " POLICY"
 How to handle in-scope file conflicts.
 Default:
+.B ai
+(Cursor AI Rule)
+if cursor\-sdk and CURSOR_API_KEY are available, then
 .B patchpal
-if a graphical display and patchpal are available, otherwise
+if a graphical display and patchpal are present, otherwise
 .BR edit .
 .RS
 .TP
@@ -425,6 +437,23 @@ on
 Open conflicted files in the user's editor for manual resolution.
 See
 .BR \-\-editor .
+.TP
+.B ai " (Cursor AI Rule)"
+Use a Cursor Opus agent to resolve conflicts automatically.
+Requires
+.B cursor\-sdk
+and
+.BR CURSOR_API_KEY .
+The agent receives the conflict markers, upstream context, and RHEL
+specifics, then edits each file to remove all conflict markers.
+After AI resolution, the standard review menu lets you accept the
+result, re-do (falls back to the editor), or skip the commit.
+The AI follows the methodology in
+.I .cursor/rules/conflict\-analysis.mdc
+\(em preserve RHEL-specific code, apply upstream changes, and verify
+lock/unlock correctness on all code paths.
+If the SDK or API key is unavailable, isb falls back to
+.BR edit .
 .TP
 .B abort
 Abort the cherry-pick on any in-scope conflict.
@@ -632,6 +661,14 @@ Interactive conflict resolution with patchpal:
 .RS
 .nf
 isb \-\-conflict\-policy patchpal
+.fi
+.RE
+.PP
+AI-assisted conflict resolution with Cursor Opus:
+.PP
+.RS
+.nf
+isb \-\-conflict\-policy ai
 .fi
 .RE
 .PP
