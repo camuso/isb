@@ -94,16 +94,53 @@ Function names and change characterization
 After commit classification (Phase\ 3), the KEEP and OMIT lists are
 written to editable files
 .RI ( keep_commits.txt ", " omit_commits.txt )
-in the output directory, and the script pauses so the user can review
-or edit the lists in another terminal before pressing any key to
-proceed.
-Press Ctrl-C to exit and edit in the current terminal; resume later
-with
-.B isb continue
-or the interactive
-.B g
-key.
+in the output directory, and the script pauses with an explicit menu
+.RB ( g
+proceed,
+.B v
+review,
+.B r
+return,
+.B q
+quit).
 .PP
+Phase\ 3 also inspects each commit's Kconfig diff for newly added
+.B config FOO
+options.
+If
+.I redhat/configs
+has no matching
+.B CONFIG_FOO
+snippet, the keep entry is annotated
+.RI ( needs redhat/configs for CONFIG_FOO )
+and a
+.B # NOTE:
+comment is written into
+.IR keep_commits.txt .
+During cherry-pick, isb prompts to create
+.I redhat/configs/common/generic/CONFIG_FOO
+using the Kconfig default
+.RB ( y / n / m )
+or an explicit per-option choice, then stages the snippet into the
+backport commit.
+Any commit that touches Kconfig (or creates a snippet) forces an
+mkmod-style build validation before the commit is finalized:
+regenerate
+.BR dist\-configs ,
+install the host-arch
+.I kernel\-*.config
+as
+.IR .config ,
+run
+.B make prepare
+and
+.BR make\ modules_prepare ,
+then
+.BI make\ M= subsystem .
+This runs even when
+.B \-\-build\-policy
+is
+.BR none .
 .PP
 Every long-running operation displays an animated spinner:
 cherry-picking, conflict resolution, scope indexing, and build

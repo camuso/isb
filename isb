@@ -320,6 +320,32 @@ def git(cmd, *, cwd=None, check=True):
     return run(f"git {cmd}", cwd=cwd, check=check)
 
 
+def _git_batch(subcommand, paths, *, cwd=None, check=False,
+               batch_bytes=80000):
+    """Run ``git <subcommand>`` with *paths*, chunked to avoid ARG_MAX.
+
+    Each path is shell-quoted.  Batches are split when the accumulated
+    argument length would exceed *batch_bytes* (well under typical
+    ARG_MAX limits).
+    """
+    if not paths:
+        return
+    batch = []
+    size = 0
+    for p in paths:
+        q = shlex.quote(p)
+        extra = len(q) + (1 if batch else 0)
+        if batch and size + extra > batch_bytes:
+            git(f"{subcommand} {' '.join(batch)}", cwd=cwd, check=check)
+            batch = []
+            size = 0
+            extra = len(q)
+        batch.append(q)
+        size += extra
+    if batch:
+        git(f"{subcommand} {' '.join(batch)}", cwd=cwd, check=check)
+
+
 def die(msg):
     print(f"{CAU}ERROR:{OFF} {msg}", file=sys.stderr)
     sys.exit(1)
@@ -2712,13 +2738,291 @@ def is_driver_removal(commit_hash, subject, upstream_repo):
     return None
 
 
+def _is_kconfig_path(path):
+    """True if *path* is a Kconfig file (Kconfig, Kconfig.foo, etc.)."""
+    base = os.path.basename(path)
+    return base == "Kconfig" or base.startswith("Kconfig.")
+
+
+def _redhat_configs_root(rhel_repo):
+    """Return the redhat/configs (or configs/) root, or None."""
+    for sub in ("redhat/configs", "configs"):
+        path = os.path.join(rhel_repo, sub)
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _load_redhat_config_basenames(rhel_repo):
+    """Return the set of CONFIG_* basenames under redhat/configs.
+
+    One filesystem walk — used to detect missing snippets for new
+    Kconfig options without re-scanning on every commit.
+    """
+    root = _redhat_configs_root(rhel_repo)
+    if not root:
+        return set()
+    names = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.startswith("CONFIG_"):
+                names.add(fn)
+    return names
+
+
+def _default_snippet_dir(rhel_repo):
+    """Preferred directory for new common/generic config snippets."""
+    root = _redhat_configs_root(rhel_repo)
+    if not root:
+        return None
+    preferred = os.path.join(root, "common", "generic")
+    if os.path.isdir(preferred):
+        return preferred
+    return root
+
+
+def _new_kconfig_options(commit_hash, upstream_repo):
+    """Parse newly added ``config FOO`` entries from a commit's Kconfig diff.
+
+    Returns a list of dicts:
+      {symbol, short, ktype, default, prompt}
+    where symbol is ``CONFIG_FOO``.  Symbols that also appear as removals
+    in the same diff (moves/rewrites) are excluded.
+    """
+    r = git(f"diff-tree --no-commit-id --name-only -r {commit_hash}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0:
+        return []
+    kconfigs = [f for f in r.stdout.strip().split("\n") if f
+                and _is_kconfig_path(f)]
+    if not kconfigs:
+        return []
+
+    quoted = " ".join(shlex.quote(f) for f in kconfigs)
+    r = git(f"show --format= --unified=0 {commit_hash} -- {quoted}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+
+    removed = set()
+    added_blocks = []  # list of (name, [body lines without leading +])
+    current = None
+
+    for line in r.stdout.splitlines():
+        if line.startswith("+++") or line.startswith("---") \
+                or line.startswith("@@") or line.startswith("diff "):
+            current = None
+            continue
+        if line.startswith("-config "):
+            name = line[len("-config "):].strip().split()[0]
+            if name:
+                removed.add(name)
+            current = None
+            continue
+        if line.startswith("+config "):
+            name = line[len("+config "):].strip().split()[0]
+            if name:
+                current = (name, [])
+                added_blocks.append(current)
+            else:
+                current = None
+            continue
+        if current is not None:
+            if line.startswith("+"):
+                # Still in the added block
+                body = line[1:]
+                # Stop collecting if indentation drops to a new top-level
+                # token that isn't part of this config entry.
+                if body and not body[0].isspace() and not body.startswith("\t"):
+                    current = None
+                else:
+                    current[1].append(body)
+            elif line.startswith("-"):
+                # Interleaved removal — ignore, stay in block
+                continue
+            else:
+                current = None
+
+    results = []
+    for name, body in added_blocks:
+        if name in removed:
+            continue
+        ktype = None
+        default = None
+        prompt = ""
+        for bl in body:
+            s = bl.strip()
+            if not s:
+                continue
+            m_type = re.match(
+                r"^(bool|tristate|string|int|hex)\b(?:\s+[\"']?(.*?)[\"']?)?$",
+                s,
+            )
+            if m_type and ktype is None:
+                ktype = m_type.group(1)
+                prompt = (m_type.group(2) or "").strip()
+                continue
+            m_def = re.match(r"^default\s+(\S+)", s)
+            if m_def and default is None:
+                raw = m_def.group(1).strip().strip("\"'")
+                # Ignore expression defaults like "FOO || BAR"
+                if raw in ("y", "n", "m") or re.match(r"^-?\d+$", raw):
+                    default = raw
+                continue
+        results.append({
+            "symbol": f"CONFIG_{name}",
+            "short": name,
+            "ktype": ktype or "unknown",
+            "default": default,
+            "prompt": prompt,
+        })
+    return results
+
+
+def _missing_redhat_config_options(commit_hash, upstream_repo, rhel_repo,
+                                  redhat_basenames=None):
+    """Return new Kconfig options that lack a redhat/configs snippet."""
+    options = _new_kconfig_options(commit_hash, upstream_repo)
+    if not options:
+        return []
+    if redhat_basenames is None:
+        redhat_basenames = _load_redhat_config_basenames(rhel_repo)
+    return [o for o in options if o["symbol"] not in redhat_basenames]
+
+
+def _snippet_content(symbol, value):
+    """Return file content for a redhat/configs CONFIG_* snippet."""
+    if value in ("n", "not set", "unset"):
+        return f"# {symbol} is not set\n"
+    if value == "m":
+        return f"{symbol}=m\n"
+    if value == "y":
+        return f"{symbol}=y\n"
+    # numeric/string defaults
+    return f"{symbol}={value}\n"
+
+
+def _suggested_snippet_value(option):
+    """Pick a redhat/configs value from the Kconfig default."""
+    default = option.get("default")
+    ktype = option.get("ktype") or ""
+    if default in ("y", "n", "m"):
+        return default
+    if default is not None and re.match(r"^-?\d+$", str(default)):
+        return str(default)
+    # No usable default — bool/tristate → not set; else y
+    if ktype in ("bool", "tristate", "unknown"):
+        return "n"
+    return "y"
+
+
+def _prompt_create_config_snippets(missing_options, rhel_repo):
+    """Interactively create redhat/configs snippets for new CONFIG options.
+
+    Returns a list of (relative_path, value_description) for created files.
+    """
+    if not missing_options:
+        return []
+
+    snippet_dir = _default_snippet_dir(rhel_repo)
+    if not snippet_dir:
+        warn("  No redhat/configs directory found; cannot create snippets.")
+        return []
+
+    rel_root = os.path.relpath(snippet_dir, rhel_repo)
+    print(f"\n  {WRN}New Kconfig option(s) need redhat/configs snippets:{OFF}")
+    for opt in missing_options:
+        dflt = opt.get("default")
+        dflt_disp = dflt if dflt is not None else "(none)"
+        prompt = opt.get("prompt") or ""
+        extra = f" — {prompt}" if prompt else ""
+        print(f"    {INF}{opt['symbol']}{OFF}  "
+              f"({opt['ktype']}, Kconfig default: {dflt_disp}){extra}")
+    print(f"  Suggested location: {INF}{rel_root}/{OFF}")
+    print(f"  {MNU}y{OFF}  Create using Kconfig defaults")
+    print(f"  {MNU}e{OFF}  Create, choose value for each")
+    print(f"  {MNU}n{OFF}  Skip (leave for later)")
+    print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+
+    while True:
+        ch = _getch()
+        if ch in ('y', 'Y', 'e', 'E', 'n', 'N', '\x03'):
+            print(ch if ch != '\x03' else "n")
+            break
+    if ch in ('n', 'N', '\x03'):
+        warn("  Skipped config snippet creation.  Remember to add:")
+        for opt in missing_options:
+            warn(f"    {rel_root}/{opt['symbol']}")
+        return []
+
+    choose_each = ch in ('e', 'E')
+    created = []
+    for opt in missing_options:
+        symbol = opt["symbol"]
+        suggested = _suggested_snippet_value(opt)
+        value = suggested
+        if choose_each:
+            ktype = opt.get("ktype") or ""
+            if ktype == "bool":
+                opts = "n/y"
+            elif ktype == "tristate":
+                opts = "n/y/m"
+            else:
+                opts = "n/y/m/<value>"
+            print(f"  {symbol} [{suggested}] ({opts}, s=skip): ",
+                  end="", flush=True)
+            raw = input().strip().lower()
+            if raw in ("s", "skip"):
+                info(f"  Skipped {symbol}")
+                continue
+            if raw == "":
+                value = suggested
+            elif raw in ("n", "y", "m") or re.match(r"^-?\d+$", raw):
+                value = raw
+            else:
+                warn(f"  Unrecognized '{raw}', using default '{suggested}'")
+                value = suggested
+
+        path = os.path.join(snippet_dir, symbol)
+        if os.path.exists(path):
+            warn(f"  {symbol} already exists at {rel_root}/{symbol}; "
+                 f"leaving untouched")
+            continue
+        content = _snippet_content(symbol, value)
+        with open(path, "w") as fh:
+            fh.write(content)
+        rel = os.path.relpath(path, rhel_repo)
+        git(f"add -- {shlex.quote(rel)}", cwd=rhel_repo, check=False)
+        if value == "n":
+            desc = "not set"
+        else:
+            desc = f"={value}"
+        status(f"  Created {rel} ({desc})")
+        created.append((rel, desc))
+    return created
+
+
+def _annotate_keep_reason(base_reason, missing_options):
+    """Append missing-config annotation to a keep reason string."""
+    if not missing_options:
+        return base_reason
+    names = ", ".join(o["symbol"] for o in missing_options)
+    return f"{base_reason}; needs redhat/configs for {names}"
+
+
 def classify_commits(commits, config_map, upstream_repo, rhel_repo, scope_paths):
     """Classify each commit as KEEP or OMIT based on CONFIG enablement."""
     header("Phase 3: Classifying commits")
     keep = []
     omit = []
 
+    with Spinner("Indexing redhat/configs snippets ..."):
+        redhat_basenames = _load_redhat_config_basenames(rhel_repo)
+    if redhat_basenames:
+        info(f"Indexed {len(redhat_basenames)} redhat/configs CONFIG snippets")
+
     prog = Progress("Classifying commits", total=len(commits))
+    config_needed = 0
 
     for i, h in enumerate(commits):
         r = git(f"log --format='%s' -1 {h}", cwd=upstream_repo)
@@ -2743,8 +3047,10 @@ def classify_commits(commits, config_map, upstream_repo, rhel_repo, scope_paths)
 
         c_files = [f for f in files if f.endswith(".c")]
         yaml_files = [f for f in files if f.endswith(".yaml")]
-        other_files = [f for f in files
-                       if not f.endswith(".c") and not f.endswith(".yaml")]
+
+        missing_cfgs = _missing_redhat_config_options(
+            h, upstream_repo, rhel_repo, redhat_basenames,
+        )
 
         if not c_files:
             if yaml_files:
@@ -2764,10 +3070,18 @@ def classify_commits(commits, config_map, upstream_repo, rhel_repo, scope_paths)
                 if all_yaml_disabled and yaml_reasons:
                     omit.append((h, subject, "; ".join(yaml_reasons)))
                 else:
-                    keep.append((h, subject,
-                                 "yaml/docs" + (" (some enabled)" if any_yaml_enabled else "")))
+                    reason = "yaml/docs" + (
+                        " (some enabled)" if any_yaml_enabled else "")
+                    reason = _annotate_keep_reason(reason, missing_cfgs)
+                    keep.append((h, subject, reason))
+                    if missing_cfgs:
+                        config_needed += 1
             else:
-                keep.append((h, subject, "no .c files (infra/docs/headers)"))
+                reason = _annotate_keep_reason(
+                    "no .c files (infra/docs/headers)", missing_cfgs)
+                keep.append((h, subject, reason))
+                if missing_cfgs:
+                    config_needed += 1
             prog.advance()
             continue
 
@@ -2790,17 +3104,27 @@ def classify_commits(commits, config_map, upstream_repo, rhel_repo, scope_paths)
                 reasons.append(f"{cf}: {config} disabled on all archs")
 
         if any_enabled:
-            keep.append((h, subject, "CONFIG enabled"))
+            reason = _annotate_keep_reason("CONFIG enabled", missing_cfgs)
+            keep.append((h, subject, reason))
+            if missing_cfgs:
+                config_needed += 1
         elif all_disabled and reasons:
             omit.append((h, subject, "; ".join(reasons)))
         else:
-            keep.append((h, subject, "mixed/uncertain -- keeping for safety"))
+            reason = _annotate_keep_reason(
+                "mixed/uncertain -- keeping for safety", missing_cfgs)
+            keep.append((h, subject, reason))
+            if missing_cfgs:
+                config_needed += 1
 
         prog.advance()
 
     prog.finish()
     print()
     info(f"KEEP: {len(keep)}   OMIT: {len(omit)}")
+    if config_needed:
+        warn(f"{config_needed} keep commit(s) introduce Kconfig option(s) "
+             f"with no redhat/configs snippet")
     return keep, omit
 
 # ---------------------------------------------------------------------------
@@ -4359,12 +4683,10 @@ def scope_index(rhel_repo, scope_paths, exclude_paths=None):
             else:
                 rm_new.append(f)
 
-    if restore:
-        git(f"checkout HEAD -- {' '.join(restore)}",
-            cwd=rhel_repo, check=False)
-    if rm_new:
-        git(f"rm -f {' '.join(rm_new)}",
-            cwd=rhel_repo, check=False)
+    # Batch to avoid OSError: Argument list too long (treewide commits
+    # can stage thousands of out-of-scope files).
+    _git_batch("checkout HEAD --", restore, cwd=rhel_repo, check=False)
+    _git_batch("rm -f", rm_new, cwd=rhel_repo, check=False)
 
     all_removed = restore + rm_new
 
@@ -4413,6 +4735,121 @@ def build_test(rhel_repo, toolbox_name, subsystem):
         if not has_compiler_error:
             return True, combined
     return rc == 0, combined
+
+
+def _commit_touches_kconfig(commit_hash, upstream_repo):
+    """True if the upstream commit modifies any Kconfig file."""
+    r = git(f"diff-tree --no-commit-id --name-only -r {commit_hash}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0:
+        return False
+    return any(_is_kconfig_path(f)
+               for f in r.stdout.strip().split("\n") if f)
+
+
+def _invalidate_dist_configs_stamp(rhel_repo):
+    stamp = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
+    if os.path.isfile(stamp):
+        os.remove(stamp)
+
+
+def _host_arch_config_path(rhel_repo):
+    """Locate the host-architecture RHEL config from dist-configs output."""
+    machine = os.uname().machine  # e.g. x86_64, aarch64, ppc64le, s390x
+    names = [
+        f"kernel-{machine}-rhel.config",
+        f"kernel-{machine}.config",
+    ]
+    search_roots = []
+    configs_dir = _find_configs_dir(rhel_repo)
+    if configs_dir:
+        search_roots.append(configs_dir)
+    for sub in ("redhat/configs", "configs"):
+        p = os.path.join(rhel_repo, sub)
+        if p not in search_roots and os.path.isdir(p):
+            search_roots.append(p)
+    for root in search_roots:
+        for name in names:
+            # Prefer a top-level match, then recursive
+            direct = os.path.join(root, name)
+            if os.path.isfile(direct):
+                return direct
+            matches = glob(os.path.join(root, "**", name), recursive=True)
+            if matches:
+                return matches[0]
+    return None
+
+
+def _mkmod_build(rhel_repo, toolbox_name, subsystem):
+    """Validate a config-affecting change the way ``mkmod -m`` would.
+
+    Non-interactive equivalent of mkmod's config+module path:
+      1. Regenerate dist-configs so new redhat/configs snippets apply
+      2. Install the host-arch kernel-*.config as .config
+      3. make prepare && make modules_prepare
+      4. make M=<subsystem> clean && make M=<subsystem>
+
+    Returns (success, output).
+    """
+    log = []
+
+    # 1. Refresh generated configs
+    _invalidate_dist_configs_stamp(rhel_repo)
+    src_hash = _config_source_hash(rhel_repo)
+    with Spinner("mkmod: regenerating dist-configs ..."):
+        # Prefer dist-configs; fall back to rh-configs like mkmod does
+        for target in ("dist-configs", "rh-configs"):
+            cmd, cwd = _toolbox_cmd(
+                toolbox_name, f"make {target}", rhel_repo)
+            rc, out, err = run_quiet(cmd, cwd=cwd)
+            log.append(out + err)
+            if rc == 0:
+                break
+        else:
+            return False, "mkmod: make dist-configs/rh-configs failed\n" + \
+                "".join(log)
+
+    stamp = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
+    with open(stamp, "w") as fh:
+        fh.write((src_hash or "unknown") + "\n")
+
+    # 2. Install host-arch .config
+    cfg = _host_arch_config_path(rhel_repo)
+    if cfg:
+        dest = os.path.join(rhel_repo, ".config")
+        try:
+            shutil.copy2(cfg, dest)
+            info(f"  mkmod: installed {os.path.relpath(cfg, rhel_repo)} "
+                 f"→ .config")
+        except OSError as e:
+            warn(f"  mkmod: could not install .config: {e}")
+    else:
+        warn("  mkmod: no host-arch kernel-*.config found; "
+             "reusing existing .config")
+
+    # 3. prepare / modules_prepare (needed after .config refresh)
+    with Spinner("mkmod: make prepare && modules_prepare ..."):
+        for step in ("make prepare",
+                     "make modules_prepare"):
+            cmd, cwd = _toolbox_cmd(toolbox_name, step, rhel_repo)
+            rc, out, err = run_quiet(cmd, cwd=cwd)
+            log.append(out + err)
+            if rc != 0:
+                # prepare can fail noisily on incomplete trees; continue
+                # and let the M= build report real errors.
+                warn(f"  mkmod: '{step}' exited {rc} "
+                     f"(continuing to module build)")
+
+    # 4. Clean + build the subsystem module (mkmod's final step)
+    with Spinner(f"mkmod: make M={subsystem} clean ..."):
+        cmd, cwd = _toolbox_cmd(
+            toolbox_name, f"make M={subsystem} clean", rhel_repo)
+        run_quiet(cmd, cwd=cwd)
+
+    with Spinner(f"mkmod: building M={subsystem} ..."):
+        ok, build_out = build_test(rhel_repo, toolbox_name, subsystem)
+    log.append(build_out)
+    return ok, "".join(log)
 
 
 def _extract_failing_files(build_output):
@@ -4967,19 +5404,58 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
 
             # "accept" falls through to build
 
+    # New Kconfig options / redhat/configs snippets — handle before build
+    # so a config change can force an mkmod-style validation.
+    missing_cfgs = _missing_redhat_config_options(
+        commit_hash, upstream_repo, rhel_repo,
+    )
+    created_snippets = []
+    if missing_cfgs:
+        created_snippets = _prompt_create_config_snippets(
+            missing_cfgs, rhel_repo)
+        for rel, desc in created_snippets:
+            conflict_notes.append(
+                f"{rel}: created redhat/configs snippet ({desc})")
+        if not created_snippets:
+            for opt in missing_cfgs:
+                conflict_notes.append(
+                    f"needs redhat/configs snippet for {opt['symbol']} "
+                    f"(Kconfig default: "
+                    f"{opt['default'] if opt['default'] is not None else 'n'})")
+
+    config_changed = (
+        _commit_touches_kconfig(commit_hash, upstream_repo)
+        or bool(created_snippets)
+    )
+
+    # Config changes always force an mkmod-style build, even when
+    # build_policy is "none" or there was no conflict.
     should_build = (
-        (build_policy == "every") or
-        (build_policy == "conflict" and had_conflict)
+        config_changed
+        or (build_policy == "every")
+        or (build_policy == "conflict" and had_conflict)
     )
 
     build_ok = True
     if should_build:
-        build_reason = "post-conflict" if had_conflict else "post-apply"
         tb_label = f" in toolbox '{toolbox_name}'" if toolbox_name else ""
-        with Spinner(f"Building {subsystem} ({build_reason}){tb_label} ..."):
-            build_ok, build_output = build_test(
+        if config_changed:
+            info("  Config change detected — running mkmod-style "
+                 "build validation")
+            build_ok, build_output = _mkmod_build(
                 rhel_repo, toolbox_name, subsystem,
             )
+            if build_ok:
+                conflict_notes.append(
+                    "mkmod build validation after config change")
+        else:
+            build_reason = ("post-conflict" if had_conflict
+                            else "post-apply")
+            with Spinner(f"Building {subsystem} ({build_reason})"
+                         f"{tb_label} ..."):
+                build_ok, build_output = build_test(
+                    rhel_repo, toolbox_name, subsystem,
+                )
         if not build_ok:
             warn("  Build FAILED -- attempting diagnosis ...")
             fixed, fix_note = diagnose_build_failure(
@@ -5254,7 +5730,7 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
         print(f"  Enter number to toggle, "
               f"{MNU}a{OFF} select all, "
               f"{MNU}n{OFF} select none, "
-              f"{MNU}q{OFF} quit")
+              f"{MNU}q{OFF} done (return to menu)")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         # Read input — single digit for <10, or line input for numbers
@@ -5329,6 +5805,8 @@ def _write_commit_list(keep_path, keep, omit_path, omit):
         fh.write("# Format: <40-char-hash> <subject line>\n")
         fh.write("#\n")
         for h, subj, reason in keep:
+            if reason and "needs redhat/configs" in reason:
+                fh.write(f"# NOTE: {reason}\n")
             fh.write(f"{h} {subj}\n")
     with open(omit_path, "w") as fh:
         fh.write("# isb omit list -- commits excluded from cherry-pick\n")
@@ -6538,7 +7016,11 @@ def main():
             info(f"Would cherry-pick {len(keep)} commits, "
                  f"omit {len(omit)}")
             for h, subj, reason in keep:
-                print(f"  {STA}KEEP{OFF} {h[:12]} {subj}")
+                if reason and "needs redhat/configs" in reason:
+                    print(f"  {STA}KEEP{OFF} {h[:12]} {subj}"
+                          f"  {WRN}({reason}){OFF}")
+                else:
+                    print(f"  {STA}KEEP{OFF} {h[:12]} {subj}")
             for h, subj, reason in omit:
                 print(f"  {WRN}OMIT{OFF} {h[:12]} {subj}  ({reason})")
             return
@@ -6570,10 +7052,10 @@ def main():
             while True:
                 print(f"\n  {BLD}{len(keep)} commits to cherry-pick{OFF}")
                 print(f"  Commit list: {INF}{keep_file}{OFF}")
-                print(f"\n  Press any key to proceed, "
-                      f"{MNU}v{OFF} review/edit commits, "
-                      f"{MNU}q{OFF} quit, "
-                      f"{MNU}r{OFF} return to main menu")
+                print(f"\n  {MNU}g{OFF}  Proceed with cherry-pick")
+                print(f"  {MNU}v{OFF}  Review/edit commits")
+                print(f"  {MNU}r{OFF}  Return to main menu")
+                print(f"  {MNU}q{OFF}  Quit")
                 print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
                 ch = _getch()
                 if ch in ('q', 'Q', '\x03'):
@@ -6592,9 +7074,13 @@ def main():
                         _session, divergence, pending, keep, omit)
                     _save()
                     continue
-                else:
-                    print()
+                elif ch in ('g', 'G', '\r', '\n'):
+                    print("g")
                     break
+                else:
+                    # Unknown key — redisplay the menu
+                    print(ch)
+                    continue
             if _step_loop:
                 continue
 
@@ -6797,7 +7283,8 @@ def main():
 
             should_build = (
                 (build_policy == "every") or
-                (build_policy == "conflict" and notes)
+                (build_policy == "conflict" and notes) or
+                any("mkmod build validation" in n for n in (notes or []))
             )
             if should_build:
                 build_tests += 1

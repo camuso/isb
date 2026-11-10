@@ -30,6 +30,15 @@ RHEL-compliant commit messages suitable for merge requests.
   conflicts (configurable: after every conflict, after every commit, or never).
 - **Tree-wide commit handling** : out-of-scope files touched by tree-wide
   commits are automatically excluded.
+- **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
+  for newly added `config FOO` options. If `redhat/configs` has no
+  matching `CONFIG_FOO` snippet, the keep entry is annotated and
+  cherry-pick prompts to create
+  `redhat/configs/common/generic/CONFIG_FOO` (using the Kconfig
+  default, or an explicit y/n/m choice). Any commit that touches
+  Kconfig (or creates a snippet) forces an mkmod-style validation:
+  regenerate dist-configs, install the host-arch `.config`, run
+  `prepare`/`modules_prepare`, then `make M=<subsystem>`.
 - **Extensible API replacement rules** : upstream-to-RHEL API mappings
   (e.g. `kzalloc_obj` -> `kzalloc(sizeof(...), GFP_KERNEL)`) are used to
   filter commits during classification and auto-fix build errors. Rules
