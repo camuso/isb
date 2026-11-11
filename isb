@@ -5094,9 +5094,34 @@ def _consolidate_conflict_notes(notes):
     return other_notes
 
 
+def _infer_resolved_by(conflict_notes, conflict_policy, inscope_conflicted):
+    """Return 'isb', 'patchpal', or None for the Conflicts stanza trailer.
+
+    Only set when an automated resolver handled in-scope conflicts.
+    Manual editor resolutions do not get a Resolved-by line.
+    """
+    if not conflict_notes or not inscope_conflicted:
+        return None
+    text = "\n".join(conflict_notes)
+    # Prefer evidence from per-file notes (survives policy fallbacks)
+    if "Cursor AI Rule" in text:
+        return "isb"
+    if re.search(r":\s*patchpal\b", text):
+        return "patchpal"
+    # Editor fallback from AI/patchpal — no Resolved-by
+    if re.search(r":\s*editor\b", text):
+        return None
+    if conflict_policy == "ai":
+        return "isb"
+    if conflict_policy == "patchpal":
+        return "patchpal"
+    return None
+
+
 def format_gort_message(subject, commit_hash, upstream_repo,
                         jira, upstream_version, conflict_notes,
-                        signed_off_by, assisted_by="", cve=""):
+                        signed_off_by, assisted_by="", cve="",
+                        resolved_by=None):
     """Build an RHEL kernel compliant commit message."""
     # Single git call to fetch author, date, and body
     sep = "---8<---"
@@ -5153,6 +5178,8 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                                             break_long_words=False,
                                             break_on_hyphens=False):
                         lines.append(f"    {wl}")
+        if resolved_by in ("isb", "patchpal"):
+            lines.append(f"Resolved-by: {resolved_by}")
 
     lines.append("")
     lines.append(f"commit {commit_hash}")
@@ -5207,10 +5234,12 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     conflict_notes = []
     oos_conflict_count = 0
     inscope_conflicted = []
+    resolved_by = None
 
     _redo_resolution = True
     while _redo_resolution:
         _redo_resolution = False
+        resolved_by = None
 
         if had_conflict:
             if conflict_policy in ("patchpal", "edit", "ai"):
@@ -5232,6 +5261,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             if conflict_notes == ["skipped by user"]:
                 _cherrypick_repo = None
                 return "skip", conflict_notes
+
+            # Capture before --ailog may rewrite per-file notes
+            resolved_by = _infer_resolved_by(
+                conflict_notes, conflict_policy, inscope_conflicted)
 
         with Spinner("Scoping and indexing ..."):
             removed = scope_index(rhel_repo, scope_paths, exclude_paths)
@@ -5617,6 +5650,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         subject, commit_hash, upstream_repo,
         jira, upstream_version, conflict_notes,
         signed_off_by, assisted_by=assisted_by, cve=cve,
+        resolved_by=resolved_by,
     )
     msg_file = "/tmp/backport_msg.txt"
     with open(msg_file, "w") as fh:

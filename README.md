@@ -77,6 +77,9 @@ RHEL-compliant commit messages suitable for merge requests.
   - Known upstream-only APIs flagged via `api-replacements.json`
   - Function names and change characterization
     (e.g. `added return value capture in sev_init()`)
+  - Ends with `Resolved-by: isb` (Cursor AI Rule) or
+    `Resolved-by: patchpal` when those engines resolved in-scope
+    conflicts (not added for manual editor resolutions)
 - **Commit review with omit toggle** : the interactive commit review
   page (`v` hotkey) shows previously omitted commits with a ✘ mark.
   Toggle any entry by number to restore it to the keep list.

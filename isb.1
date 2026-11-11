@@ -89,6 +89,14 @@ Known upstream-only APIs flagged via
 .IP \(bu 2
 Function names and change characterization
 (e.g.\& \fIadded return value capture in sev_init()\fR).
+.IP \(bu 2
+When in-scope conflicts were resolved by the Cursor AI Rule or
+patchpal, the stanza ends with
+.B Resolved\-by:\ isb
+or
+.BR Resolved\-by:\ patchpal
+respectively.
+Manual editor resolutions omit this line.
 .RE
 .PP
 After commit classification (Phase\ 3), the KEEP and OMIT lists are
