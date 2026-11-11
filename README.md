@@ -45,8 +45,14 @@ RHEL-compliant commit messages suitable for merge requests.
   are loaded from `api-replacements.json` shipped with `isb`; users can
   add their own in `~/.config/isb/api-replacements.json` without editing
   the tool.
-- **Session persistence** : parameters are saved to `.backport/session.json`
-  and reused across runs with an interactive single-keypress menu.
+- **Session persistence** : per-backport parameters are saved to
+  `.backport/session.json` and reused across runs with an interactive
+  single-keypress menu.
+- **User Config menu (`C`)** : stable preferences live in
+  `~/.config/isb/config.json` — conflict/build policy, editor, ailog,
+  AI provider, API key path/env (never the raw secret), and model
+  preference lists. Open with `C` from Parameters / session, or when
+  prompted by `isb new`.
 - **Resumable** : interrupted runs save progress and resume automatically
   with `--continue`.
 - **Automatic commit-graph** : on first run, isb writes a git commit-graph
@@ -112,47 +118,32 @@ RHEL-compliant commit messages suitable for merge requests.
 
 ## Setting up the Cursor API Key
 
-AI-assisted features (`--ailog`) require the `CURSOR_API_KEY` environment
-variable and a Cursor paid subscription. Without them, isb falls back to
-heuristic-based conflict descriptions and prints a one-time warning:
+AI-assisted features require `cursor-sdk` and an API key (paid Cursor
+subscription). Without them, isb falls back to heuristic conflict notes.
 
-    CURSOR_API_KEY not set. Falling back to simpler conflict notes.
+**Easiest path:** in the isb Parameters menu press `C` → `k` → paste the
+key. isb writes `~/.config/isb/api-keys/cursor` with mode `0600` and
+records only that path in `config.json` (never the secret).
 
-isb automatically selects the best available model from the Cursor API
-at runtime, so no model name needs to be configured.
+Manual setup:
 
-1. Install the SDK:
-
-   ```sh
-   pip3 install cursor-sdk
-   ```
-
-2. Generate an API key at
-   [cursor.com/dashboard/api](https://cursor.com/dashboard/api):
-   click **New API Key** and copy the full secret immediately
-   (it is only shown once; format: `crsr_...`)
-
-3. Save the key to a file and export it from your shell profile:
+1. `pip3 install cursor-sdk`
+2. Create a User API key at
+   [cursor.com/dashboard/api](https://cursor.com/dashboard/api)
+   (copy the full secret from the create dialog — shown once)
+3. Either paste via Config (`C` → `k`), or:
 
    ```sh
-   # Save the key (paste your key when prompted):
-   read -sp "Cursor API key: " key && echo "$key" > ~/.cursor/cursor-worker-api-key && echo
-
-   # Add to ~/.bashrc or ~/.bash_profile:
-   [ -f ~/.cursor/cursor-worker-api-key ] && export CURSOR_API_KEY="$(cat ~/.cursor/cursor-worker-api-key)"
+   mkdir -p ~/.config/isb/api-keys
+   read -sp "Cursor API key: " key && printf '%s\n' "$key" > ~/.config/isb/api-keys/cursor
+   chmod 600 ~/.config/isb/api-keys/cursor
+   # Optional: also export for other tools
+   export CURSOR_API_KEY="$(cat ~/.config/isb/api-keys/cursor)"
    ```
 
-4. Source the profile or open a new terminal:
-
-   ```sh
-   source ~/.bashrc
-   ```
-
-Verify it works:
-
-```sh
-python3 -c "import cursor_sdk; import os; print('OK' if os.environ.get('CURSOR_API_KEY') else 'NOT SET')"
-```
+Model preference lists (analysis vs fix) are edited in Config (`m` / `f`).
+isb still picks the first listed model that `Cursor.models.list()` reports
+as available.
 
 ## Installation
 

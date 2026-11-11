@@ -7,6 +7,7 @@ build-tests via toolbox.
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -74,6 +75,258 @@ _USER_CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "isb",
 )
+_USER_CONFIG_FILE = os.path.join(_USER_CONFIG_DIR, "config.json")
+_USER_API_KEYS_DIR = os.path.join(_USER_CONFIG_DIR, "api-keys")
+
+# Providers currently wired for AI explain/resolve.  Additional providers
+# will be added later; Config already stores ai_provider for that.
+AI_PROVIDERS = ["cursor"]
+
+# Defaults for ~/.config/isb/config.json — rarely change between backports.
+CONFIG_DEFAULTS = {
+    "conflict_policy": None,          # None = auto (ai/patchpal/edit)
+    "build_policy": "conflict",
+    "editor": None,                   # None = VISUAL/EDITOR/vim
+    "ailog": True,
+    "assisted_by": "",
+    "signed_off_by": "",
+    "ai_provider": "cursor",
+    "ai_api_key_env": "CURSOR_API_KEY",
+    "ai_api_key_file": "",
+    "ai_model_analysis": [
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "default",
+    ],
+    "ai_model_fix": [
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4",
+        "claude-opus-4-6",
+        "default",
+    ],
+}
+
+# Fields that belong in user config (not per-backport session identity).
+CONFIG_FIELD_NAMES = tuple(CONFIG_DEFAULTS.keys())
+
+_user_config = {}
+_config_loaded = False
+
+
+def get_config(key, default=None):
+    """Return a user-config value (after ensure_user_config)."""
+    if key in _user_config:
+        return _user_config[key]
+    if key in CONFIG_DEFAULTS:
+        return CONFIG_DEFAULTS[key]
+    return default
+
+
+def set_config(key, value):
+    """Update an in-memory user-config value (does not save)."""
+    _user_config[key] = value
+
+
+def save_user_config():
+    """Write ~/.config/isb/config.json (never stores API key material)."""
+    os.makedirs(_USER_CONFIG_DIR, exist_ok=True)
+    data = dict(CONFIG_DEFAULTS)
+    data.update(_user_config)
+    # Never persist secrets — only env name / file path references.
+    with open(_USER_CONFIG_FILE, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    try:
+        os.chmod(_USER_CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def ensure_user_config(session=None):
+    """Load or create ~/.config/isb/config.json.
+
+    On first create, migrate stable fields from the repo session (if any)
+    and discover a legacy Cursor key file path.
+    """
+    global _user_config, _config_loaded
+    if _config_loaded:
+        return _user_config
+
+    created = False
+    if os.path.isfile(_USER_CONFIG_FILE):
+        try:
+            with open(_USER_CONFIG_FILE) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                _user_config = dict(CONFIG_DEFAULTS)
+                _user_config.update(data)
+            else:
+                warn(f"Ignoring non-object config in {_USER_CONFIG_FILE}")
+                _user_config = dict(CONFIG_DEFAULTS)
+                created = True
+        except (json.JSONDecodeError, OSError) as exc:
+            warn(f"Failed to load {_USER_CONFIG_FILE}: {exc}")
+            _user_config = dict(CONFIG_DEFAULTS)
+            created = True
+    else:
+        _user_config = dict(CONFIG_DEFAULTS)
+        created = True
+        if session:
+            for k in ("conflict_policy", "build_policy", "editor", "ailog",
+                      "assisted_by", "signed_off_by"):
+                val = session.get(k)
+                if val is None or val == "":
+                    continue
+                if k == "conflict_policy" and val not in CONFLICT_POLICIES:
+                    continue
+                if k == "build_policy" and val not in BUILD_POLICIES:
+                    continue
+                _user_config[k] = val
+        legacy = os.path.expanduser("~/.cursor/cursor-worker-api-key")
+        if os.path.isfile(legacy) and not _user_config.get("ai_api_key_file"):
+            _user_config["ai_api_key_file"] = legacy
+
+    if created:
+        save_user_config()
+        info(f"Created {_USER_CONFIG_FILE}")
+        info("  Press C in the Parameters menu to edit Config.")
+
+    _config_loaded = True
+    return _user_config
+
+
+def apply_user_config_to_args(args):
+    """Fill unset CLI/session args from user config."""
+    ensure_user_config(_session)
+    if getattr(args, "conflict_policy", None) is None:
+        pol = get_config("conflict_policy")
+        if pol in CONFLICT_POLICIES:
+            args.conflict_policy = pol
+    if getattr(args, "build_policy", None) is None:
+        bp = get_config("build_policy")
+        if bp in BUILD_POLICIES:
+            args.build_policy = bp
+    if getattr(args, "ailog", None) is None:
+        val = get_config("ailog")
+        if val is not None:
+            args.ailog = bool(val)
+    if not getattr(args, "assisted_by", None):
+        ab = get_config("assisted_by") or ""
+        if ab:
+            args.assisted_by = ab
+    if not getattr(args, "signed_off_by", None):
+        sob = get_config("signed_off_by") or ""
+        if sob:
+            args.signed_off_by = sob
+    if getattr(args, "editor", None) is None:
+        ed = get_config("editor")
+        if ed:
+            args.editor = ed
+            _session["editor"] = ed
+
+
+def _get_api_key(provider=None):
+    """Resolve the API key for *provider* without printing it.
+
+    Order: configured env var → configured key file → legacy Cursor paths.
+    Returns "" if unavailable.
+    """
+    ensure_user_config(_session)
+    provider = provider or get_config("ai_provider") or "cursor"
+
+    env_name = get_config("ai_api_key_env") or "CURSOR_API_KEY"
+    if provider == "cursor" and env_name:
+        val = os.environ.get(env_name, "")
+        if val.strip():
+            return val.strip()
+
+    key_file = get_config("ai_api_key_file") or ""
+    candidates = []
+    if key_file:
+        candidates.append(os.path.expanduser(key_file))
+    if provider == "cursor":
+        candidates.extend([
+            os.path.join(_USER_API_KEYS_DIR, "cursor"),
+            os.path.expanduser("~/.cursor/cursor-worker-api-key"),
+        ])
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            try:
+                with open(path) as fh:
+                    val = fh.read().strip()
+                if val:
+                    return val
+            except OSError:
+                continue
+    return ""
+
+
+def _api_key_status():
+    """Human-readable key status for Config UI (never reveals the secret)."""
+    ensure_user_config(_session)
+    env_name = get_config("ai_api_key_env") or "CURSOR_API_KEY"
+    if os.environ.get(env_name, "").strip():
+        return f"env {env_name} (set)"
+    key_file = get_config("ai_api_key_file") or ""
+    paths = []
+    if key_file:
+        paths.append(os.path.expanduser(key_file))
+    paths.append(os.path.join(_USER_API_KEYS_DIR, "cursor"))
+    paths.append(os.path.expanduser("~/.cursor/cursor-worker-api-key"))
+    for path in paths:
+        if os.path.isfile(path):
+            try:
+                mode = oct(os.stat(path).st_mode & 0o777)[2:]
+            except OSError:
+                mode = "????"
+            rel = path.replace(os.path.expanduser("~"), "~", 1)
+            return f"file {rel} (mode {mode})"
+    return "unset"
+
+
+def _write_api_key_file(key, path=None):
+    """Write *key* to a 0600 file; return the path used."""
+    if path is None:
+        os.makedirs(_USER_API_KEYS_DIR, exist_ok=True)
+        path = os.path.join(_USER_API_KEYS_DIR, "cursor")
+    else:
+        path = os.path.expanduser(path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    # Write privately
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(key.strip() + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    set_config("ai_api_key_file", path)
+    save_user_config()
+    return path
+
+
+def _config_summary_line():
+    """One-line Config summary for the Parameters menu."""
+    ensure_user_config(_session)
+    pol = get_config("conflict_policy")
+    if pol not in CONFLICT_POLICIES:
+        pol = "auto"
+    plabel = CONFLICT_POLICY_LABELS.get(pol, pol)
+    provider = get_config("ai_provider") or "cursor"
+    ailog = "ailog on" if get_config("ailog") else "ailog off"
+    key = "key ok" if _get_api_key() else "no key"
+    return f"{provider} / {plabel} / {ailog} / {key}"
+
 
 def _load_api_config():
     """Load API replacement rules from the repo baseline and optional user
@@ -722,6 +975,26 @@ _HELP_TOPICS = {
             Interactive menu hotkey: 8
         """),
     ),
+    "config": (
+        "isb Config menu (C)",
+        "Stable preferences in ~/.config/isb/config.json.",
+        textwrap.dedent("""\
+            Open with C from the Parameters or session menu, or when
+            prompted by 'isb new'.  Holds settings that rarely change
+            between backports:
+
+              conflict-policy, build-policy, editor, ailog
+              AI provider (currently: cursor)
+              API key env/file references (never the raw secret)
+              analysis / fix model preference lists
+              signed-off-by / assisted-by defaults
+
+            Paste-to-file stores the key under
+            ~/.config/isb/api-keys/ with mode 0600.
+
+            Precedence: CLI > session > user config > built-in defaults.
+        """),
+    ),
     "conflict-policy": (
         "--conflict-policy {patchpal,edit,ai,abort}",
         "In-scope conflict resolution strategy.",
@@ -729,25 +1002,15 @@ _HELP_TOPICS = {
             Cursor AI Rule
                       - Use a Cursor Opus agent to resolve conflicts
                         automatically (internal name: ai).  Requires
-                        cursor-sdk and CURSOR_API_KEY.  After
-                        resolution, a review menu lets you accept,
-                        re-do (falls back to editor), or skip the
-                        commit.  The AI follows the methodology in
-                        .cursor/rules/conflict-analysis.mdc: preserve
-                        RHEL-specific code, apply upstream changes,
-                        verify lock/unlock correctness.
-            patchpal  - Launch the patchpal GUI mergetool (requires a
-                        graphical display and the patchpal executable).
+                        cursor-sdk and an API key (Config → k).
+            patchpal  - Launch the patchpal GUI mergetool.
             edit      - Open conflicted files in the configured editor.
             abort     - Abort on any in-scope conflict.
 
-            Default: Cursor AI Rule if cursor-sdk and CURSOR_API_KEY
-            are available, then patchpal if a display and the
-            executable are found, otherwise edit.  Out-of-scope files,
-            MAINTAINERS, and delete/modify conflicts are always
-            resolved automatically.
+            Default: value from ~/.config/isb/config.json if set,
+            else Cursor AI Rule when available, then patchpal, else edit.
 
-            Interactive menu hotkey: c (cycles through policies)
+            Configure via Config menu (C).
         """),
     ),
     "editor": (
@@ -755,23 +1018,23 @@ _HELP_TOPICS = {
         "Editor for conflict-policy=edit (default: vim).",
         textwrap.dedent("""\
             Any editor command the user prefers (vim, gvim, emacs, nano,
-            vscodium, etc.).  Saved in the session.  Also used by the
-            'fix' option when a build fails.
+            vscodium, etc.).  Stored in ~/.config/isb/config.json.
+            Also used by the 'fix' option when a build fails.
 
-            Interactive menu hotkey: e
+            Configure via Config menu (C).
         """),
     ),
     "build-policy": (
-        "--build-policy {every,conflict,never}",
+        "--build-policy {every,conflict,none}",
         "When to run incremental build-tests.",
         textwrap.dedent("""\
             every     - Build after every cherry-picked commit.
             conflict  - Build only after commits that had conflicts.
-            never     - Skip all incremental builds.
+            none      - Skip all incremental builds.
 
-            Default: conflict.
+            Default: conflict (or value from Config).
 
-            Interactive menu hotkey: b (cycles through policies)
+            Configure via Config menu (C).
         """),
     ),
     "dry-run": (
@@ -889,17 +1152,16 @@ _HELP_TOPICS = {
                If all AI attempts fail, isb falls back to the manual
                Skip / Fix / Abort menu.
 
-            Requires the cursor-sdk Python package and CURSOR_API_KEY in the
-            environment.  If either is missing, isb falls back to local
-            heuristic analysis silently.
+            Requires the cursor-sdk Python package and an API key
+            (Config → k, or CURSOR_API_KEY).  If either is missing, isb
+            falls back to local heuristic analysis.
 
             Setup:
               pip3 install cursor-sdk
               # Generate a key at cursor.com/dashboard/api
-              # Click "New API Key" and copy the full secret (shown once)
-              export CURSOR_API_KEY="your-key-here"   # add to ~/.bashrc
+              # Or press C → k in the isb Config menu to paste/store it
 
-            Interactive menu hotkey: i
+            Configure ailog and keys via Config menu (C).
 
             Examples:
               isb --no-ailog          # disable AI features
@@ -950,7 +1212,7 @@ def _show_topics_list():
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
                 "cve", "jira", "add", "drop",
-                "branch", "output-dir",
+                "branch", "output-dir", "config",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen", "ailog", "skip"):
@@ -992,7 +1254,7 @@ def _show_general_help():
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
                 "cve", "jira", "add", "drop",
-                "branch", "output-dir",
+                "branch", "output-dir", "config",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen", "ailog"):
@@ -1278,7 +1540,8 @@ def _getch():
     return ch
 
 
-# Menu items: (key, field, label, required)
+# Initial session menu items: (key, field, label, required)
+# Stable prefs (conflict/build policy, editor, ailog, AI) are in Config (C).
 _MENU_ITEMS = [
     ("s", "subsystem",        "subsystem",        True),
     ("r", "rhel",             "rhel",             True),
@@ -1287,10 +1550,6 @@ _MENU_ITEMS = [
     ("b", "signed_off_by",    "signed-off-by",    True),
     ("j", "jira",             "jira",             False),
     ("t", "toolbox",          "toolbox",          False),
-    ("c", "conflict_policy",  "conflict-policy",  False),
-    ("d", "build_policy",     "build-policy",     False),
-    ("e", "editor",           "editor",           False),
-    ("a", "assisted_by",      "assisted-by",      False),
     ("o", "only_paths",       "only-paths",       False),
     ("x", "extra_paths",      "extra-paths",      False),
 ]
@@ -1448,6 +1707,7 @@ def _print_menu(session):
     Fields in REQUISITE_FIELDS are marked with * to indicate that
     changing them invalidates cached divergence/classification results.
     """
+    ensure_user_config(session)
     print(f"\n{MNU}    {'Session parameters'}{OFF}")
     print(f"    {'─' * 50}")
     for key, field, label, required in _MENU_ITEMS:
@@ -1455,11 +1715,12 @@ def _print_menu(session):
         mark = f"{CAU}*{OFF}" if field in REQUISITE_FIELDS else " "
         print(f"  {MNU}{key}{OFF}{mark} {label+':':<20s} "
               f"{_format_value(field, val)}")
+    print(f"  {MNU}C{OFF}  {'config:':<20s} "
+          f"{INF}{_config_summary_line()}{OFF}")
     print(f"    {'─' * 50}")
     print(f"  {CAU}*{OFF} changing invalidates cached results")
-    if not _has_display():
-        print(f"  {WRN}**{OFF} requires a graphical display (X11/Wayland)")
     print(f"  {MNU}g{OFF}  Go          "
+          f"{MNU}C{OFF}  Config      "
           f"{MNU}q{OFF}  Quit        "
           f"{MNU}h{OFF}  Help")
 
@@ -1495,6 +1756,31 @@ def prompt_session():
         if ch in ('h', 'H'):
             print()
             _show_manpage()
+            continue
+
+        if ch in ('c', 'C'):
+            print()
+            show_config_menu({
+                "conflict_policy": (
+                    _session.get("conflict_policy")
+                    or get_config("conflict_policy")),
+                "build_policy": (
+                    _session.get("build_policy")
+                    or get_config("build_policy")
+                    or "conflict"),
+                "editor": _session.get("editor") or _get_editor(),
+                "ailog": (_session.get("ailog")
+                          if _session.get("ailog") is not None
+                          else bool(get_config("ailog"))),
+                "signed_off_by": (
+                    _session.get("signed_off_by")
+                    or get_config("signed_off_by")
+                    or ""),
+                "assisted_by": (
+                    _session.get("assisted_by")
+                    or get_config("assisted_by")
+                    or ""),
+            })
             continue
 
         if ch in _key_map:
@@ -1685,6 +1971,8 @@ def discover_scope_paths(subsystem, upstream_repo, extra_paths):
 # Interactive confirmation menu
 # ---------------------------------------------------------------------------
 
+# Per-backport identity fields shown on the Parameters menu.
+# Stable preferences (conflict/build policy, editor, ailog, AI) live in Config.
 _CONFIRM_FIELDS = [
     ("1", "subsystem",        "Subsystem",        "text"),
     ("2", "rhel",             "RHEL version",     "text"),
@@ -1696,10 +1984,19 @@ _CONFIRM_FIELDS = [
     ("8", "branch",           "Branch",           "text"),
     ("9", "output_dir",       "Output dir",       "text"),
     ("t", "toolbox",          "Toolbox",          "toolbox"),
-    ("c", "conflict_policy",  "Conflict policy",  "cycle"),
-    ("b", "build_policy",     "Build policy",     "cycle"),
-    ("e", "editor",           "Editor",           "text"),
-    ("i", "ailog",            "AI conflict log",  "toggle"),
+]
+
+_CONFIG_MENU_FIELDS = [
+    ("c", "conflict_policy",   "Conflict policy",  "cycle"),
+    ("b", "build_policy",      "Build policy",     "cycle"),
+    ("e", "editor",            "Editor",           "text"),
+    ("i", "ailog",             "AI conflict log",  "toggle"),
+    ("p", "ai_provider",       "AI provider",      "provider"),
+    ("k", "ai_api_key",        "API key",          "apikey"),
+    ("m", "ai_model_analysis", "Analysis models",  "modellist"),
+    ("f", "ai_model_fix",      "Fix models",       "modellist"),
+    ("s", "signed_off_by",     "Signed-off-by",    "text"),
+    ("a", "assisted_by",       "Assisted-by",      "text"),
 ]
 
 
@@ -1819,44 +2116,275 @@ def _scope_submenu(scope_paths, params, session):
     return scope_paths, exclude
 
 
+def _sync_config_into_params(params):
+    """Push user-config preferences into the live params dict."""
+    ensure_user_config(_session)
+    pol = get_config("conflict_policy")
+    if pol in CONFLICT_POLICIES:
+        params["conflict_policy"] = pol
+    bp = get_config("build_policy")
+    if bp in BUILD_POLICIES:
+        params["build_policy"] = bp
+    ed = get_config("editor")
+    if ed:
+        params["editor"] = ed
+        _session["editor"] = ed
+    if get_config("ailog") is not None:
+        params["ailog"] = bool(get_config("ailog"))
+    sob = get_config("signed_off_by") or ""
+    if sob:
+        params["signed_off_by"] = sob
+    ab = get_config("assisted_by") or ""
+    if ab:
+        params["assisted_by"] = ab
+
+
+def _prompt_api_key_setup():
+    """Interactive API key configuration (never echoes the secret)."""
+    print(f"\n  Current: {INF}{_api_key_status()}{OFF}")
+    print(f"  {MNU}1{OFF}  Paste key → save to "
+          f"~/.config/isb/api-keys/cursor (mode 600)")
+    print(f"  {MNU}2{OFF}  Set key file path")
+    print(f"  {MNU}3{OFF}  Set env var name "
+          f"(default CURSOR_API_KEY)")
+    print(f"  {MNU}4{OFF}  Clear file path from config")
+    print(f"  {MNU}q{OFF}  Cancel")
+    print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+    ch = _getch()
+    print(ch)
+    if ch == '1':
+        try:
+            key = getpass.getpass("  Paste API key (hidden): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not key:
+            warn("  Empty key — cancelled.")
+            return
+        path = _write_api_key_file(key)
+        # Also export for this process so SDK calls work immediately
+        env_name = get_config("ai_api_key_env") or "CURSOR_API_KEY"
+        os.environ[env_name] = key
+        status(f"  Saved key to {path} (mode 600)")
+    elif ch == '2':
+        cur = get_config("ai_api_key_file") or ""
+        val = input(f"  Key file path [{cur}]: ").strip()
+        if val:
+            set_config("ai_api_key_file", os.path.expanduser(val))
+            save_user_config()
+            status(f"  ai_api_key_file = {get_config('ai_api_key_file')}")
+    elif ch == '3':
+        cur = get_config("ai_api_key_env") or "CURSOR_API_KEY"
+        val = input(f"  Env var name [{cur}]: ").strip()
+        if val:
+            set_config("ai_api_key_env", val)
+            save_user_config()
+            status(f"  ai_api_key_env = {val}")
+    elif ch == '4':
+        set_config("ai_api_key_file", "")
+        save_user_config()
+        status("  Cleared ai_api_key_file from config "
+               "(env var still used if set).")
+
+
+def show_config_menu(params):
+    """Edit stable preferences stored in ~/.config/isb/config.json.
+
+    Syncs selected values back into *params* / session so the current
+    run picks them up immediately.
+    """
+    ensure_user_config(_session)
+    # Seed config from live params when config still has auto/empty
+    if (get_config("conflict_policy") not in CONFLICT_POLICIES
+            and params.get("conflict_policy") in CONFLICT_POLICIES):
+        set_config("conflict_policy", params["conflict_policy"])
+    if (get_config("build_policy") not in BUILD_POLICIES
+            and params.get("build_policy") in BUILD_POLICIES):
+        set_config("build_policy", params["build_policy"])
+    if not get_config("editor") and params.get("editor"):
+        set_config("editor", params["editor"])
+
+    cycle_values = {
+        "conflict_policy": CONFLICT_POLICIES,
+        "build_policy": BUILD_POLICIES,
+        "ai_provider": AI_PROVIDERS,
+    }
+
+    while True:
+        print(f"\n{MNU}    isb Config{OFF}  "
+              f"{DIM}({_USER_CONFIG_FILE}){OFF}")
+        print(f"    {'─' * 50}")
+        for key, field, label, ftype in _CONFIG_MENU_FIELDS:
+            if ftype == "apikey":
+                display = _api_key_status()
+            elif ftype == "provider":
+                display = get_config("ai_provider") or "cursor"
+            elif ftype == "modellist":
+                prefs = get_config(field) or []
+                if isinstance(prefs, list) and prefs:
+                    display = prefs[0] + (
+                        f" (+{len(prefs) - 1})" if len(prefs) > 1 else "")
+                else:
+                    display = f"{WRN}(default list){OFF}"
+            elif ftype == "cycle":
+                val = get_config(field)
+                if field == "conflict_policy":
+                    if val not in CONFLICT_POLICIES:
+                        display = "auto"
+                    else:
+                        plabel = CONFLICT_POLICY_LABELS.get(val, val)
+                        if val == "patchpal" and not _has_display():
+                            display = (f"{DIM}{plabel}{OFF} "
+                                       f"{WRN}(requires GUI) **{OFF}")
+                        elif val == "ai" and not _ai_provider_available():
+                            display = (f"{DIM}{plabel}{OFF} "
+                                       f"{WRN}(requires key/sdk) **{OFF}")
+                        else:
+                            display = plabel
+                else:
+                    display = val if val else f"{WRN}(not set){OFF}"
+            elif ftype == "toggle":
+                display = (f"{STA}on{OFF}" if get_config(field)
+                           else f"{WRN}off{OFF}")
+            else:
+                val = get_config(field) or ""
+                if field == "editor" and not val:
+                    val = _get_editor()
+                display = val if val else f"{WRN}(not set){OFF}"
+            print(f"  {MNU}{key}{OFF}  {label:<18s}: {INF}{display}{OFF}")
+        print(f"    {'─' * 50}")
+        print(f"  {MNU}q{OFF}  Done (save & return)")
+        print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+
+        ch = _getch()
+        print(ch)
+
+        if ch in ('q', 'Q', '\r', '\n', '\x03'):
+            save_user_config()
+            _sync_config_into_params(params)
+            _params_to_session(params)
+            _save()
+            # Model cache may be stale after preference edits
+            _cached_models.clear()
+            status("  Config saved.")
+            return
+
+        hit = None
+        for key, field, label, ftype in _CONFIG_MENU_FIELDS:
+            if ch == key:
+                hit = (field, label, ftype)
+                break
+        if not hit:
+            continue
+        field, label, ftype = hit
+
+        if ftype == "apikey":
+            _prompt_api_key_setup()
+            continue
+
+        if ftype == "provider":
+            vals = cycle_values["ai_provider"]
+            cur = get_config("ai_provider") or vals[0]
+            try:
+                idx = vals.index(cur)
+            except ValueError:
+                idx = -1
+            nxt = vals[(idx + 1) % len(vals)]
+            set_config("ai_provider", nxt)
+            save_user_config()
+            status(f"  AI provider: {nxt}")
+            if nxt != "cursor":
+                warn("  Only 'cursor' is wired today; "
+                     "other providers come later.")
+            continue
+
+        if ftype == "cycle":
+            vals = cycle_values[field]
+            cur = get_config(field)
+            try:
+                idx = vals.index(cur) if cur in vals else -1
+            except ValueError:
+                idx = -1
+            nxt = vals[(idx + 1) % len(vals)]
+            set_config(field, nxt)
+            save_user_config()
+            if field == "conflict_policy":
+                plabel = CONFLICT_POLICY_LABELS.get(nxt, nxt)
+                status(f"  {label}: {plabel}")
+                if nxt == "patchpal" and not _has_display():
+                    warn("  patchpal requires a graphical display")
+                elif nxt == "ai" and not _ai_provider_available():
+                    warn("  AI provider needs cursor-sdk + API key "
+                         "(press k to configure)")
+            else:
+                status(f"  {label}: {nxt}")
+            continue
+
+        if ftype == "toggle":
+            set_config(field, not bool(get_config(field)))
+            save_user_config()
+            state = "on" if get_config(field) else "off"
+            status(f"  {label}: {state}")
+            continue
+
+        if ftype == "modellist":
+            cur = get_config(field) or []
+            if isinstance(cur, list):
+                cur_disp = ", ".join(cur)
+            else:
+                cur_disp = str(cur)
+            print(f"  Current: {INF}{cur_disp}{OFF}")
+            print("  Enter comma-separated preference list "
+                  "(first = preferred), or Enter to keep:")
+            raw = input("  > ").strip()
+            if raw:
+                prefs = [p.strip() for p in raw.split(",") if p.strip()]
+                set_config(field, prefs)
+                save_user_config()
+                _cached_models.clear()
+                status(f"  {label}: {', '.join(prefs)}")
+            continue
+
+        # text fields
+        cur = get_config(field) or ""
+        if field == "editor" and not cur:
+            cur = _get_editor()
+        print()
+        val = input(f"  {label} [{cur}]: ").strip()
+        if val:
+            set_config(field, val)
+            save_user_config()
+            if field == "editor":
+                _session["editor"] = val
+            status(f"  {label}: {val}")
+        elif val == "" and field in ("assisted_by", "signed_off_by"):
+            # Allow clearing with a single space? Keep as-is on Enter.
+            pass
+
+
 def show_confirmation_menu(params):
     """Display parameters and let the user edit any field before proceeding.
 
     All menu input is single-keypress via _getch() -- no Enter required.
-    Cycle fields (conflict/build policy) toggle on keypress.
+    Stable preferences are edited via the Config submenu (C).
     Text fields drop to an input() prompt for editing.
     """
 
     scope_paths = list(params["scope_paths"])
-    cycle_values = {
-        "conflict_policy": CONFLICT_POLICIES,
-        "build_policy":    BUILD_POLICIES,
-    }
+    ensure_user_config(_session)
+    _sync_config_into_params(params)
 
     while True:
         print(f"\n{MNU}    {'Backport Parameters'}{OFF}")
         print(f"    {'─' * 50}")
         for key, field, label, ftype in _CONFIRM_FIELDS:
             val = params[field]
-            suffix = ""
-            if field == "build_policy" and val == "conflict":
-                suffix = " (DEFAULT)"
-            if field == "conflict_policy" and val in CONFLICT_POLICY_LABELS:
-                plabel = CONFLICT_POLICY_LABELS[val]
-                if val == "patchpal" and not _has_display():
-                    display = (f"{DIM}{plabel}{OFF} "
-                               f"{WRN}(requires GUI) **{OFF}")
-                elif val == "ai" and not _cursor_sdk_available():
-                    display = (f"{DIM}{plabel}{OFF} "
-                               f"{WRN}(requires cursor-sdk) **{OFF}")
-                else:
-                    display = f"{plabel}{suffix}"
-            elif isinstance(val, bool):
+            if isinstance(val, bool):
                 display = f"{STA}on{OFF}" if val else f"{WRN}off{OFF}"
             elif isinstance(val, list):
                 display = " ".join(val) if val else f"{WRN}(not set){OFF}"
             elif val:
-                display = f"{val}{suffix}"
+                display = str(val)
             else:
                 display = f"{WRN}(not set){OFF}"
             mark = f"{CAU}*{OFF}" if field in REQUISITE_FIELDS else " "
@@ -1868,6 +2396,8 @@ def show_confirmation_menu(params):
         mark = f"{CAU}*{OFF}"
         print(f"  {MNU}P{OFF}{mark}{'Scope paths':<18s}: "
               f"{INF}{scope_summary}{OFF}")
+        print(f"  {MNU}C{OFF}  {'Config':<18s}: "
+              f"{INF}{_config_summary_line()}{OFF}")
         print(f"    {'─' * 50}")
 
         cached = _session.get("_cached")
@@ -1906,9 +2436,7 @@ def show_confirmation_menu(params):
             print(f"    {'─' * 50}")
 
         print(f"  {CAU}*{OFF} changing invalidates cached results")
-        if not _has_display():
-            print(f"  {WRN}**{OFF} requires a graphical display "
-                  f"(X11/Wayland)")
+        print(f"  {MNU}C{OFF}  Config (policies, editor, AI, keys)")
         print(f"  {MNU}N{OFF}  New session (edit all)    "
               f"{MNU}p{OFF}  Regen patches")
         print(f"  {MNU}r{OFF}  Reset to commit           "
@@ -1925,6 +2453,7 @@ def show_confirmation_menu(params):
         if ch == 'g':
             params["scope_paths"] = scope_paths
             params["_step"] = False
+            _sync_config_into_params(params)
             _params_to_session(params)
             _save()
             print()
@@ -1933,6 +2462,7 @@ def show_confirmation_menu(params):
         elif ch == 'x':
             params["scope_paths"] = scope_paths
             params["_step"] = True
+            _sync_config_into_params(params)
             _params_to_session(params)
             _save()
             print()
@@ -1944,6 +2474,10 @@ def show_confirmation_menu(params):
             _save()
             print()
             sys.exit(0)
+
+        elif ch in ('c', 'C'):
+            show_config_menu(params)
+            continue
 
         elif ch in ('h', 'H'):
             _show_manpage()
@@ -2006,53 +2540,11 @@ def show_confirmation_menu(params):
             for _, field, label, ftype in _CONFIRM_FIELDS:
                 cur = params[field] or ""
                 old_val = params[field]
-                if ftype == "cycle":
-                    vals = cycle_values[field]
-                    if field == "conflict_policy":
-                        opt_labels = []
-                        for p in vals:
-                            plabel = CONFLICT_POLICY_LABELS.get(p, p)
-                            if p == "patchpal" and not _has_display():
-                                opt_labels.append(
-                                    f"{DIM}{plabel}{OFF}")
-                            elif (p == "ai"
-                                    and not _cursor_sdk_available()):
-                                opt_labels.append(
-                                    f"{DIM}{plabel}{OFF}")
-                            else:
-                                opt_labels.append(plabel)
-                        opts = "/".join(opt_labels)
-                        cur_display = CONFLICT_POLICY_LABELS.get(
-                            cur, cur)
-                    else:
-                        opts = "/".join(vals)
-                        cur_display = cur
-                    prompt_str = (f"    {label} [{cur_display}] "
-                                  f"({opts}): ")
-                    val = input(prompt_str).strip().lower()
-                    # Accept label or internal key
-                    if field == "conflict_policy":
-                        ltk = {v.lower(): k for k, v in
-                               CONFLICT_POLICY_LABELS.items()}
-                        val = ltk.get(val, val)
-                    if val and val in vals:
-                        params[field] = val
-                        if (field == "conflict_policy"
-                                and val == "patchpal"
-                                and not _has_display()):
-                            print(f"  {WRN}Note: patchpal requires a "
-                                  f"graphical display (X11/Wayland)"
-                                  f"{OFF}")
-                    elif val:
-                        warn(f"    Invalid choice, keeping '{cur}'")
-                elif ftype == "toggle":
-                    cur_state = "on" if params[field] else "off"
-                    val = input(f"    {label} [{cur_state}] "
-                                f"(on/off): ").strip().lower()
-                    if val in ("on", "yes", "true", "1"):
-                        params[field] = True
-                    elif val in ("off", "no", "false", "0"):
-                        params[field] = False
+                if ftype == "toolbox":
+                    print()
+                    new_tb = _pick_toolbox(params[field])
+                    if new_tb is not None:
+                        params[field] = new_tb
                 else:
                     prompt_str = (f"    {label} [{cur}]: " if cur
                                   else f"    {label}: ")
@@ -2063,9 +2555,11 @@ def show_confirmation_menu(params):
                     changed_requisite = True
             old_paths = scope_paths[:]
             print(f"\n  Current scope paths: {', '.join(scope_paths)}")
-            raw = input("  Enter new comma-separated paths (Enter to keep): ").strip()
+            raw = input("  Enter new comma-separated paths "
+                        "(Enter to keep): ").strip()
             if raw:
-                scope_paths = [p.strip() for p in raw.split(",") if p.strip()]
+                scope_paths = [p.strip() for p in raw.split(",")
+                               if p.strip()]
             if sorted(scope_paths) != sorted(old_paths):
                 changed_requisite = True
             params["scope_paths"] = scope_paths
@@ -2082,6 +2576,10 @@ def show_confirmation_menu(params):
             _params_to_session(params)
             _save()
             status("  Session reset.")
+            ans = input("  Edit Config (policies/AI/keys)? [y/N]: "
+                        ).strip().lower()
+            if ans in ("y", "yes"):
+                show_config_menu(params)
 
         elif ch == 'P':
             scope_paths, exclude = _scope_submenu(
@@ -2098,35 +2596,11 @@ def show_confirmation_menu(params):
             if hit:
                 field, label, ftype = hit
                 old_val = params[field]
-                if ftype == "cycle":
-                    vals = cycle_values[field]
-                    try:
-                        idx = vals.index(params[field])
-                    except ValueError:
-                        idx = -1
-                    params[field] = vals[(idx + 1) % len(vals)]
-                    if field == "conflict_policy":
-                        plabel = CONFLICT_POLICY_LABELS.get(
-                            params[field], params[field])
-                        if (params[field] == "patchpal"
-                                and not _has_display()):
-                            print(f"\n  {WRN}Note: {plabel} requires "
-                                  f"a graphical display "
-                                  f"(X11/Wayland){OFF}")
-                        elif (params[field] == "ai"
-                                and not _cursor_sdk_available()):
-                            print(f"\n  {WRN}Note: {plabel} requires "
-                                  f"cursor-sdk and "
-                                  f"CURSOR_API_KEY{OFF}")
-                elif ftype == "toolbox":
+                if ftype == "toolbox":
                     print()
                     new_tb = _pick_toolbox(params[field])
                     if new_tb is not None:
                         params[field] = new_tb
-                elif ftype == "toggle":
-                    params[field] = not params[field]
-                    state = "on" if params[field] else "off"
-                    status(f"  {label}: {state}")
                 elif ftype == "paths":
                     cur = params[field] or []
                     display = " ".join(cur) if cur else "(none)"
@@ -3352,11 +3826,14 @@ def _check_hunk(filepath, hunk_header, hunk_lines, upstream_diff_text,
 def _get_editor():
     """Return the editor command to use for manual conflict resolution.
 
-    Priority: session value > --editor CLI > $VISUAL > $EDITOR > vim > vi
+    Priority: session > user config > $VISUAL > $EDITOR > vim > vi
     """
-    editor = _session.get("editor")
-    if editor and shutil.which(editor):
-        return editor
+    for candidate in (
+        _session.get("editor"),
+        get_config("editor") if _config_loaded else None,
+    ):
+        if candidate and shutil.which(candidate):
+            return candidate
     for env in ("VISUAL", "EDITOR"):
         val = os.environ.get(env)
         if val and shutil.which(val):
@@ -3600,58 +4077,61 @@ def _group_prereq_series(missing_list):
 
 _sdk_warned = False
 
-def _cursor_sdk_available():
-    """Return True if cursor-sdk is installed and CURSOR_API_KEY is set."""
+def _ai_provider_available(provider=None):
+    """Return True if the configured (or named) AI provider can be used."""
     global _sdk_warned
-    if not os.environ.get("CURSOR_API_KEY"):
+    ensure_user_config(_session)
+    provider = provider or get_config("ai_provider") or "cursor"
+
+    if provider not in AI_PROVIDERS:
         if not _sdk_warned:
             _sdk_warned = True
-            warn("  CURSOR_API_KEY not set. "
-                 "Falling back to simpler conflict notes.")
-        return False
-    try:
-        import cursor_sdk  # noqa: F401
-        return True
-    except ImportError:
-        if not _sdk_warned:
-            _sdk_warned = True
-            warn("  cursor-sdk not installed. "
-                 "Falling back to simpler conflict notes.")
+            warn(f"  AI provider '{provider}' is not supported yet. "
+                 f"Falling back to simpler conflict notes.")
         return False
 
+    if provider == "cursor":
+        if not _get_api_key("cursor"):
+            if not _sdk_warned:
+                _sdk_warned = True
+                env_name = get_config("ai_api_key_env") or "CURSOR_API_KEY"
+                warn(f"  {env_name} / API key file not set. "
+                     f"Falling back to simpler conflict notes.")
+            return False
+        try:
+            import cursor_sdk  # noqa: F401
+            return True
+        except ImportError:
+            if not _sdk_warned:
+                _sdk_warned = True
+                warn("  cursor-sdk not installed. "
+                     "Falling back to simpler conflict notes.")
+            return False
 
-# Opus for deep analysis (conflict explanation, prerequisite tracing)
-_OPUS_PREFERENCE = [
-    "claude-opus-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "default",
-]
+    return False
 
-# Sonnet for lighter tasks (build-fix)
-_SONNET_PREFERENCE = [
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4",
-    "claude-opus-4-6",
-    "default",
-]
+
+def _cursor_sdk_available():
+    """Compatibility wrapper: True when the Cursor AI provider is usable."""
+    return _ai_provider_available("cursor")
+
+
+# Built-in fallbacks if config lists are missing/empty
+_DEFAULT_ANALYSIS_MODELS = list(CONFIG_DEFAULTS["ai_model_analysis"])
+_DEFAULT_FIX_MODELS = list(CONFIG_DEFAULTS["ai_model_fix"])
 
 _cached_models = {}
 
 def _select_model(task="analysis"):
-    """Pick the best available model from the Cursor API.
+    """Pick the best available model from the configured preference list.
 
-    Queries Cursor.models.list() once and caches the result.
-    task='analysis' prefers Opus (deep reasoning for conflict analysis).
-    task='fix' prefers Sonnet (faster for build-fix iterations).
+    Queries Cursor.models.list() once per task and caches the result.
+    Preference lists come from user config (ai_model_analysis / ai_model_fix).
     """
     if task in _cached_models:
         return _cached_models[task]
 
-    api_key = os.environ.get("CURSOR_API_KEY", "")
+    api_key = _get_api_key()
     try:
         from cursor_sdk import Cursor
         available = {m.id for m in Cursor().models.list(api_key=api_key)}
@@ -3659,7 +4139,13 @@ def _select_model(task="analysis"):
         _cached_models[task] = "default"
         return "default"
 
-    prefs = _OPUS_PREFERENCE if task == "analysis" else _SONNET_PREFERENCE
+    if task == "analysis":
+        prefs = get_config("ai_model_analysis") or _DEFAULT_ANALYSIS_MODELS
+    else:
+        prefs = get_config("ai_model_fix") or _DEFAULT_FIX_MODELS
+    if isinstance(prefs, str):
+        prefs = [p.strip() for p in prefs.split(",") if p.strip()]
+
     for pref in prefs:
         if pref in available:
             _cached_models[task] = pref
@@ -3758,7 +4244,7 @@ Write the per-file lines now."""
         result = Agent.prompt(
             prompt,
             AgentOptions(
-                api_key=os.environ["CURSOR_API_KEY"],
+                api_key=_get_api_key(),
                 model=_select_model(task="analysis"),
                 local=LocalAgentOptions(cwd=os.getcwd()),
             ),
@@ -4430,7 +4916,7 @@ then run git add on the resolved files.
         result = Agent.prompt(
             prompt,
             AgentOptions(
-                api_key=os.environ["CURSOR_API_KEY"],
+                api_key=_get_api_key(),
                 model=_select_model(task="analysis"),
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
@@ -4960,7 +5446,7 @@ INSTRUCTIONS:
         result = Agent.prompt(
             prompt,
             AgentOptions(
-                api_key=os.environ["CURSOR_API_KEY"],
+                api_key=_get_api_key(),
                 model=_select_model(task="fix"),
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
@@ -6300,13 +6786,14 @@ def main():
     global _loop_base_commit
     _session = load_session(rhel_repo)
     _session_repo = rhel_repo
+    ensure_user_config(_session)
 
     if args.command == "status":
         show_status(rhel_repo)
         return
 
     if args.command == "new":
-        # Clear all persistent session data
+        # Clear all persistent session data (user config is kept)
         session_path = _session_path(rhel_repo)
         stamp_path = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
         removed = []
@@ -6340,6 +6827,18 @@ def main():
                 info(f"  {f}")
         else:
             info("No session data found.")
+        info(f"User config kept: {_USER_CONFIG_FILE}")
+        ans = input("  Edit Config before next run? [y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            # Minimal params dict so Config can sync preferences
+            show_config_menu({
+                "conflict_policy": get_config("conflict_policy"),
+                "build_policy": get_config("build_policy") or "conflict",
+                "editor": get_config("editor") or _get_editor(),
+                "ailog": bool(get_config("ailog")),
+                "signed_off_by": get_config("signed_off_by") or "",
+                "assisted_by": get_config("assisted_by") or "",
+            })
         status("Next invocation will start a fresh session.")
         return
 
@@ -6651,6 +7150,7 @@ def main():
         prompt_session()
 
     apply_session_to_args(args, _session)
+    apply_user_config_to_args(args)
 
     # Purge stale policy values that were removed.
     if args.conflict_policy not in (None, *CONFLICT_POLICIES):
@@ -6658,19 +7158,30 @@ def main():
              f"valid; resetting.")
         args.conflict_policy = None
         _session.pop("conflict_policy", None)
+        set_config("conflict_policy", None)
+        save_user_config()
         _save()
 
+    # Resolve auto defaults: user config → capability-based → edit
     if args.conflict_policy is None:
-        if _cursor_sdk_available():
+        cfg_pol = get_config("conflict_policy")
+        if cfg_pol in CONFLICT_POLICIES:
+            args.conflict_policy = cfg_pol
+        elif _ai_provider_available():
             args.conflict_policy = "ai"
         elif _has_display() and shutil.which("patchpal"):
             args.conflict_policy = "patchpal"
         else:
             args.conflict_policy = "edit"
     if args.build_policy is None:
-        args.build_policy = "conflict"
+        args.build_policy = get_config("build_policy") or "conflict"
     if args.ailog is None:
-        args.ailog = True
+        val = get_config("ailog")
+        args.ailog = True if val is None else bool(val)
+    # Keep session in sync for this run (config remains source of truth)
+    _session["conflict_policy"] = args.conflict_policy
+    _session["build_policy"] = args.build_policy
+    _session["ailog"] = args.ailog
     _save()
 
     if args.conflict_policy == "patchpal":

@@ -112,6 +112,16 @@ return,
 .B q
 quit).
 .PP
+Stable preferences (conflict/build policy, editor, ailog, AI provider,
+API key path/env, model preference lists) are edited in the Config menu
+.RB ( C )
+and stored in
+.I ~/.config/isb/config.json .
+The API key secret is never written to that file; Config can paste a key
+into
+.I ~/.config/isb/api-keys/cursor
+with mode 0600.
+.PP
 Phase\ 3 also inspects each commit's Kconfig diff for newly added
 .B config FOO
 options.
