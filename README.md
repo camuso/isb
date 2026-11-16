@@ -26,10 +26,17 @@ RHEL-compliant commit messages suitable for merge requests.
     is available but cursor-sdk is not)
   - `edit` : open conflicted files in your editor
   - `abort` : stop on any in-scope conflict
-- **Build testing** : runs `dist-configs` inside a toolbox container after
-  conflicts (configurable: after every conflict, after every commit, or never).
+- **Build testing** : after conflicts (or every commit / never — configurable),
+  prepares the host-arch `.config` + `modules_prepare` when needed, then
+  `make M=<subsystem>` in the toolbox. Failures are fail-closed so an
+  unprepared tree cannot silently “pass.” Kconfig changes use a fuller
+  mkmod-style validation.
 - **Tree-wide commit handling** : out-of-scope files touched by tree-wide
   commits are automatically excluded.
+- **Non-functional residual skip** : if conflict resolution leaves only
+  comment/whitespace edits while upstream had real code changes, the
+  commit is skipped (already present or unmergeable), not kept as a
+  comment-only backport.
 - **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
   for newly added `config FOO` options. If `redhat/configs` has no
   matching `CONFIG_FOO` snippet, the keep entry is annotated and
@@ -109,12 +116,31 @@ RHEL-compliant commit messages suitable for merge requests.
 - A RHEL or CentOS Stream kernel repository
 - An upstream Linux kernel repository
 - [toolbox](https://containertoolbx.org/) (required for build testing
-  if not building natively, e.g. host OS differs from RHEL target)
+  if not building natively, e.g. host OS differs from RHEL target).
+  See **Toolbox path rules** below.
 - [patchpal](https://github.com/camuso/patchpal) (optional, for GUI
   conflict resolution; requires X11/Wayland display)
 - [cursor-sdk](https://pypi.org/project/cursor-sdk/) + `CURSOR_API_KEY`
   (optional, for AI conflict explanation via `--ailog` and Cursor AI
   Rule conflict resolution via `--conflict-policy ai`)
+
+### Toolbox path rules
+
+Toolbox bind-mounts `$HOME` into the container. Host paths outside
+`$HOME` are reached via `/run/host<abspath>` (the host root mount).
+isb resolves the RHEL repo with `realpath` and syncs `PWD` to that
+path before every `toolbox run`, because toolbox follows `PWD`, not
+the process cwd.
+
+| Repo location (after realpath) | How isb runs builds |
+| --- | --- |
+| Under `$HOME` (including entry via a symlink such as `/work` → `~/work`) | `toolbox run` with cwd/`PWD` set to the realpath under `$HOME` |
+| Outside `$HOME` (e.g. `/data/...`) | `toolbox run` + `cd /run/host<realpath>` inside the container |
+
+Custom toolboxes without a `/run/host` mount, or paths the container
+cannot see, are not supported — bind-mount the tree explicitly or keep
+the repo under `$HOME`. Path/mount failures are treated as infrastructure
+errors (AI build-fix is skipped).
 
 ## Setting up the Cursor API Key
 
