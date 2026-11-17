@@ -109,12 +109,13 @@ Known upstream-only APIs flagged via
 Function names and change characterization
 (e.g.\& \fIadded return value capture in sev_init()\fR).
 .IP \(bu 2
-When in-scope conflicts were resolved by the Cursor AI Rule or
-patchpal, the stanza ends with
-.B Resolved\-by:\ isb
+When in-scope conflicts were resolved by automation, the stanza ends with
+.BR Resolved\-by:\ isb
+(Cursor AI Rule),
+.BR Resolved\-by:\ patchpal ,
 or
-.BR Resolved\-by:\ patchpal
-respectively.
+.BI Resolved\-by:\ <provider>
+for another configured AI.
 Manual editor resolutions omit this line.
 .RE
 .PP
@@ -152,6 +153,26 @@ Such omits are recorded in
 with
 .BR Omitted\-fix:
 in the MR description.
+Post\-conflict AI analysis ends with
+.B RECOMMENDATION: SKIP
+or
+.BR ACCEPT .
+A missing\-prerequisite / kept\-RHEL heuristic always wins over a
+mistaken AI ACCEPT.
+The review menu highlights
+.B SKIP RECOMMENDED
+and offers
+.B s
+to omit into
+.IR Omitted\-fixes .
+Conflicts resolved by automation end with
+.BR Resolved\-by:\ isb
+(Cursor AI Rule),
+.BR Resolved\-by:\ patchpal ,
+or
+.BI Resolved\-by:\ <provider>
+for another configured AI provider.
+Manual editor resolutions omit that line.
 .PP
 Stable preferences (conflict/build policy, editor, ailog, AI provider,
 API key path/env, model preference lists) are edited in the Config menu

@@ -4800,12 +4800,127 @@ def _select_model(task="analysis"):
     return "default"
 
 
+def _heuristic_skip_recommendation(analyses):
+    """Recommend SKIP when conflicts look already-present / unmergeable.
+
+    Returns (\"skip\", message) or (None, None).
+    """
+    if not analyses:
+        return None, None
+    missing = []
+    seen = set()
+    blocked = False
+    class_missing = 0
+    for a in analyses:
+        if a.get("likely_blocked"):
+            blocked = True
+        cls = (a.get("classification") or "").lower()
+        m = re.search(r"missing prerequisite \((\d+)", cls)
+        if m:
+            class_missing = max(class_missing, int(m.group(1)))
+        for h, s in a.get("missing_prereqs") or []:
+            if h and h not in seen:
+                seen.add(h)
+                missing.append((h, s))
+    n = max(len(missing), class_missing)
+    if not blocked and n < 3:
+        return None, None
+    msg = (
+        f"RECOMMENDATION: SKIP — {n} missing prerequisite(s); "
+        "upstream functional change is likely already present on RHEL "
+        "under other names/APIs, or cannot be merged without those "
+        "prerequisites. Prefer omit (Omitted-fixes) over accepting "
+        "comment-only / partial adaptations."
+    )
+    return "skip", msg
+
+
+def _ai_text_suggests_skip(ai_explanation):
+    """True when most AI per-file lines are kept-RHEL / dropped hunks."""
+    if not ai_explanation:
+        return False
+    lines = []
+    for ln in ai_explanation.splitlines():
+        s = ln.strip()
+        if not s or s.upper().startswith("RECOMMENDATION:"):
+            continue
+        if ":" not in s:
+            continue
+        # path: explanation
+        lines.append(s)
+    if len(lines) < 2:
+        return False
+    keep_drop = sum(
+        1 for l in lines
+        if re.search(r"\b(kept|dropped|already present|reject)\b", l, re.I)
+    )
+    return keep_drop >= max(2, (len(lines) + 1) // 2)
+
+
+def _parse_ai_recommendation(ai_explanation):
+    """Parse RECOMMENDATION: SKIP|ACCEPT from AI analysis text."""
+    if not ai_explanation:
+        return None, None
+    for ln in ai_explanation.splitlines():
+        s = ln.strip()
+        if not s.upper().startswith("RECOMMENDATION:"):
+            continue
+        rest = s.split(":", 1)[1].strip()
+        up = rest.upper()
+        if up.startswith("SKIP") or up.startswith("OMIT"):
+            return "skip", s
+        if up.startswith("ACCEPT") or up.startswith("KEEP"):
+            return "accept", s
+    return None, None
+
+
+def _skip_recommendation(analyses, ai_explanation=""):
+    """Recommend SKIP/ACCEPT for the conflict review menu.
+
+    Heuristic SKIP (many missing prereqs / kept-RHEL majority) always
+    wins over an AI ACCEPT — that was why a9b5-style commits were not
+    flagged.  AI SKIP reinforces with the AI's wording when present.
+    """
+    h_kind, h_msg = _heuristic_skip_recommendation(analyses)
+    ai_kind, ai_msg = _parse_ai_recommendation(ai_explanation)
+    text_skip = _ai_text_suggests_skip(ai_explanation)
+
+    if h_kind == "skip" or text_skip or ai_kind == "skip":
+        if ai_kind == "skip" and ai_msg:
+            return "skip", ai_msg
+        if h_kind == "skip":
+            return "skip", h_msg
+        return "skip", (
+            "RECOMMENDATION: SKIP — most conflict hunks kept RHEL or "
+            "dropped; functional upstream change appears already present "
+            "or unmergeable. Prefer omit (Omitted-fixes)."
+        )
+    if ai_kind == "accept":
+        return "accept", ai_msg
+    return None, None
+
+
+def _ensure_skip_recommendation_text(analyses, ai_explanation):
+    """Append a RECOMMENDATION: SKIP line when heuristic says so but AI did not."""
+    kind, msg = _skip_recommendation(analyses, ai_explanation)
+    if kind != "skip" or not msg:
+        return ai_explanation or ""
+    if _parse_ai_recommendation(ai_explanation)[0] == "skip":
+        return ai_explanation or ""
+    base = (ai_explanation or "").rstrip()
+    if base:
+        return base + "\n" + msg
+    return msg
+
+
 def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
     """Use the Cursor SDK to generate an AI explanation of conflict resolutions.
 
     Calls Claude with the diff, blame, and prerequisite data from each
     analysis dict and returns a concise explanation string suitable for
-    inclusion in the commit message Conflicts stanza.
+    inclusion in the commit message Conflicts stanza (per-file lines),
+    plus an optional final RECOMMENDATION: SKIP|ACCEPT line for the
+    review menu (not stored in the commit message).
 
     Returns:
         str: AI-generated explanation, or "" if the SDK call fails.
@@ -4851,15 +4966,15 @@ def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
         sections.append("\n".join(sec))
 
     prompt = f"""\
-You are writing the Conflicts stanza for a RHEL kernel backport commit message.
+You are advising on a RHEL kernel backport conflict resolution.
 DO NOT modify any files. Analysis and explanation only.
 
 Upstream commit: {commit_hash[:12]} {subject}
 
 The following files had conflicts when cherry-picking this upstream commit
-into the RHEL kernel branch.  Each conflict has been resolved (by patchpal
-or a human editor).  The diff shows how the resolved RHEL version differs
-from the upstream version.
+into the RHEL kernel branch.  Each conflict has been resolved (by AI,
+patchpal, or a human editor).  The diff shows how the resolved RHEL
+version differs from the upstream version.
 
 ANALYSIS METHOD:
 1. For each conflicted file, identify which functions contain the conflicts
@@ -4867,8 +4982,14 @@ ANALYSIS METHOD:
    whole-file blame — name the missing commit that owns each hunk
 3. For each conflict region, explain WHY the code diverges — name the
    missing commit that caused it (by short hash)
-4. Check lock/unlock correctness across all paths (normal, error, loop break)
-5. Check function name consistency with the RHEL tree
+4. Decide whether this commit is worth KEEPING:
+   - SKIP if most hunks were kept-as-RHEL / dropped because the functional
+     upstream change is already present under RHEL names/APIs, OR because
+     too many missing prerequisites make a faithful merge impossible
+     (comment renames or partial queue swaps alone are not enough to keep)
+   - ACCEPT only if meaningful upstream functional change was applied
+5. Check lock/unlock correctness across all paths (normal, error, loop break)
+6. Check function name consistency with the RHEL tree
 
 Write ONE LINE per file (or per function if a file has multiple distinct
 conflicts) in this exact format:
@@ -4881,9 +5002,18 @@ The explanation should tell a reviewer WHAT was done and WHY:
 - "fixed error-path unlock: rcu_read_unlock -> srcu_read_unlock (lock mismatch)"
 - "dropped hunk; already present via prior backport"
 
+Then end with EXACTLY one recommendation line:
+  RECOMMENDATION: SKIP — <one-sentence why omit is better>
+or
+  RECOMMENDATION: ACCEPT — <one-sentence why the backport is valuable>
+
+When SKIP: say clearly that hunks are already merged on RHEL and/or cannot
+be merged for want of prerequisites, and that skipping (Omitted-fixes) is
+recommended.
+
 Rules:
 - One line per file/function, no blank lines between them
-- No markdown, no bullet points, no numbering
+- No markdown, no bullet points, no numbering (except the RECOMMENDATION line)
 - Do NOT start with "File:" — just the bare path followed by colon
 - Be specific: name functions, variables, lock types, commit hashes
 - Max ~100 chars per line; wrap to indented continuation if needed
@@ -4893,7 +5023,7 @@ Rules:
 {chr(10).join(f"{chr(10)}{'-' * 40}{chr(10)}{s}" for s in sections)}
 {"=" * 60}
 
-Write the per-file lines now."""
+Write the per-file lines, then the RECOMMENDATION line."""
 
     try:
         from cursor_sdk import LocalAgentOptions
@@ -4914,7 +5044,7 @@ Write the per-file lines now."""
 
 
 def _write_resolution_report(output_dir, commit_hash, subject, analyses,
-                             ai_explanation=""):
+                             ai_explanation="", resolved_by=None):
     """Write a detailed conflict resolution report file.
 
     Args:
@@ -4923,6 +5053,7 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
         subject: upstream commit subject line
         analyses: list of dicts from _analyze_conflict()
         ai_explanation: optional AI-generated explanation string
+        resolved_by: optional Conflicts stanza Resolved-by value
 
     Returns the path to the written report file.
     """
@@ -4936,7 +5067,10 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
         fh.write(f"{'=' * 70}\n\n")
         fh.write(f"Upstream commit: {commit_hash[:12]} {subject}\n")
         fh.write(f"Date:            {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        fh.write(f"Files with conflicts: {len(analyses)}\n\n")
+        fh.write(f"Files with conflicts: {len(analyses)}\n")
+        if resolved_by:
+            fh.write(f"Resolved-by:     {resolved_by}\n")
+        fh.write("\n")
 
         all_missing = []
         for a in analyses:
@@ -5022,6 +5156,17 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
                 fh.write("\n")
             fh.write("\n")
 
+        kind, rec_msg = _skip_recommendation(analyses, ai_explanation)
+        if kind == "skip":
+            fh.write(f"{'=' * 70}\n")
+            fh.write(f"SKIP RECOMMENDED\n")
+            fh.write(f"{'─' * 70}\n")
+            fh.write(f"{rec_msg}\n")
+            fh.write(
+                "Prefer omitting this commit (Omitted-fixes) over "
+                "accepting comment-only or partial adaptations.\n\n"
+            )
+
         # Summary section at the end
         if all_missing:
             seen = set()
@@ -5047,7 +5192,7 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
 
 
 def _show_review_menu(commit_hash, subject, analyses, report_path,
-                      ai_explanation=""):
+                      ai_explanation="", resolved_by=None):
     """Display post-conflict review and present A/B/C menu.
 
     Shows:
@@ -5056,6 +5201,8 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
       - Compact diff summary (hunk counts)
       - Missing prerequisites warning if any
       - AI explanation if available
+      - SKIP recommendation when already-present / unmergeable
+      - Resolved-by trailer that will appear in the Conflicts stanza
 
     Returns:
       "accept"  -- user accepted the resolution
@@ -5064,10 +5211,14 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
       "menu"    -- user aborted, return to interactive menu
       "exit"    -- user aborted, exit isb
     """
+    rec_kind, rec_msg = _skip_recommendation(analyses, ai_explanation)
+
     while True:
         print(f"\n{CAU}{'=' * 70}{OFF}")
         print(f"  {BLD}Conflict Review: {commit_hash[:12]} {subject}{OFF}")
         print(f"  {'─' * 66}")
+        if resolved_by:
+            print(f"  {STA}Resolved-by: {resolved_by}{OFF}")
 
         all_missing = []
         total_unchecked = 0
@@ -5124,11 +5275,39 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         if ai_explanation:
             print(f"\n  {BLD}AI Analysis:{OFF}")
             for ln in ai_explanation.splitlines():
+                s = ln.strip()
+                if s.upper().startswith("RECOMMENDATION:"):
+                    continue  # shown prominently below
                 print(f"    {DIM}{ln}{OFF}")
+
+        if rec_kind == "skip":
+            print(f"\n  {WRN}{'!' * 66}{OFF}")
+            print(f"  {WRN}SKIP RECOMMENDED{OFF}")
+            body = rec_msg or ""
+            if body.upper().startswith("RECOMMENDATION:"):
+                body = body.split(":", 1)[1].strip()
+            for wl in textwrap.wrap(body, width=66):
+                print(f"  {WRN}{wl}{OFF}")
+            print(f"  {WRN}Prefer omit (Omitted-fixes) over accepting "
+                  f"this resolution.{OFF}")
+            print(f"  {WRN}{'!' * 66}{OFF}")
+        elif rec_kind == "accept" and rec_msg:
+            print(f"\n  {STA}AI recommendation: ACCEPT{OFF}")
+            body = rec_msg
+            if body.upper().startswith("RECOMMENDATION:"):
+                body = body.split(":", 1)[1].strip()
+            for wl in textwrap.wrap(body, width=66):
+                print(f"    {DIM}{wl}{OFF}")
 
         print(f"\n  Report: {INF}{report_path}{OFF}")
         print(f"  {'─' * 66}")
-        print(f"  {MNU}1{OFF}  Accept and continue")
+        if rec_kind == "skip":
+            print(f"  {MNU}s{OFF}  Skip / omit this commit  "
+                  f"{WRN}(recommended){OFF}")
+            print(f"  {MNU}1{OFF}  Accept anyway and continue")
+        else:
+            print(f"  {MNU}1{OFF}  Accept and continue")
+            print(f"  {MNU}s{OFF}  Skip / omit this commit")
         print(f"  {MNU}2{OFF}  Re-do resolution (reopen in editor/patchpal)")
         print(f"  {MNU}3{OFF}  Abort this cherry-pick")
         print(f"  {MNU}v{OFF}  View conflict report")
@@ -5137,6 +5316,8 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         ch = _getch()
         print(ch)
 
+        if ch in ('s', 'S'):
+            return "skip"
         if ch == '1':
             return "accept"
         elif ch == '2':
@@ -6711,25 +6892,44 @@ def _consolidate_conflict_notes(notes):
     return other_notes
 
 
-def _infer_resolved_by(conflict_notes, conflict_policy, inscope_conflicted):
-    """Return 'isb', 'patchpal', or None for the Conflicts stanza trailer.
+def _resolved_by_for_ai_provider(provider=None):
+    """Map configured AI provider to a Resolved-by trailer value.
 
-    Only set when an automated resolver handled in-scope conflicts.
-    Manual editor resolutions do not get a Resolved-by line.
+    The isb Cursor AI Rule agent is always recorded as ``isb``.
+    Other providers use their config name (future multi-provider support).
     """
-    if not conflict_notes or not inscope_conflicted:
-        return None
-    text = "\n".join(conflict_notes)
-    # Prefer evidence from per-file notes (survives policy fallbacks)
-    if "Cursor AI Rule" in text:
+    provider = (provider or get_config("ai_provider") or "cursor").strip().lower()
+    if provider in ("cursor", "isb", ""):
         return "isb"
-    if re.search(r":\s*patchpal\b", text):
-        return "patchpal"
+    return provider
+
+
+def _infer_resolved_by(conflict_notes, conflict_policy, inscope_conflicted):
+    """Return Resolved-by trailer value, or None for manual editor.
+
+    - patchpal → ``patchpal``
+    - Cursor AI Rule / isb agent → ``isb``
+    - other AI provider → that provider's name
+    - manual editor → None (no Resolved-by line)
+
+    Policy and note evidence are both considered.  ``conflict_notes`` may
+    be empty or rewritten by --ailog; ``inscope_conflicted`` non-empty
+    plus ai/patchpal policy is enough.
+    """
+    if not inscope_conflicted:
+        return None
+    text = "\n".join(conflict_notes or [])
     # Editor fallback from AI/patchpal — no Resolved-by
     if re.search(r":\s*editor\b", text):
         return None
+    # Prefer evidence from per-file notes (survives policy fallbacks)
+    if "Cursor AI Rule" in text:
+        return _resolved_by_for_ai_provider()
+    if re.search(r":\s*patchpal\b", text):
+        return "patchpal"
+    # Policy alone is enough — ailog may have replaced the per-file notes
     if conflict_policy == "ai":
-        return "isb"
+        return _resolved_by_for_ai_provider()
     if conflict_policy == "patchpal":
         return "patchpal"
     return None
@@ -6763,8 +6963,8 @@ def format_gort_message(subject, commit_hash, upstream_repo,
     lines.append(f"JIRA: {jira}")
     lines.append(f"Upstream status: {upstream_version}")
 
-    if conflict_notes:
-        consolidated = _consolidate_conflict_notes(conflict_notes)
+    if conflict_notes or resolved_by:
+        consolidated = _consolidate_conflict_notes(conflict_notes or [])
         lines.append("")
         lines.append("Conflicts:")
         for note in consolidated:
@@ -6795,7 +6995,9 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                                             break_long_words=False,
                                             break_on_hyphens=False):
                         lines.append(f"    {wl}")
-        if resolved_by in ("isb", "patchpal"):
+        # Always last line of the Conflicts stanza when an automated
+        # resolver handled in-scope conflicts (isb / patchpal / provider).
+        if resolved_by:
             lines.append(f"Resolved-by: {resolved_by}")
 
     lines.append("")
@@ -6852,11 +7054,15 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     oos_conflict_count = 0
     inscope_conflicted = []
     resolved_by = None
+    # Engine that actually resolved in-scope markers (survives ailog rewrite
+    # and note replacement).  Updated on each resolve attempt.
+    resolver_engine = None
 
     _redo_resolution = True
     while _redo_resolution:
         _redo_resolution = False
         resolved_by = None
+        resolver_engine = None
 
         if had_conflict:
             if conflict_policy in ("patchpal", "edit", "ai"):
@@ -6887,7 +7093,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 _cherrypick_repo = None
                 _cleanup_and_exit()
 
-            # Capture before --ailog may rewrite per-file notes
+            # Remember the engine before --ailog rewrites per-file notes
+            if inscope_conflicted and conflict_policy in ("ai", "patchpal"):
+                resolver_engine = conflict_policy
             resolved_by = _infer_resolved_by(
                 conflict_notes, conflict_policy, inscope_conflicted)
 
@@ -7004,31 +7212,58 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     ai_explanation = _ai_explain_conflicts(
                         analyses, commit_hash, subject, upstream_repo,
                     )
+                # Always surface SKIP when heuristic says so, even if AI
+                # omitted RECOMMENDATION or wrongly said ACCEPT.
+                ai_explanation = _ensure_skip_recommendation_text(
+                    analyses, ai_explanation,
+                )
                 if ai_explanation:
                     # Replace generic per-file notes with AI versions
+                    # (exclude RECOMMENDATION: — review-menu only).
                     ai_files = set()
                     ai_lines = []
                     for ai_line in ai_explanation.splitlines():
                         ai_line = ai_line.strip()
-                        if ai_line:
-                            ai_lines.append(ai_line)
-                            if ":" in ai_line:
-                                ai_files.add(
-                                    ai_line.split(":", 1)[0].strip())
+                        if not ai_line:
+                            continue
+                        if ai_line.upper().startswith("RECOMMENDATION:"):
+                            continue
+                        ai_lines.append(ai_line)
+                        if ":" in ai_line:
+                            ai_files.add(
+                                ai_line.split(":", 1)[0].strip())
                     conflict_notes = [
                         n for n in conflict_notes
                         if not any(n.startswith(f"{f}:") for f in ai_files)
                     ]
                     conflict_notes.extend(ai_lines)
+            else:
+                # No ailog — still attach heuristic SKIP for the menu/report
+                ai_explanation = _ensure_skip_recommendation_text(
+                    analyses, "",
+                )
+
+            # Ensure Resolved-by is known before review (ailog may have
+            # replaced "Cursor AI Rule" note text already).
+            if not resolved_by and inscope_conflicted:
+                engine = resolver_engine or conflict_policy
+                resolved_by = _infer_resolved_by(
+                    conflict_notes, engine, inscope_conflicted)
+            if not resolved_by and resolver_engine == "ai":
+                resolved_by = _resolved_by_for_ai_provider()
+            if not resolved_by and resolver_engine == "patchpal":
+                resolved_by = "patchpal"
 
             report_path = _write_resolution_report(
                 output_dir, commit_hash, subject, analyses,
                 ai_explanation=ai_explanation,
+                resolved_by=resolved_by,
             )
 
             decision = _show_review_menu(
                 commit_hash, subject, analyses, report_path,
                 ai_explanation=ai_explanation,
+                resolved_by=resolved_by,
             )
 
             if decision == "redo":
@@ -7333,6 +7568,17 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         warn("  Spurious blank-line deletion(s) detected:")
         for filepath, desc in spurious:
             warn(f"    {filepath}: {desc}")
+
+    # Re-assert Resolved-by right before commit — ailog may have replaced
+    # the "Cursor AI Rule" / patchpal note text used at first infer.
+    if not resolved_by and inscope_conflicted:
+        engine = resolver_engine or conflict_policy
+        resolved_by = _infer_resolved_by(
+            conflict_notes, engine, inscope_conflicted)
+    if not resolved_by and inscope_conflicted and resolver_engine == "ai":
+        resolved_by = _resolved_by_for_ai_provider()
+    if not resolved_by and inscope_conflicted and resolver_engine == "patchpal":
+        resolved_by = "patchpal"
 
     msg = format_gort_message(
         subject, commit_hash, upstream_repo,
