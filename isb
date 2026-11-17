@@ -3869,14 +3869,41 @@ def _classify_diff_lines(diff_lines):
     return {"functional": functional, "nonfunctional": nonfunctional}
 
 
-def _classify_staged_diff(rhel_repo, scope_paths=None):
-    """Classify staged +/- lines (optionally limited to scope prefixes)."""
+def _upstream_commit_files(commit_hash, upstream_repo, scope_paths=None,
+                           exclude_paths=None):
+    """Files touched by *commit_hash*, optionally limited to scope."""
+    r = git(f"diff-tree --no-commit-id --name-only -r {commit_hash}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0:
+        return []
+    files = [f for f in r.stdout.splitlines() if f]
+    if scope_paths:
+        prefixes = tuple(p.rstrip("/") for p in scope_paths)
+        files = [f for f in files if f.startswith(prefixes)]
+    if exclude_paths:
+        excl = tuple(e.rstrip("/") for e in exclude_paths)
+        files = [f for f in files
+                 if not any(f.startswith(e) for e in excl)]
+    return files
+
+
+def _classify_staged_diff(rhel_repo, scope_paths=None, files=None):
+    """Classify staged +/- lines.
+
+    *files*: if set, only those paths (exact) are classified — used to
+    ignore AI/manual build-fix edits outside the upstream commit.
+    Otherwise *scope_paths* prefix-filters staged names.
+    """
     r = git("diff --cached", cwd=rhel_repo, check=False)
     if r.returncode != 0 or not r.stdout.strip():
         return {"functional": 0, "nonfunctional": 0}
     lines = extract_strict_lines(r.stdout)
-    if scope_paths:
-        # Re-filter via per-file extraction for scope
+    if files is not None:
+        scoped = []
+        for f in files:
+            scoped.extend(extract_strict_lines(r.stdout, f))
+        lines = scoped
+    elif scope_paths:
         scoped = []
         prefixes = tuple(p.rstrip("/") for p in scope_paths)
         names = git("diff --cached --name-only", cwd=rhel_repo,
@@ -3910,28 +3937,73 @@ def _classify_upstream_diff(commit_hash, upstream_repo, scope_paths=None):
     return _classify_diff_lines(scoped)
 
 
-def _nonfunctional_skip_notes(conflict_notes, had_conflict, upstream_cls):
-    """Build omit/Conflicts-style notes when only comments remain staged."""
-    notes = [
-        "no functional in-scope changes remain "
-        "(comment/whitespace only)",
-    ]
-    if had_conflict or upstream_cls.get("functional", 0) > 0:
+def _nonfunctional_skip_notes(conflict_notes, had_conflict, upstream_cls,
+                              staged_cls=None):
+    """Build omit notes when a commit is inapplicable after apply.
+
+    notes[0] is the Omitted-fixes reason line.
+    """
+    uf = upstream_cls.get("functional", 0) if upstream_cls else 0
+    nf = (staged_cls or {}).get("nonfunctional", 0)
+    if nf > 0:
+        primary = (
+            "already present on RHEL or unmergeable "
+            f"(only {nf} comment/whitespace residual(s); "
+            f"upstream had {uf} functional line(s))"
+        )
+    else:
+        primary = (
+            "already present on RHEL or unmergeable "
+            f"(no functional changes remain; "
+            f"upstream had {uf} functional line(s))"
+        )
+    notes = [primary]
+    if had_conflict or uf > 0:
         notes.append(
             "functional upstream hunks were already present on RHEL "
             "or unmergeable due to omitted prerequisites / divergence"
         )
-    # Keep a short digest of prior resolution notes for the omit log
-    for n in conflict_notes:
+    for n in conflict_notes or []:
         n = (n or "").strip()
         if not n:
             continue
-        if n.startswith("no functional"):
+        if n.startswith("already present") or n.startswith("no functional"):
             continue
         if len(notes) >= 5:
             break
         notes.append(n)
     return notes
+
+
+def _inapplicable_after_apply(rhel_repo, commit_hash, upstream_repo,
+                              scope_paths, had_conflict, conflict_notes,
+                              exclude_paths=None):
+    """Detect commits like a9b5: upstream functional change did not land.
+
+    Only staged hunks in files the *upstream* commit touches are counted.
+    Build-fix edits to other files (e.g. unrelated .probe_new) do not
+    keep an inapplicable commit alive.
+
+    Returns (skip_notes, staged_cls, upstream_cls) or (None, ..., ...).
+    """
+    up_files = _upstream_commit_files(
+        commit_hash, upstream_repo, scope_paths, exclude_paths,
+    )
+    staged_cls = _classify_staged_diff(
+        rhel_repo, files=up_files if up_files else None,
+        scope_paths=None if up_files else scope_paths,
+    )
+    upstream_cls = _classify_upstream_diff(
+        commit_hash, upstream_repo, scope_paths,
+    )
+    if staged_cls["functional"] != 0:
+        return None, staged_cls, upstream_cls
+    if not (had_conflict or upstream_cls["functional"] > 0):
+        return None, staged_cls, upstream_cls
+    notes = _nonfunctional_skip_notes(
+        conflict_notes, had_conflict, upstream_cls, staged_cls,
+    )
+    return notes, staged_cls, upstream_cls
 
 
 def classify_file_conflict(filepath, commit_hash, rhel_repo, upstream_repo):
@@ -6991,7 +7063,32 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 _cherrypick_repo = None
                 _cleanup_and_exit()
 
-            # "accept" falls through to build
+            # "accept" falls through to inapplicable check / build
+
+    # Omit before build when the upstream commit's functional change did
+    # not land (already on RHEL under other names, or unmergeable).  Count
+    # only files the upstream commit touches so unrelated AI/build-fix
+    # edits cannot keep a no-op backport alive (a9b5-style).
+    skip_notes, _staged_cls, _up_cls = _inapplicable_after_apply(
+        rhel_repo, commit_hash, upstream_repo, scope_paths,
+        had_conflict, conflict_notes,
+        exclude_paths=exclude_paths,
+    )
+    if skip_notes:
+        nf = _staged_cls["nonfunctional"]
+        uf = _up_cls["functional"]
+        if nf == 0:
+            warn(f"  Inapplicable {commit_hash[:12]}: no functional "
+                 f"changes remain in upstream-touched files "
+                 f"(upstream had {uf} functional line(s)).")
+        else:
+            warn(f"  Inapplicable {commit_hash[:12]}: only {nf} "
+                 f"comment/whitespace residual(s) in upstream-touched "
+                 f"files (upstream had {uf} functional line(s)).")
+        warn("  Omitting — already present on RHEL or unmergeable.")
+        git("reset --hard HEAD", cwd=rhel_repo, check=False)
+        _cherrypick_repo = None
+        return "skip", skip_notes
 
     # New Kconfig options / redhat/configs snippets — handle before build
     # so a config change can force an mkmod-style validation.
@@ -7214,34 +7311,19 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                             cwd=rhel_repo, check=False)
                         return False, conflict_notes
 
-    # If conflict resolution (or scoping) left only comment/whitespace
-    # edits while upstream had real code changes, skip rather than
-    # shipping a no-op "Convert …" commit that only updates comments.
-    staged_cls = _classify_staged_diff(rhel_repo, scope_paths)
-    if staged_cls["functional"] == 0:
-        upstream_cls = _classify_upstream_diff(
-            commit_hash, upstream_repo, scope_paths,
-        )
-        if had_conflict or upstream_cls["functional"] > 0:
-            skip_notes = _nonfunctional_skip_notes(
-                conflict_notes, had_conflict, upstream_cls,
-            )
-            nf = staged_cls["nonfunctional"]
-            uf = upstream_cls["functional"]
-            if nf == 0:
-                warn(f"  No in-scope staged changes remain for "
-                     f"{commit_hash[:12]} "
-                     f"(upstream had {uf} functional line(s)).")
-            else:
-                warn(f"  Only non-functional changes remain for "
-                     f"{commit_hash[:12]} "
-                     f"({nf} comment/whitespace line(s); "
-                     f"upstream had {uf} functional line(s)).")
-            warn("  Skipping — functional hunks already present or "
-                 "unmergeable.")
-            git("reset --hard HEAD", cwd=rhel_repo, check=False)
-            _cherrypick_repo = None
-            return "skip", skip_notes
+    # Re-check after build/AI fix: unrelated edits outside the upstream
+    # file list still must not rescue an inapplicable commit.
+    skip_notes, _staged_cls, _up_cls = _inapplicable_after_apply(
+        rhel_repo, commit_hash, upstream_repo, scope_paths,
+        had_conflict, conflict_notes,
+        exclude_paths=exclude_paths,
+    )
+    if skip_notes:
+        warn(f"  Inapplicable {commit_hash[:12]} after build/fix — "
+             f"omitting (already present or unmergeable).")
+        git("reset --hard HEAD", cwd=rhel_repo, check=False)
+        _cherrypick_repo = None
+        return "skip", skip_notes
 
     # Check for spurious blank-line hunks before commit
     spurious = detect_spurious_hunks(
@@ -8958,7 +9040,8 @@ def main():
 
             # Quick duplicate check: skip if already backported
             if h in _applied_hashes:
-                warn(f"  Already applied — skipping.")
+                warn(f"  Already applied — omitting.")
+                omit.append((h, subj, "already applied on this branch"))
                 _save_progress(output_dir, idx + 1, base_commit, rhel_repo)
                 continue
 
@@ -8980,9 +9063,10 @@ def main():
                     reason = "skipped by user"
                     _record_user_skip(output_dir, h)
                 elif notes:
+                    # notes[0] is the Omitted-fixes reason; keep it intact
                     reason = notes[0]
-                    if len(reason) > 140:
-                        reason = reason[:137] + "..."
+                    if len(reason) > 200:
+                        reason = reason[:197] + "..."
                 else:
                     reason = "skipped (no in-scope changes)"
                 omit.append((h, subj, reason))

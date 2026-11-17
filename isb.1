@@ -141,6 +141,17 @@ Out\-of\-scope dependents are added to OMIT (and later
 in the MR description) so tools like patchreview treat them as
 intentionally omitted.
 In\-scope dependents missing from Phase\ 2 are added to KEEP.
+After each cherry\-pick (and again after build),
+.B isb
+omits commits whose upstream\-touched files retain no functional
+staged changes while upstream had functional hunks
+(already present on RHEL or unmergeable).
+Unrelated build\-fix edits outside those files do not keep the commit.
+Such omits are recorded in
+.I Omitted\-fixes
+with
+.BR Omitted\-fix:
+in the MR description.
 .PP
 Stable preferences (conflict/build policy, editor, ailog, AI provider,
 API key path/env, model preference lists) are edited in the Config menu

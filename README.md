@@ -42,6 +42,11 @@ RHEL-compliant commit messages suitable for merge requests.
   Out-of-scope dependents go into `Omitted-fixes` / `Omitted-fix:` in
   the MR description so they are not reported as missing. In-scope
   dependents that Phase 2 missed are added to KEEP.
+- **Inapplicable omit** : after apply/resolve (and again after build),
+  if upstream-touched files have no functional staged changes while the
+  upstream commit did, isb omits the commit to `Omitted-fixes` as
+  already present on RHEL or unmergeable. Unrelated AI/build-fix edits
+  outside those files do not keep the commit.
 - **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
   for newly added `config FOO` options. If `redhat/configs` has no
   matching `CONFIG_FOO` snippet, the keep entry is annotated and
