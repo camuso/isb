@@ -3076,6 +3076,130 @@ def list_pending_commits(upstream_repo, divergence, scope_paths, rhel_repo,
     info(f"After filtering already-downstream: {len(pending)} pending commits")
     return pending
 
+
+def _commit_in_scope_files(commit_hash, upstream_repo, scope_paths,
+                           exclude_paths=None):
+    """Return in-scope paths touched by *commit_hash*, else []."""
+    r = git(f"diff-tree --no-commit-id --name-only -r {commit_hash}",
+            cwd=upstream_repo, check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    prefixes = tuple(p.rstrip("/") for p in scope_paths)
+    excl = tuple(e.rstrip("/") for e in (exclude_paths or ()))
+    hits = []
+    for f in r.stdout.splitlines():
+        if not f:
+            continue
+        if excl and f.startswith(excl):
+            continue
+        if f.startswith(prefixes):
+            hits.append(f)
+    return hits
+
+
+def _rhel_references_commit(rhel_repo, commit_hash):
+    """True if RHEL history references *commit_hash* (full or 12-char)."""
+    for needle in (commit_hash, commit_hash[:12]):
+        r = git(f"log --format=%H --extended-regexp "
+                f"--grep='(^|\\s)commit\\s+{needle}' -1",
+                cwd=rhel_repo, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+        r = git(f"log --format=%H --grep='cherry picked from commit "
+                f"{needle}' -1",
+                cwd=rhel_repo, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    return False
+
+
+def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
+                        exclude_paths=None):
+    """Find Fixes: dependents of KEEP commits (patchreview-style).
+
+    Out-of-scope fixes are added to *omit* (for Omitted-fixes /
+    ``Omitted-fix:`` in the MR description) so patchreview treats them
+    as intentionally omitted rather than missing.
+
+    In-scope fixes that Phase 2 somehow missed are appended to *keep*.
+
+    Returns updated (keep, omit).
+    """
+    if not keep:
+        return keep, omit
+
+    known = {h for h, _, _ in keep} | {h for h, _, _ in omit}
+    added_omit = []
+    added_keep = []
+
+    scope_label = ", ".join(scope_paths) if scope_paths else "(all)"
+    with Spinner("Seeking Fixes: for KEEP commits ..."):
+        for h, subj, _reason in list(keep):
+            meta = git(f"log -1 --format='%h|%ad' --date=short {h}",
+                       cwd=upstream_repo, check=False)
+            if meta.returncode != 0 or "|" not in meta.stdout:
+                continue
+            short, date = meta.stdout.strip().split("|", 1)
+            # Prefer 12-char (common Fixes: form) and %h
+            greps = []
+            for prefix in dict.fromkeys(
+                    [h[:12], short, h[:10], h[:8]]):
+                if len(prefix) >= 8:
+                    greps.append(prefix)
+            fix_hashes = []
+            for prefix in greps:
+                r = git(
+                    f"log --no-merges --since={date} "
+                    f"--grep='Fixes: {prefix}' --format='%H'",
+                    cwd=upstream_repo, check=False,
+                )
+                if r.returncode != 0:
+                    continue
+                for fh in r.stdout.splitlines():
+                    if fh and fh not in fix_hashes:
+                        fix_hashes.append(fh)
+            for fh in fix_hashes:
+                if fh in known or fh == h:
+                    continue
+                if _rhel_references_commit(rhel_repo, fh):
+                    known.add(fh)
+                    continue
+                sr = git(f"log -1 --format=%s {fh}",
+                         cwd=upstream_repo, check=False)
+                fsubj = (sr.stdout.strip() if sr.returncode == 0
+                         else "(subject unavailable)")
+                in_scope = _commit_in_scope_files(
+                    fh, upstream_repo, scope_paths, exclude_paths,
+                )
+                if in_scope:
+                    entry = (fh, fsubj,
+                             f"Fixes: {h[:12]} ({subj})")
+                    added_keep.append(entry)
+                    keep.append(entry)
+                else:
+                    entry = (
+                        fh, fsubj,
+                        f"Fixes: {h[:12]}; out of scope "
+                        f"(does not touch {scope_label})",
+                    )
+                    added_omit.append(entry)
+                    omit.append(entry)
+                known.add(fh)
+
+    if added_omit or added_keep:
+        info(f"Fixes: seek — "
+             f"{len(added_omit)} out-of-scope omitted, "
+             f"{len(added_keep)} in-scope added to KEEP")
+        for fh, fsubj, reason in added_omit:
+            info(f"  OMIT {fh[:12]} {fsubj}")
+            info(f"       {reason}")
+        for fh, fsubj, reason in added_keep:
+            info(f"  KEEP {fh[:12]} {fsubj}")
+            info(f"       {reason}")
+    else:
+        info("Fixes: seek — no additional dependents")
+    return keep, omit
+
 # ---------------------------------------------------------------------------
 # Phase 3: CONFIG classification
 # ---------------------------------------------------------------------------
@@ -4020,11 +4144,293 @@ def _get_editor():
     return "vi"
 
 
-def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
-    """Deep analysis of a conflicted file using git blame.
+# Conflict / prerequisite analysis limits (documented in README + man).
+BLAME_LINE_CAP = 50          # legacy post-resolve file blame (fallback)
+HUNK_PREREQ_COMMIT_CAP = 30  # max distinct hunk-first commits to check
 
-    Identifies upstream prerequisite commits that introduced the conflicting
-    code and checks whether they are present in RHEL.
+
+def _parse_conflict_hunks(filepath):
+    """Parse <<<<<<< / ======= / >>>>>>> regions from a conflicted file.
+
+    Returns a list of dicts:
+      {
+        "index": int,          # 1-based hunk number in file
+        "start": int,          # 0-based start line of <<<<<<<
+        "end": int,            # 0-based end line of >>>>>>>
+        "ours": [str, ...],    # lines between <<<<<<< and =======
+        "theirs": [str, ...],  # lines between ======= and >>>>>>>
+      }
+    """
+    try:
+        with open(filepath) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+
+    hunks = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("<<<<<<<"):
+            i += 1
+            continue
+        start = i
+        i += 1
+        ours = []
+        while i < len(lines) and not lines[i].startswith("======="):
+            ours.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            break
+        i += 1  # skip =======
+        theirs = []
+        while i < len(lines) and not lines[i].startswith(">>>>>>>"):
+            theirs.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            break
+        end = i
+        hunks.append({
+            "index": len(hunks) + 1,
+            "start": start,
+            "end": end,
+            "ours": ours,
+            "theirs": theirs,
+        })
+        i += 1
+    return hunks
+
+
+def _normalize_conflict_line(line):
+    """Strip for matching conflict lines against upstream file content."""
+    return line.rstrip("\n").rstrip()
+
+
+def _rhel_references_hashes(rhel_repo, hashes):
+    """Return the subset of *hashes* found in RHEL commit message bodies."""
+    if not hashes:
+        return set()
+    body_r = git("log --format=%B --no-merges", cwd=rhel_repo, check=False)
+    body = body_r.stdout if body_r.returncode == 0 else ""
+    return {h for h in hashes if h in body}
+
+
+def _subjects_for_hashes(upstream_repo, hashes):
+    """Batch-resolve subjects for full hashes. Missing → placeholder."""
+    hash_subjects = {h: "(subject unavailable)" for h in hashes}
+    if not hashes:
+        return hash_subjects
+    sep = "---8<---"
+    nw = git(f"log --no-walk --format='%H{sep}%s' " + " ".join(hashes),
+             cwd=upstream_repo, check=False)
+    if nw.returncode == 0:
+        for line in nw.stdout.strip().split("\n"):
+            if sep in line:
+                h_part, s_part = line.split(sep, 1)
+                hash_subjects[h_part.strip()] = s_part.strip()
+    return hash_subjects
+
+
+def _hunk_first_prereqs(cf, hunks, commit_hash, upstream_repo, rhel_repo):
+    """Find missing prerequisites from conflict hunks (not whole-file blame).
+
+    For each hunk, map unique non-empty ``theirs`` lines onto the upstream
+    parent file and blame those lines.  Commits are ranked by how many
+    conflict lines they own.  Only hashes not referenced in RHEL history
+    are reported as missing.
+
+    Returns dict with missing_prereqs, present_prereqs, unchecked_prereqs,
+    hunk_summaries, likely_blocked, total_theirs_lines.
+    """
+    empty = {
+        "missing_prereqs": [],
+        "present_prereqs": [],
+        "unchecked_prereqs": 0,
+        "hunk_summaries": [],
+        "likely_blocked": False,
+        "total_theirs_lines": 0,
+        "commit_line_counts": {},
+    }
+    if not hunks or not commit_hash or not upstream_repo:
+        return empty
+
+    parent = f"{commit_hash}~1"
+    us_r = git(f"show {parent}:{cf}", cwd=upstream_repo, check=False)
+    if us_r.returncode != 0:
+        return empty
+    parent_lines = us_r.stdout.splitlines()
+
+    # line text -> list of 1-based line numbers in parent file
+    index = {}
+    for ln, text in enumerate(parent_lines, 1):
+        key = _normalize_conflict_line(text)
+        if key.strip():
+            index.setdefault(key, []).append(ln)
+
+    commit_counts = {}   # hash -> number of theirs lines attributed
+    hunk_summaries = []
+    total_theirs = 0
+
+    for hunk in hunks:
+        theirs_keys = [
+            _normalize_conflict_line(l)
+            for l in hunk["theirs"]
+            if _normalize_conflict_line(l).strip()
+        ]
+        total_theirs += len(theirs_keys)
+        blame_lines = set()
+        for key in theirs_keys:
+            for ln in index.get(key, [])[:3]:  # few matches per text
+                blame_lines.add(ln)
+        # Cap per-hunk blame volume
+        sorted_bl = sorted(blame_lines)[:BLAME_LINE_CAP]
+        hunk_commits = {}
+        if sorted_bl:
+            ranges = []
+            rng_start = rng_end = sorted_bl[0]
+            for ln in sorted_bl[1:]:
+                if ln == rng_end + 1:
+                    rng_end = ln
+                else:
+                    ranges.append((rng_start, rng_end))
+                    rng_start = rng_end = ln
+            ranges.append((rng_start, rng_end))
+            blame_args = " ".join(f"-L {s},{e}" for s, e in ranges)
+            br = git(f"blame {blame_args} --porcelain {parent} -- {cf}",
+                     cwd=upstream_repo, check=False)
+            if br.returncode == 0:
+                for bl in br.stdout.split("\n"):
+                    bm = re.match(r"^([0-9a-f]{40})\s", bl)
+                    if bm:
+                        h = bm.group(1)
+                        if h != "0" * 40 and h != commit_hash:
+                            hunk_commits[h] = hunk_commits.get(h, 0) + 1
+                            commit_counts[h] = commit_counts.get(h, 0) + 1
+        hunk_summaries.append({
+            "index": hunk["index"],
+            "ours_lines": len(hunk["ours"]),
+            "theirs_lines": len(theirs_keys),
+            "top_commits": sorted(
+                hunk_commits.items(), key=lambda x: -x[1])[:5],
+        })
+
+    if not commit_counts:
+        empty["hunk_summaries"] = hunk_summaries
+        empty["total_theirs_lines"] = total_theirs
+        return empty
+
+    ranked = sorted(commit_counts.items(), key=lambda x: -x[1])
+    unchecked = 0
+    if len(ranked) > HUNK_PREREQ_COMMIT_CAP:
+        unchecked = len(ranked) - HUNK_PREREQ_COMMIT_CAP
+        ranked = ranked[:HUNK_PREREQ_COMMIT_CAP]
+
+    capped_hashes = [h for h, _ in ranked]
+    subjects = _subjects_for_hashes(upstream_repo, capped_hashes)
+    present_set = _rhel_references_hashes(rhel_repo, capped_hashes)
+
+    missing = []
+    present = []
+    for h, nlines in ranked:
+        entry = (h, subjects.get(h, "(subject unavailable)"), nlines)
+        if h in present_set:
+            present.append(entry)
+        else:
+            missing.append(entry)
+
+    # Likely blocked: a single missing commit owns >= half of theirs lines
+    likely = False
+    if missing and total_theirs > 0:
+        top_h, top_s, top_n = missing[0]
+        if top_n >= max(3, (total_theirs + 1) // 2):
+            likely = True
+
+    return {
+        "missing_prereqs": [(h, s) for h, s, _ in missing],
+        "present_prereqs": [(h, s) for h, s, _ in present],
+        "missing_ranked": missing,   # (hash, subject, line_count)
+        "present_ranked": present,
+        "unchecked_prereqs": unchecked,
+        "hunk_summaries": hunk_summaries,
+        "likely_blocked": likely,
+        "total_theirs_lines": total_theirs,
+        "commit_line_counts": dict(ranked),
+    }
+
+
+def _prereq_gate_menu(commit_hash, subject, file_analyses):
+    """Warn when conflicts look blocked on missing prerequisites.
+
+    Returns one of: ``continue``, ``skip``, ``menu``, ``exit``.
+    """
+    blocked = [a for a in file_analyses if a.get("likely_blocked")]
+    all_missing = []
+    seen = set()
+    for a in file_analyses:
+        for h, s, n in a.get("missing_ranked", []):
+            if h and h not in seen:
+                seen.add(h)
+                all_missing.append((h, s, n, a["file"]))
+        # fallback shape without line counts
+        for h, s in a.get("missing_prereqs", []):
+            if h and h not in seen:
+                seen.add(h)
+                all_missing.append((h, s, 0, a["file"]))
+
+    if not all_missing:
+        return "continue"
+
+    print(f"\n{CAU}{'=' * 70}{OFF}")
+    print(f"  {BLD}Missing prerequisite(s) for "
+          f"{commit_hash[:12]} {subject}{OFF}")
+    print(f"  {'─' * 66}")
+    print(f"  Conflict hunks reference upstream context that is not")
+    print(f"  present in the RHEL branch. Ranked by conflict lines owned:")
+    print()
+    for h, s, n, f in all_missing[:15]:
+        owned = f" ({n} conflict line(s))" if n else ""
+        print(f"  {WRN}{h[:12]}{OFF} {s}{owned}")
+        print(f"    file: {DIM}{f}{OFF}")
+        print(f"    {BLD}isb pick {h}{OFF}")
+    if len(all_missing) > 15:
+        print(f"  {DIM}... and {len(all_missing) - 15} more{OFF}")
+
+    if blocked:
+        print(f"\n  {WRN}Likely blocked:{OFF} at least one file's conflict")
+        print(f"  is dominated by a missing commit. Resolving anyway may")
+        print(f"  drop the upstream change or produce a weak backport.")
+    else:
+        print(f"\n  Resolution may still succeed by adapting to RHEL.")
+
+    print()
+    print(f"  {MNU}c{OFF}  Continue — resolve conflicts anyway")
+    print(f"  {MNU}s{OFF}  Skip this commit")
+    print(f"  {MNU}m{OFF}  Return to interactive menu")
+    print(f"  {MNU}q{OFF}  Quit isb (pick prerequisites first)")
+    print()
+    print(f"  {BLD}Choice:{OFF} ", end="", flush=True)
+    while True:
+        ch = _getch()
+        if ch in ('c', 'C'):
+            print("continue")
+            return "continue"
+        if ch in ('s', 'S'):
+            print("skip")
+            return "skip"
+        if ch in ('m', 'M'):
+            print("menu")
+            return "menu"
+        if ch in ('q', 'Q', '\x03'):
+            print("quit")
+            return "exit"
+
+
+def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo,
+                      hunk_prereqs=None):
+    """Analyze a conflicted/resolved file for review.
+
+    When *hunk_prereqs* from pre-resolution hunk-first analysis is
+    provided, prerequisite lists come from conflict hunks (preferred).
+    Otherwise falls back to post-resolve upstream-parent blame.
 
     Returns a dict:
       {
@@ -4033,8 +4439,11 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
         "diff_summary": str,         # compact unified diff (resolved vs upstream)
         "missing_prereqs": [(hash, subject), ...],
         "present_prereqs": [(hash, subject), ...],
+        "unchecked_prereqs": int,    # blame candidates not checked (cap)
         "rhel_specific_count": int,  # lines with KABI/RHEL markers
         "hunk_count": int,
+        "hunk_summaries": [...],     # optional hunk-first detail
+        "likely_blocked": bool,
       }
     """
     import difflib
@@ -4044,8 +4453,11 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
         "diff_summary": "",
         "missing_prereqs": [],
         "present_prereqs": [],
+        "unchecked_prereqs": 0,
         "rhel_specific_count": 0,
         "hunk_count": 0,
+        "hunk_summaries": [],
+        "likely_blocked": False,
     }
 
     if not commit_hash or not upstream_repo:
@@ -4100,97 +4512,81 @@ def _analyze_conflict(cf, commit_hash, upstream_repo, rhel_repo):
         if "RH_KABI" in l or "RHEL" in l or "redhat" in l.lower()
     )
 
-    # --- Git blame analysis for prerequisite detection ---
-    # Find which line ranges in the upstream file differ from RHEL.
-    # Use the zero-context diff to identify exact upstream line numbers.
-    zero_diff = list(difflib.unified_diff(us_lines, our_lines, n=0))
-    blame_lines = set()
-    for hdr in zero_diff:
-        if not hdr.startswith("@@"):
-            continue
-        # Parse @@ -start,count +start,count @@
-        m = re.match(r"@@ -(\d+)(?:,(\d+))? ", hdr)
-        if m:
-            start = int(m.group(1))
-            count = int(m.group(2)) if m.group(2) else 1
-            for i in range(start, start + count):
-                blame_lines.add(i)
+    # Prefer hunk-first prereqs captured while markers were still present.
+    if hunk_prereqs:
+        result["missing_prereqs"] = list(hunk_prereqs.get("missing_prereqs", []))
+        result["present_prereqs"] = list(hunk_prereqs.get("present_prereqs", []))
+        result["unchecked_prereqs"] = hunk_prereqs.get("unchecked_prereqs", 0)
+        result["hunk_summaries"] = list(hunk_prereqs.get("hunk_summaries", []))
+        result["likely_blocked"] = bool(hunk_prereqs.get("likely_blocked"))
+        # Prefer original conflict hunk count when available
+        if result["hunk_summaries"]:
+            result["hunk_count"] = max(
+                result["hunk_count"], len(result["hunk_summaries"]))
+    else:
+        # Fallback: post-resolve blame on upstream-parent lines that differ
+        zero_diff = list(difflib.unified_diff(us_lines, our_lines, n=0))
+        blame_lines = set()
+        for hdr in zero_diff:
+            if not hdr.startswith("@@"):
+                continue
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? ", hdr)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2)) if m.group(2) else 1
+                for i in range(start, start + count):
+                    blame_lines.add(i)
 
-    if not blame_lines:
-        result["classification"] = (
-            f"{result['hunk_count']} hunk(s) differ from upstream"
-        )
-        return result
-
-    # Run git blame on the upstream file for the parent of this commit
-    # to find which commits introduced the conflicting context.
-    # Batch contiguous lines into ranges; cap at 50 lines to keep
-    # blame fast on large kernel repos.
-    _BLAME_LINE_CAP = 50
-    parent = f"{commit_hash}~1"
-    blame_hashes = set()
-    sorted_lines = sorted(blame_lines)[:_BLAME_LINE_CAP]
-    ranges = []
-    if sorted_lines:
-        rng_start = rng_end = sorted_lines[0]
-        for ln in sorted_lines[1:]:
-            if ln == rng_end + 1:
-                rng_end = ln
-            else:
+        if blame_lines:
+            parent = f"{commit_hash}~1"
+            blame_hashes = set()
+            sorted_lines = sorted(blame_lines)[:BLAME_LINE_CAP]
+            ranges = []
+            if sorted_lines:
+                rng_start = rng_end = sorted_lines[0]
+                for ln in sorted_lines[1:]:
+                    if ln == rng_end + 1:
+                        rng_end = ln
+                    else:
+                        ranges.append((rng_start, rng_end))
+                        rng_start = rng_end = ln
                 ranges.append((rng_start, rng_end))
-                rng_start = rng_end = ln
-        ranges.append((rng_start, rng_end))
 
-    blame_args = " ".join(f"-L {s},{e}" for s, e in ranges)
-    if blame_args:
-        r = git(f"blame {blame_args} --porcelain "
-                f"{parent} -- {cf}",
-                cwd=upstream_repo, check=False)
-        if r.returncode == 0:
-            for bl in r.stdout.split("\n"):
-                bm = re.match(r"^([0-9a-f]{40})\s", bl)
-                if bm:
-                    h = bm.group(1)
-                    if h != "0" * 40 and h != commit_hash:
-                        blame_hashes.add(h)
+            blame_args = " ".join(f"-L {s},{e}" for s, e in ranges)
+            if blame_args:
+                r = git(f"blame {blame_args} --porcelain "
+                        f"{parent} -- {cf}",
+                        cwd=upstream_repo, check=False)
+                if r.returncode == 0:
+                    for bl in r.stdout.split("\n"):
+                        bm = re.match(r"^([0-9a-f]{40})\s", bl)
+                        if bm:
+                            h = bm.group(1)
+                            if h != "0" * 40 and h != commit_hash:
+                                blame_hashes.add(h)
 
-    _PREREQ_CAP = 10
-    if blame_hashes:
-        capped = sorted(blame_hashes)[:_PREREQ_CAP]
-        if len(blame_hashes) > _PREREQ_CAP:
-            result["missing_prereqs"].append(
-                ("", f"(+{len(blame_hashes) - _PREREQ_CAP} more "
-                     f"unchecked)"))
+            if blame_hashes:
+                ordered = sorted(blame_hashes)
+                capped = ordered[:HUNK_PREREQ_COMMIT_CAP]
+                if len(ordered) > HUNK_PREREQ_COMMIT_CAP:
+                    result["unchecked_prereqs"] = (
+                        len(ordered) - HUNK_PREREQ_COMMIT_CAP)
+                subjects = _subjects_for_hashes(upstream_repo, capped)
+                present_set = _rhel_references_hashes(rhel_repo, capped)
+                for bh in capped:
+                    subj = subjects.get(bh, "(subject unavailable)")
+                    if bh in present_set:
+                        result["present_prereqs"].append((bh, subj))
+                    else:
+                        result["missing_prereqs"].append((bh, subj))
 
-        # Batch subject lookup: one git log --no-walk call
-        hash_subjects = {}
-        sep = "---8<---"
-        nw = git(f"log --no-walk --format='%H{sep}%s' "
-                 + " ".join(capped),
-                 cwd=upstream_repo, check=False)
-        if nw.returncode == 0:
-            for line in nw.stdout.strip().split("\n"):
-                if sep in line:
-                    h_part, s_part = line.split(sep, 1)
-                    hash_subjects[h_part.strip()] = s_part.strip()
-
-        # Check RHEL presence: use the same method as isb pick —
-        # pipe full git log through grep for each hash.  Capped to
-        # _PREREQ_CAP hashes so this is at most 10 calls.
-        for bh, subj in sorted(hash_subjects.items()):
-            rc, out, _ = run_quiet(
-                f"git log | grep -m1 -F {bh}",
-                cwd=rhel_repo)
-            if rc == 0 and out.strip():
-                result["present_prereqs"].append((bh, subj))
-            else:
-                result["missing_prereqs"].append((bh, subj))
-
-    # Classify based on findings
+    # Classify based on findings (real missing only)
     if result["missing_prereqs"]:
         n = len(result["missing_prereqs"])
+        blocked = " — likely blocked" if result.get("likely_blocked") else ""
         result["classification"] = (
             f"missing prerequisite ({n} upstream commit(s) not in RHEL)"
+            f"{blocked}"
         )
     elif result["present_prereqs"] and result["rhel_specific_count"] == 0:
         result["classification"] = (
@@ -4353,16 +4749,27 @@ def _ai_explain_conflicts(analyses, commit_hash, subject, upstream_repo):
         sec = [f"File: {a['file']}",
                f"Classification: {a['classification']}",
                f"Hunks: {a['hunk_count']}"]
+        if a.get("likely_blocked"):
+            sec.append("LIKELY BLOCKED on missing prerequisite")
         if a["rhel_specific_count"]:
             sec.append(f"RHEL-specific lines: {a['rhel_specific_count']}")
         if a["missing_prereqs"]:
-            sec.append("Missing prerequisites:")
+            sec.append("Missing prerequisites (hunk-first, ranked):")
             for h, s in a["missing_prereqs"]:
                 sec.append(f"  {h[:12]} {s}")
         if a["present_prereqs"]:
             sec.append("Present prerequisites:")
             for h, s in a["present_prereqs"]:
                 sec.append(f"  {h[:12]} {s}")
+        for hs in a.get("hunk_summaries", [])[:8]:
+            tops = hs.get("top_commits") or []
+            top_s = ", ".join(f"{h[:12]}({c})" for h, c in tops[:3]) or "n/a"
+            sec.append(
+                f"Conflict hunk {hs.get('index')}: "
+                f"ours={hs.get('ours_lines', 0)} "
+                f"theirs={hs.get('theirs_lines', 0)} "
+                f"blame-top={top_s}"
+            )
         if a["diff_summary"]:
             # Truncate very long diffs to keep token usage reasonable
             diff = a["diff_summary"]
@@ -4384,8 +4791,8 @@ from the upstream version.
 
 ANALYSIS METHOD:
 1. For each conflicted file, identify which functions contain the conflicts
-2. Trace missing prerequisites: upstream commits between the RHEL base and
-   this commit that changed the same code (shown in the data below)
+2. Prefer the per-hunk prerequisite data below (from conflict markers) over
+   whole-file blame — name the missing commit that owns each hunk
 3. For each conflict region, explain WHY the code diverges — name the
    missing commit that caused it (by short hash)
 4. Check lock/unlock correctness across all paths (normal, error, loop break)
@@ -4469,16 +4876,53 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
                 fh.write(f"RHEL-specific lines: "
                          f"{a['rhel_specific_count']}\n")
 
-            if a["missing_prereqs"]:
+            real_missing = [
+                (h, s) for h, s in a.get("missing_prereqs", []) if h
+            ]
+            if a.get("likely_blocked"):
+                fh.write(
+                    f"\nLIKELY BLOCKED: conflict hunks are dominated by "
+                    f"a missing prerequisite.\n"
+                )
+            if real_missing:
                 fh.write(f"\nMISSING PREREQUISITES "
-                         f"({len(a['missing_prereqs'])}):\n")
-                fh.write(f"  These upstream commits modified the "
-                         f"conflicting lines but are\n")
-                fh.write(f"  NOT present in the RHEL branch. "
-                         f"Consider backporting them first.\n\n")
-                for h, s in a["missing_prereqs"]:
-                    fh.write(f"  {h[:12]} {s}\n")
+                         f"({len(real_missing)}) — hunk-first:\n")
+                fh.write(f"  Ranked from conflict-marker 'theirs' lines "
+                         f"(not whole-file blame).\n")
+                fh.write(f"  These upstream commits are NOT referenced "
+                         f"in the RHEL branch.\n"
+                         f"  Consider backporting them first.\n\n")
+                for h, s in real_missing:
+                    fh.write(f"  {h} {s}\n")
+                    fh.write(f"    isb pick {h}\n\n")
                     all_missing.append((h, s))
+
+            unchecked = a.get("unchecked_prereqs", 0) or 0
+            if unchecked:
+                fh.write(
+                    f"\nUNCHECKED PREREQUISITE CANDIDATES: {unchecked}\n"
+                    f"  Additional upstream commits owned conflict "
+                    f"hunk lines but were not checked for RHEL\n"
+                    f"  presence (cap={HUNK_PREREQ_COMMIT_CAP} "
+                    f"distinct commits; blame lines/hunk capped at "
+                    f"{BLAME_LINE_CAP}).\n"
+                    f"  They are NOT listed as missing — only "
+                    f"unchecked.\n"
+                )
+
+            if a.get("hunk_summaries"):
+                fh.write(f"\nCONFLICT HUNKS (pre-resolve):\n")
+                for hs in a["hunk_summaries"]:
+                    tops = hs.get("top_commits") or []
+                    top_s = (", ".join(
+                        f"{h[:12]}({c})" for h, c in tops[:5])
+                        or "none")
+                    fh.write(
+                        f"  hunk {hs.get('index')}: "
+                        f"ours={hs.get('ours_lines', 0)} "
+                        f"theirs={hs.get('theirs_lines', 0)} "
+                        f"top={top_s}\n"
+                    )
 
             if a["present_prereqs"]:
                 fh.write(f"\nPrerequisites already in RHEL "
@@ -4511,19 +4955,19 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
             seen = set()
             unique = []
             for h, s in all_missing:
-                if h not in seen:
+                if h and h not in seen:
                     seen.add(h)
                     unique.append((h, s))
             fh.write(f"{'=' * 70}\n")
             fh.write(f"ACTION REQUIRED: {len(unique)} missing "
-                     f"prerequisite(s) detected\n\n")
-            fh.write(f"The following upstream commits introduced code "
-                     f"that this commit\n")
-            fh.write(f"depends on, but they are not in the RHEL "
-                     f"branch:\n\n")
+                     f"prerequisite commit(s) detected\n\n")
+            fh.write(f"The following upstream commits introduced "
+                     f"context that this commit\n")
+            fh.write(f"conflicts with, but they are not referenced "
+                     f"in the RHEL branch:\n\n")
             for h, s in unique:
-                fh.write(f"  isb pick {h}\n")
-                fh.write(f"    # {s}\n\n")
+                fh.write(f"  {h}  {s}\n")
+                fh.write(f"    isb pick {h}\n\n")
             fh.write(f"Consider backporting these first, then "
                      f"retrying this commit.\n")
 
@@ -4554,14 +4998,30 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         print(f"  {'─' * 66}")
 
         all_missing = []
+        total_unchecked = 0
         for a in analyses:
             icon = f"{STA}✓{OFF}" if a["hunk_count"] == 0 else f"{WRN}△{OFF}"
             print(f"  {icon} {INF}{a['file']}{OFF}")
             print(f"      {a['classification']}")
-            if a["missing_prereqs"]:
-                for h, s in a["missing_prereqs"]:
-                    print(f"      {WRN}⚠ missing: {h[:12]} {s}{OFF}")
+            if a.get("likely_blocked"):
+                print(f"      {WRN}Likely blocked on a missing "
+                      f"prerequisite (hunk-dominated){OFF}")
+            real_missing = [
+                (h, s) for h, s in a.get("missing_prereqs", []) if h
+            ]
+            if real_missing:
+                print(f"      {WRN}Missing from RHEL "
+                      f"(hunk-first; not in RHEL history):{OFF}")
+                for h, s in real_missing:
+                    print(f"        {WRN}{h[:12]}{OFF} {s}")
                     all_missing.append((h, s))
+            unchecked = a.get("unchecked_prereqs", 0) or 0
+            if unchecked:
+                total_unchecked += unchecked
+                print(f"      {DIM}(+{unchecked} additional hunk "
+                      f"candidate(s) not checked — "
+                      f"cap {HUNK_PREREQ_COMMIT_CAP})"
+                      f"{OFF}")
 
         if all_missing:
             seen = set()
@@ -4569,19 +5029,25 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                       if h not in seen and not seen.add(h)]
             grouped = _group_prereq_series(unique)
             print(f"\n  {WRN}WARNING: {len(unique)} missing "
-                  f"prerequisite(s) detected.{OFF}")
+                  f"prerequisite commit(s) detected.{OFF}")
+            print(f"  Ranked from conflict hunks (theirs side), not "
+                  f"whole-file blame:")
             for label, hashes in grouped:
                 if label:
                     print(f"  {WRN}⚠ {label}{OFF}")
                 for h, s in hashes:
-                    print(f"    {DIM}{h[:12]} {s}{OFF}")
-            print(f"\n  You can exit isb and pick them from the "
-                  f"command line:")
+                    print(f"    {WRN}{h[:12]}{OFF} {s}")
+            print(f"\n  To backport a prerequisite:")
             for h, s in unique:
-                if h:
-                    print(f"    {BLD}isb pick {h}{OFF}")
+                print(f"    {BLD}isb pick {h}{OFF}  {DIM}# {s}{OFF}")
             print(f"  Then resume with {BLD}isb continue{OFF} "
                   f"or from the main menu.")
+        if total_unchecked:
+            print(f"\n  {DIM}Note: {total_unchecked} additional "
+                  f"hunk-first candidate(s) were not checked "
+                  f"(cap {HUNK_PREREQ_COMMIT_CAP}). Details are in "
+                  f"the conflict report — only listed hashes above "
+                  f"were verified missing from RHEL.{OFF}")
 
         if ai_explanation:
             print(f"\n  {BLD}AI Analysis:{OFF}")
@@ -4983,8 +5449,50 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
     return notes, list(in_scope_conflicts)
 
 
+def _format_hunk_prereq_prompt(hunk_prereqs_by_file):
+    """Format per-hunk missing/present prereq context for AI prompts."""
+    if not hunk_prereqs_by_file:
+        return ""
+    blocks = []
+    for cf, hp in hunk_prereqs_by_file.items():
+        lines = [f"File: {cf}"]
+        missing = hp.get("missing_ranked") or [
+            (h, s, 0) for h, s in hp.get("missing_prereqs", [])
+        ]
+        present = hp.get("present_ranked") or [
+            (h, s, 0) for h, s in hp.get("present_prereqs", [])
+        ]
+        if missing:
+            lines.append("  Missing prerequisites (ranked by conflict lines):")
+            for h, s, n in missing[:10]:
+                owned = f", {n} line(s)" if n else ""
+                lines.append(f"    {h[:12]} {s}{owned}")
+        if present:
+            lines.append("  Already present in RHEL:")
+            for h, s, n in present[:5]:
+                lines.append(f"    {h[:12]} {s}")
+        for hs in hp.get("hunk_summaries", [])[:8]:
+            tops = hs.get("top_commits") or []
+            top_s = ", ".join(f"{h[:12]}({c})" for h, c in tops[:3]) or "none"
+            lines.append(
+                f"  Hunk {hs['index']}: "
+                f"ours={hs.get('ours_lines', 0)} "
+                f"theirs={hs.get('theirs_lines', 0)} "
+                f"top={top_s}"
+            )
+        if hp.get("likely_blocked"):
+            lines.append(
+                "  WARNING: this file is likely blocked on a missing "
+                "prerequisite — prefer adapting to RHEL names/APIs "
+                "rather than importing upstream-only context."
+            )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def _resolve_inscope_ai(in_scope_conflicts, rhel_repo,
-                        commit_hash=None, upstream_repo=None):
+                        commit_hash=None, upstream_repo=None,
+                        hunk_prereqs_by_file=None):
     """Use a Cursor Opus agent to resolve in-scope conflict files.
 
     The agent receives the conflict markers, upstream context, and RHEL
@@ -5053,6 +5561,14 @@ def _resolve_inscope_ai(in_scope_conflicts, rhel_repo,
     if len(conflict_text) > 12000:
         conflict_text = conflict_text[:12000] + "\n... (truncated)"
 
+    prereq_block = _format_hunk_prereq_prompt(hunk_prereqs_by_file or {})
+    prereq_section = ""
+    if prereq_block:
+        prereq_section = f"""
+Per-hunk prerequisite analysis (from conflict markers, before resolve):
+{prereq_block}
+"""
+
     prompt = f"""\
 You are resolving git cherry-pick conflicts in a RHEL kernel backport.
 The files below contain conflict markers (<<<<<<< / ======= / >>>>>>>).
@@ -5064,14 +5580,17 @@ RULES:
 2. Keep RHEL-specific code (KABI wrappers, RCU guards, in_shutdown checks)
 3. Apply the upstream change where it doesn't conflict with RHEL specifics
 4. Use RHEL's function/variable names, not upstream renames from missing prereqs
-5. Verify lock/unlock correctness: every lock acquire must have matching unlock
+5. Prefer resolving each hunk using the per-hunk prerequisite hints below —
+   when a hunk is dominated by a missing commit, adapt to RHEL rather than
+   inventing upstream-only context
+6. Verify lock/unlock correctness: every lock acquire must have matching unlock
    on ALL paths (normal, error, loop break)
-6. Do NOT touch files outside the conflict regions
-7. After editing, run: git add {file_list}
+7. Do NOT touch files outside the conflict regions
+8. After editing, run: git add {file_list}
 
 Upstream commit summary:
 {upstream_ctx}
-
+{prereq_section}
 Conflict regions:
 {conflict_text}
 
@@ -5130,13 +5649,20 @@ then run git add on the resolved files.
 
 
 def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
-                      commit_hash=None, upstream_repo=None):
+                      commit_hash=None, upstream_repo=None, subject=None):
     """Resolve conflicts in the working tree.
 
-    Returns (notes, oos_count) where notes is a list of conflict note strings
-    for in-scope files, and oos_count is the number of out-of-scope files
-    that were excluded (conflicted or newly added).
+    Before resolving in-scope markers, captures conflict hunks and runs
+    hunk-first prerequisite detection.  Missing-prereq findings are stored
+    on ``resolve_conflicts._hunk_prereqs`` for post-resolve review/AI.
+
+    Gate returns (before any resolve) use sentinel notes:
+      ["skipped by user"], ["prereq-gate:menu"], ["prereq-gate:exit"]
+
+    Returns (notes, oos_count, inscope_conflicted).
     """
+    resolve_conflicts._hunk_prereqs = {}
+
     r = git("ls-files --unmerged", cwd=rhel_repo, check=False)
     unmerged_paths = sorted({
         line.split("\t", 1)[1]
@@ -5144,7 +5670,7 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
         if "\t" in line
     })
     if not unmerged_paths:
-        return [], 0
+        return [], 0, []
 
     # Identify delete/modify conflicts (file exists in index stages
     # but was deleted on one side).  Stage 1=base, 2=ours, 3=theirs.
@@ -5205,6 +5731,43 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
 
     inscope_conflicted = []
     if in_scope_deferred:
+        # Capture hunks + prereqs while markers are still present.
+        hunk_prereqs_by_file = {}
+        gate_analyses = []
+        if commit_hash and upstream_repo:
+            if not subject:
+                sr = git(f"log -1 --format=%s {commit_hash}",
+                         cwd=upstream_repo, check=False)
+                subject = (sr.stdout.strip() if sr.returncode == 0
+                           else commit_hash[:12])
+            with Spinner("Analyzing conflict hunks for prerequisites ..."):
+                for cf in in_scope_deferred:
+                    fullpath = os.path.join(rhel_repo, cf)
+                    hunks = (_parse_conflict_hunks(fullpath)
+                             if os.path.isfile(fullpath) else [])
+                    hp = _hunk_first_prereqs(
+                        cf, hunks, commit_hash, upstream_repo, rhel_repo)
+                    hp["file"] = cf
+                    hunk_prereqs_by_file[cf] = hp
+                    gate_analyses.append(hp)
+            resolve_conflicts._hunk_prereqs = hunk_prereqs_by_file
+
+            any_missing = any(
+                a.get("missing_prereqs") for a in gate_analyses)
+            if any_missing:
+                gate = _prereq_gate_menu(
+                    commit_hash, subject or "", gate_analyses)
+                if gate == "skip":
+                    git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                    return ["skipped by user"], len(oos_excluded), []
+                if gate == "menu":
+                    git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                    return ["prereq-gate:menu"], len(oos_excluded), []
+                if gate == "exit":
+                    git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                    return ["prereq-gate:exit"], len(oos_excluded), []
+                # "continue" — proceed to resolve
+
         if conflict_policy == "patchpal":
             deferred_notes, deferred_files = _resolve_inscope_patchpal(
                 in_scope_deferred, rhel_repo,
@@ -5214,6 +5777,8 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
             deferred_notes, deferred_files = _resolve_inscope_ai(
                 in_scope_deferred, rhel_repo,
                 commit_hash=commit_hash, upstream_repo=upstream_repo,
+                hunk_prereqs_by_file=getattr(
+                    resolve_conflicts, "_hunk_prereqs", {}),
             )
         else:
             deferred_notes, deferred_files = _resolve_inscope_edit(
@@ -6228,6 +6793,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     resolve_conflicts(
                         rhel_repo, scope_paths, conflict_policy, rhel_ver,
                         commit_hash=commit_hash, upstream_repo=upstream_repo,
+                        subject=subject,
                     )
             else:
                 with Spinner("Resolving conflicts ..."):
@@ -6235,12 +6801,19 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         resolve_conflicts(
                             rhel_repo, scope_paths, conflict_policy, rhel_ver,
                             commit_hash=commit_hash, upstream_repo=upstream_repo,
+                            subject=subject,
                         )
 
-            # User chose to skip from within patchpal/editor
+            # User chose to skip from within patchpal/editor / prereq gate
             if conflict_notes == ["skipped by user"]:
                 _cherrypick_repo = None
                 return "skip", conflict_notes
+            if conflict_notes == ["prereq-gate:menu"]:
+                _cherrypick_repo = None
+                return "menu", conflict_notes
+            if conflict_notes == ["prereq-gate:exit"]:
+                _cherrypick_repo = None
+                _cleanup_and_exit()
 
             # Capture before --ailog may rewrite per-file notes
             resolved_by = _infer_resolved_by(
@@ -6313,14 +6886,17 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         # -- Post-conflict review --
         if inscope_conflicted:
             n_files = len(inscope_conflicted)
+            hunk_map = getattr(resolve_conflicts, "_hunk_prereqs", {}) or {}
             analyses = []
             for fi, cf in enumerate(inscope_conflicted, 1):
                 label = (f"Analyzing conflicts [{fi}/{n_files}]: "
                          f"{cf} ...")
                 with Spinner(label):
                     analyses.append(
-                        _analyze_conflict(cf, commit_hash,
-                                          upstream_repo, rhel_repo)
+                        _analyze_conflict(
+                            cf, commit_hash, upstream_repo, rhel_repo,
+                            hunk_prereqs=hunk_map.get(cf),
+                        )
                     )
 
             # Add missing prerequisite notes in reviewer style
@@ -6504,9 +7080,12 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         break
 
                     info(f"  AI fix: {ai_note}")
+                    # Stage only — cherry_pick_commit has not created this
+                    # commit yet (cherry-pick --no-commit).  Amending here
+                    # would fold the fix into the previous HEAD and leave
+                    # an empty index, which then triggers a false
+                    # "non-functional skip" and drops the backport.
                     git("add -u", cwd=rhel_repo, check=False)
-                    git("commit --amend --no-edit",
-                        cwd=rhel_repo, check=False)
 
                     tb = (f" in toolbox '{toolbox_name}'"
                           if toolbox_name else "")
@@ -6597,9 +7176,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                             f"{editor} {file_args}",
                             shell=True, cwd=rhel_repo,
                         )
+                        # Stage only; commit happens later with the
+                        # formatted GORT message (same as AI build-fix).
                         git("add -u", cwd=rhel_repo, check=False)
-                        git("commit --amend --no-edit",
-                            cwd=rhel_repo, check=False)
                         print()
                         tb = (f" in toolbox '{toolbox_name}'"
                               if toolbox_name else "")
@@ -6647,11 +7226,17 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             skip_notes = _nonfunctional_skip_notes(
                 conflict_notes, had_conflict, upstream_cls,
             )
-            warn(f"  Only non-functional changes remain for "
-                 f"{commit_hash[:12]} "
-                 f"({staged_cls['nonfunctional']} comment/whitespace "
-                 f"line(s); upstream had "
-                 f"{upstream_cls['functional']} functional line(s)).")
+            nf = staged_cls["nonfunctional"]
+            uf = upstream_cls["functional"]
+            if nf == 0:
+                warn(f"  No in-scope staged changes remain for "
+                     f"{commit_hash[:12]} "
+                     f"(upstream had {uf} functional line(s)).")
+            else:
+                warn(f"  Only non-functional changes remain for "
+                     f"{commit_hash[:12]} "
+                     f"({nf} comment/whitespace line(s); "
+                     f"upstream had {uf} functional line(s)).")
             warn("  Skipping — functional hunks already present or "
                  "unmergeable.")
             git("reset --hard HEAD", cwd=rhel_repo, check=False)
@@ -8175,6 +8760,14 @@ def main():
             if os.path.isfile(state_file):
                 os.remove(state_file)
                 info("  Cleared stale state from previous run.")
+
+        # Seek Fixes: dependents of KEEP (out-of-scope → Omitted-fixes)
+        keep, omit = seek_fixes_for_keep(
+            keep, omit, upstream_repo, rhel_repo, scope_paths,
+            exclude_paths=args.exclude or None,
+        )
+        save_cached_results(_session, divergence, pending, keep, omit)
+        _save()
 
         if args.dry_run:
             header("Dry run complete")

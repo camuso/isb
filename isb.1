@@ -81,7 +81,26 @@ Dropped architecture hunks named explicitly
 API renames detected from the diff
 (e.g.\& \fIrdmsrl->rdmsrq; in kvm_init()\fR).
 .IP \(bu 2
-Missing prerequisites grouped by series when they share keywords
+Missing prerequisites are detected
+.B hunk\-first
+before resolution: each conflict region’s
+.B theirs
+lines are mapped onto the upstream parent and blamed.
+Commits are ranked by conflict lines owned (not whole\-file blame).
+Caps:
+50 blame lines per hunk,
+30 distinct commits checked against RHEL history;
+excess candidates are
+.I unchecked
+only — never listed as missing.
+When missing commits are found,
+.B isb
+offers continue / skip / menu / quit
+(not a hard exit).
+A file is marked
+.I likely blocked
+when one missing commit owns most of its conflict lines.
+Missing prerequisites are also grouped by series when they share keywords
 (e.g.\& \fImissing rdmsrl, rename patch series (5 commit(s))\fR).
 .IP \(bu 2
 Known upstream-only APIs flagged via
@@ -111,6 +130,17 @@ review,
 return,
 .B q
 quit).
+.B isb
+then seeks upstream commits that
+.B Fixes:
+a KEEP hash.
+Out\-of\-scope dependents are added to OMIT (and later
+.I Omitted\-fixes
+/
+.BR Omitted\-fix:
+in the MR description) so tools like patchreview treat them as
+intentionally omitted.
+In\-scope dependents missing from Phase\ 2 are added to KEEP.
 .PP
 Stable preferences (conflict/build policy, editor, ailog, AI provider,
 API key path/env, model preference lists) are edited in the Config menu
@@ -270,7 +300,8 @@ uses the Cursor SDK to call Claude in two situations:
 .TP
 .B Conflict explanation
 After every conflict resolution, Claude reads the upstream diff,
-the resolved diff, git-blame data, and missing-prerequisite information,
+the resolved diff, hunk\-first missing\-prerequisite rankings
+(from conflict markers), and optional fallback blame data,
 then produces a concise explanation appended to the Conflicts stanza in
 the commit message and the conflict report file.
 .TP

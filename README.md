@@ -37,6 +37,11 @@ RHEL-compliant commit messages suitable for merge requests.
   comment/whitespace edits while upstream had real code changes, the
   commit is skipped (already present or unmergeable), not kept as a
   comment-only backport.
+- **Fixes: seek** : after KEEP/OMIT classification, isb searches upstream
+  for commits that `Fixes:` a KEEP hash (same idea as patchreview).
+  Out-of-scope dependents go into `Omitted-fixes` / `Omitted-fix:` in
+  the MR description so they are not reported as missing. In-scope
+  dependents that Phase 2 missed are added to KEEP.
 - **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
   for newly added `config FOO` options. If `redhat/configs` has no
   matching `CONFIG_FOO` snippet, the keep entry is annotated and
@@ -80,6 +85,18 @@ RHEL-compliant commit messages suitable for merge requests.
      failing source, apply minimal fixes, and rebuild : retrying up to
      3 times before falling back to the manual menu.
   Disable with `--no-ailog`.
+- **Hunk-first missing prerequisites** : before resolving in-scope
+  conflicts, isb parses `<<<<<<<` / `=======` / `>>>>>>>` hunks and
+  blames the upstream parent for the **theirs** lines in each hunk
+  (not whole-file post-resolve blame). Commits are ranked by how many
+  conflict lines they own. Caps: 50 blame lines per hunk,
+  30 distinct commits checked against RHEL history. Excess candidates
+  are reported as unchecked — never shown as fake “missing” entries.
+  If missing commits are found, isb notifies with options (continue
+  resolve anyway / skip / menu / quit) instead of hard-exiting. When a
+  single missing commit owns most of a file’s conflict lines, the UI
+  marks it **likely blocked**. Per-hunk rankings are fed to Cursor AI
+  Rule resolve and `--ailog` explanation prompts.
 - **Reviewer-style conflict notes** : the Conflicts stanza in commit
   messages produces descriptions reviewers expect:
   - Dropped architecture hunks named explicitly
