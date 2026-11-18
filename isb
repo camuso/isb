@@ -4006,6 +4006,198 @@ def _inapplicable_after_apply(rhel_repo, commit_hash, upstream_repo,
     return notes, staged_cls, upstream_cls
 
 
+def _rhel_ours_text(rhel_repo, filepath):
+    """RHEL-side file content during a conflict (stage 2), else HEAD."""
+    r = git(f"show :2:{filepath}", cwd=rhel_repo, check=False)
+    if r.returncode == 0:
+        return r.stdout
+    r = git(f"show HEAD:{filepath}", cwd=rhel_repo, check=False)
+    if r.returncode == 0:
+        return r.stdout
+    return None
+
+
+def _body_line_in_text(body, text):
+    """True if a unified-diff body (no +/- prefix) matches a line in text."""
+    if text is None:
+        return False
+    b = body.rstrip("\n\r")
+    if not b.strip():
+        return False
+    return b in text.splitlines()
+
+
+def _assess_functional_applicability(commit_hash, upstream_repo, rhel_repo,
+                                     scope_paths=None, exclude_paths=None):
+    """Before resolve: can any functional upstream change land on RHEL?
+
+    Compares upstream functional +/- lines to RHEL ours/HEAD (and any
+    already-staged clean merge).  Used to skip AI/edit when the commit is
+    already present under other names/APIs or has no matching preimage
+    (a9b5-style tasklet→BH when RHEL already uses workqueues).
+
+    Returns dict with keys:
+      applicable (bool), reason (str), upstream_functional (int),
+      preimage_hits, preimage_total, plus_missing, plus_total, details.
+    """
+    up_files = _upstream_commit_files(
+        commit_hash, upstream_repo, scope_paths, exclude_paths,
+    )
+    upstream_cls = _classify_upstream_diff(
+        commit_hash, upstream_repo, scope_paths,
+    )
+    uf = upstream_cls.get("functional", 0)
+    empty = {
+        "applicable": False,
+        "reason": "",
+        "upstream_functional": uf,
+        "preimage_hits": 0,
+        "preimage_total": 0,
+        "plus_missing": 0,
+        "plus_total": 0,
+        "details": [],
+    }
+    if uf == 0:
+        empty["reason"] = (
+            "already present on RHEL or unmergeable "
+            "(upstream has no functional changes in scope before resolve)"
+        )
+        return empty
+
+    # Clean auto-merge parts may already have landed functional hunks.
+    staged_cls = _classify_staged_diff(
+        rhel_repo, files=up_files if up_files else None,
+        scope_paths=None if up_files else scope_paths,
+    )
+    if staged_cls.get("functional", 0) > 0:
+        return {
+            "applicable": True,
+            "reason": "",
+            "upstream_functional": uf,
+            "preimage_hits": 0,
+            "preimage_total": 0,
+            "plus_missing": 0,
+            "plus_total": 0,
+            "details": [
+                f"staged functional={staged_cls['functional']} "
+                f"(clean merge already landed)"
+            ],
+        }
+
+    preimage_hits = 0
+    preimage_total = 0
+    plus_missing = 0
+    plus_total = 0
+    details = []
+
+    for f in up_files:
+        dr = git(
+            f"diff {commit_hash}^..{commit_hash} -- {f}",
+            cwd=upstream_repo, check=False,
+        )
+        if dr.returncode != 0 or not dr.stdout.strip():
+            continue
+        minus_bodies = []
+        plus_bodies = []
+        for line in extract_strict_lines(dr.stdout, f):
+            if _is_nonfunctional_diff_line(line):
+                continue
+            if line.startswith("-"):
+                minus_bodies.append(line[1:])
+            elif line.startswith("+"):
+                plus_bodies.append(line[1:])
+        if not minus_bodies and not plus_bodies:
+            continue
+
+        ours = _rhel_ours_text(rhel_repo, f)
+        if ours is None:
+            # File absent on RHEL — pure addition is still applicable.
+            if plus_bodies:
+                plus_total += len(plus_bodies)
+                plus_missing += len(plus_bodies)
+                details.append(
+                    f"{f}: absent on RHEL "
+                    f"({len(plus_bodies)} functional +)"
+                )
+            continue
+
+        hits = 0
+        for body in minus_bodies:
+            preimage_total += 1
+            if _body_line_in_text(body, ours):
+                preimage_hits += 1
+                hits += 1
+        miss = 0
+        for body in plus_bodies:
+            plus_total += 1
+            if _body_line_in_text(body, ours):
+                continue
+            plus_missing += 1
+            miss += 1
+        details.append(
+            f"{f}: preimage {hits}/{len(minus_bodies)}, "
+            f"+missing {miss}/{len(plus_bodies)}"
+        )
+
+    if preimage_total > 0:
+        if preimage_hits == 0:
+            reason = (
+                "already present on RHEL or unmergeable "
+                "(no matching functional preimage before resolve; "
+                f"upstream had {uf} functional line(s), "
+                f"0/{preimage_total} removed-line(s) found on RHEL)"
+            )
+            return {
+                "applicable": False,
+                "reason": reason,
+                "upstream_functional": uf,
+                "preimage_hits": 0,
+                "preimage_total": preimage_total,
+                "plus_missing": plus_missing,
+                "plus_total": plus_total,
+                "details": details,
+            }
+        return {
+            "applicable": True,
+            "reason": "",
+            "upstream_functional": uf,
+            "preimage_hits": preimage_hits,
+            "preimage_total": preimage_total,
+            "plus_missing": plus_missing,
+            "plus_total": plus_total,
+            "details": details,
+        }
+
+    # Pure additions (no functional minus lines).
+    if plus_missing > 0:
+        return {
+            "applicable": True,
+            "reason": "",
+            "upstream_functional": uf,
+            "preimage_hits": 0,
+            "preimage_total": 0,
+            "plus_missing": plus_missing,
+            "plus_total": plus_total,
+            "details": details,
+        }
+
+    reason = (
+        "already present on RHEL or unmergeable "
+        "(functional additions already present before resolve; "
+        f"upstream had {uf} functional line(s))"
+    )
+    return {
+        "applicable": False,
+        "reason": reason,
+        "upstream_functional": uf,
+        "preimage_hits": 0,
+        "preimage_total": 0,
+        "plus_missing": 0,
+        "plus_total": plus_total,
+        "details": details,
+    }
+
+
 def classify_file_conflict(filepath, commit_hash, rhel_repo, upstream_repo):
     """Classify a resolved in-scope conflict for a single file.
 
@@ -4433,6 +4625,10 @@ def _prereq_gate_menu(commit_hash, subject, file_analyses):
     """Warn when conflicts look blocked on missing prerequisites.
 
     Returns one of: ``continue``, ``skip``, ``menu``, ``exit``.
+
+    Recommends SKIP when a file is hunk-dominated by one missing commit
+    (*likely_blocked*), or when several distinct missing prerequisites
+    appear (same threshold as the post-resolve review heuristic).
     """
     blocked = [a for a in file_analyses if a.get("likely_blocked")]
     all_missing = []
@@ -4451,6 +4647,11 @@ def _prereq_gate_menu(commit_hash, subject, file_analyses):
     if not all_missing:
         return "continue"
 
+    # Many distinct missing commits ⇒ unmergeable / already-present pattern
+    # (e.g. a9b5 tasklet→BH with 10 missing context commits).
+    many_missing = len(all_missing) >= 3
+    recommend_skip = bool(blocked) or many_missing
+
     print(f"\n{CAU}{'=' * 70}{OFF}")
     print(f"  {BLD}Missing prerequisite(s) for "
           f"{commit_hash[:12]} {subject}{OFF}")
@@ -4466,16 +4667,34 @@ def _prereq_gate_menu(commit_hash, subject, file_analyses):
     if len(all_missing) > 15:
         print(f"  {DIM}... and {len(all_missing) - 15} more{OFF}")
 
-    if blocked:
-        print(f"\n  {WRN}Likely blocked:{OFF} at least one file's conflict")
-        print(f"  is dominated by a missing commit. Resolving anyway may")
-        print(f"  drop the upstream change or produce a weak backport.")
+    if recommend_skip:
+        print(f"\n  {WRN}{'!' * 66}{OFF}")
+        print(f"  {WRN}SKIP RECOMMENDED{OFF}")
+        if blocked and many_missing:
+            print(f"  {WRN}Conflict(s) dominated by missing commit(s), and "
+                  f"{len(all_missing)} missing prerequisites overall.{OFF}")
+        elif blocked:
+            print(f"  {WRN}At least one file's conflict is dominated by a "
+                  f"missing commit.{OFF}")
+        else:
+            print(f"  {WRN}{len(all_missing)} missing prerequisites — "
+                  f"upstream functional change is likely already present "
+                  f"on RHEL under other names/APIs, or unmergeable "
+                  f"without those commits.{OFF}")
+        print(f"  {WRN}Prefer omit (Omitted-fixes) over resolving; "
+              f"adapting often leaves only comment noise.{OFF}")
+        print(f"  {WRN}{'!' * 66}{OFF}")
     else:
         print(f"\n  Resolution may still succeed by adapting to RHEL.")
 
     print()
-    print(f"  {MNU}c{OFF}  Continue — resolve conflicts anyway")
-    print(f"  {MNU}s{OFF}  Skip this commit")
+    if recommend_skip:
+        print(f"  {MNU}s{OFF}  Skip / omit this commit  "
+              f"{WRN}(recommended){OFF}")
+        print(f"  {MNU}c{OFF}  Continue — resolve conflicts anyway")
+    else:
+        print(f"  {MNU}c{OFF}  Continue — resolve conflicts anyway")
+        print(f"  {MNU}s{OFF}  Skip this commit")
     print(f"  {MNU}m{OFF}  Return to interactive menu")
     print(f"  {MNU}q{OFF}  Quit isb (pick prerequisites first)")
     print()
@@ -4766,6 +4985,28 @@ _DEFAULT_ANALYSIS_MODELS = list(CONFIG_DEFAULTS["ai_model_analysis"])
 _DEFAULT_FIX_MODELS = list(CONFIG_DEFAULTS["ai_model_fix"])
 
 _cached_models = {}
+
+# Models actually used by Agent.prompt during the current cherry-pick
+# (conflict resolve / build-fix).  Cleared at the start of each pick.
+_resolved_ai_models = []
+
+
+def _clear_ai_models():
+    _resolved_ai_models.clear()
+
+
+def _note_ai_model(model):
+    """Record a model that successfully ran for Resolved-by granularity."""
+    if not model or model == "default":
+        return
+    if model not in _resolved_ai_models:
+        _resolved_ai_models.append(model)
+
+
+def _primary_ai_model():
+    """First model noted this cherry-pick, or None."""
+    return _resolved_ai_models[0] if _resolved_ai_models else None
+
 
 def _select_model(task="analysis"):
     """Pick the best available model from the configured preference list.
@@ -5192,7 +5433,8 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
 
 
 def _show_review_menu(commit_hash, subject, analyses, report_path,
-                      ai_explanation="", resolved_by=None):
+                      ai_explanation="", resolved_by=None,
+                      assisted_by=None):
     """Display post-conflict review and present A/B/C menu.
 
     Shows:
@@ -5202,7 +5444,8 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
       - Missing prerequisites warning if any
       - AI explanation if available
       - SKIP recommendation when already-present / unmergeable
-      - Resolved-by trailer that will appear in the Conflicts stanza
+      - Resolved-by (non-interactive isb) and/or Assisted-by
+        (interactive patchpal) trailers
 
     Returns:
       "accept"  -- user accepted the resolution
@@ -5219,6 +5462,8 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         print(f"  {'─' * 66}")
         if resolved_by:
             print(f"  {STA}Resolved-by: {resolved_by}{OFF}")
+        if assisted_by:
+            print(f"  {STA}Assisted-by: {assisted_by}{OFF}")
 
         all_missing = []
         total_unchecked = 0
@@ -5861,15 +6106,17 @@ then run git add on the resolved files.
     status(f"  Cursor AI Rule resolving {n_files} file(s), "
            f"{total_markers} conflict region(s) ({estimate}) ...")
 
+    model = _select_model(task="analysis")
     try:
         result = Agent.prompt(
             prompt,
             AgentOptions(
                 api_key=_get_api_key(),
-                model=_select_model(task="analysis"),
+                model=model,
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
         )
+        _note_ai_model(model)
     except Exception as e:
         warn(f"  Cursor AI Rule failed: {e}")
         warn("  Falling back to editor.")
@@ -5911,6 +6158,8 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
 
     Gate returns (before any resolve) use sentinel notes:
       ["skipped by user"], ["prereq-gate:menu"], ["prereq-gate:exit"]
+    Pre-resolve inapplicable omit returns notes whose first line starts
+    with ``already present on RHEL or unmergeable`` (tree reset already).
 
     Returns (notes, oos_count, inscope_conflicted).
     """
@@ -6004,6 +6253,41 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
                     hunk_prereqs_by_file[cf] = hp
                     gate_analyses.append(hp)
             resolve_conflicts._hunk_prereqs = hunk_prereqs_by_file
+
+            # Before AI/edit: skip when no functional upstream change can
+            # land on RHEL (no matching preimage / already present).
+            with Spinner(
+                    "Checking functional applicability on RHEL ..."):
+                assess = _assess_functional_applicability(
+                    commit_hash, upstream_repo, rhel_repo,
+                    scope_paths=scope_paths,
+                )
+            if not assess.get("applicable"):
+                uf = assess.get("upstream_functional", 0)
+                pt = assess.get("preimage_total", 0)
+                ph = assess.get("preimage_hits", 0)
+                warn(f"  Pre-resolve {commit_hash[:12]}: no applicable "
+                     f"functional change on RHEL "
+                     f"(upstream {uf} functional line(s); "
+                     f"preimage {ph}/{pt}).")
+                warn("  Omitting before resolve — already present "
+                     "or unmergeable.")
+                for d in (assess.get("details") or [])[:8]:
+                    warn(f"    {d}")
+                git("reset --hard HEAD", cwd=rhel_repo, check=False)
+                reason = assess.get("reason") or (
+                    "already present on RHEL or unmergeable "
+                    "(no functional upstream change applicable "
+                    "before resolve)"
+                )
+                skip_notes = [reason]
+                skip_notes.append(
+                    "functional applicability checked against RHEL "
+                    "ours/HEAD before conflict resolution"
+                )
+                for d in (assess.get("details") or [])[:3]:
+                    skip_notes.append(d)
+                return skip_notes, len(oos_excluded), []
 
             any_missing = any(
                 a.get("missing_prereqs") for a in gate_analyses)
@@ -6754,12 +7038,13 @@ INSTRUCTIONS:
 5. After editing, write a one-line summary of what you changed and why.
 """
 
+    model = _select_model(task="fix")
     try:
         result = Agent.prompt(
             prompt,
             AgentOptions(
                 api_key=_get_api_key(),
-                model=_select_model(task="fix"),
+                model=model,
                 local=LocalAgentOptions(cwd=rhel_repo),
             ),
         )
@@ -6769,6 +7054,8 @@ INSTRUCTIONS:
         changed = [f for f in r.stdout.strip().split("\n") if f]
         if not changed:
             return False, ""
+
+        _note_ai_model(model)
 
         note = ""
         if result.status == "finished" and result.result:
@@ -6892,46 +7179,91 @@ def _consolidate_conflict_notes(notes):
     return other_notes
 
 
-def _resolved_by_for_ai_provider(provider=None):
-    """Map configured AI provider to a Resolved-by trailer value.
+def _resolved_by_for_ai_provider(provider=None, model=None):
+    """Map AI provider (+ optional model) to a Resolved-by trailer value.
 
-    The isb Cursor AI Rule agent is always recorded as ``isb``.
-    Other providers use their config name (future multi-provider support).
+    Non-interactive isb-channeled resolutions only:
+
+      ``isb/<provider>``                 — e.g. ``isb/cursor``
+      ``isb/<provider>/<model>``         — when a model ran this pick
+                                           e.g. ``isb/cursor/claude-opus-4-6``
+
+    Interactive patchpal is recorded as ``Assisted-by: patchpal``, not
+    here.  ``model`` defaults to the first model noted via
+    ``_note_ai_model`` this cherry-pick; pass ``model=""`` to force
+    provider-only.
     """
     provider = (provider or get_config("ai_provider") or "cursor").strip().lower()
-    if provider in ("cursor", "isb", ""):
-        return "isb"
-    return provider
+    if provider in ("isb", ""):
+        provider = "cursor"
+    if model is None:
+        model = _primary_ai_model()
+    parts = ["isb", provider]
+    if model and model != "default":
+        parts.append(model)
+    return "/".join(parts)
+
+
+def _patchpal_assisted(conflict_notes, conflict_policy, inscope_conflicted):
+    """True when patchpal interactively resolved in-scope conflicts."""
+    text = "\n".join(conflict_notes or [])
+    if re.search(r":\s*patchpal\b", text):
+        return True
+    return bool(inscope_conflicted and conflict_policy == "patchpal")
+
+
+def _infer_assisted_by(conflict_notes, conflict_policy, inscope_conflicted,
+                       configured_assisted_by=""):
+    """Assisted-by for interactive help; patchpal wins when it resolved."""
+    if _patchpal_assisted(conflict_notes, conflict_policy,
+                          inscope_conflicted):
+        return "patchpal"
+    return (configured_assisted_by or "").strip()
 
 
 def _infer_resolved_by(conflict_notes, conflict_policy, inscope_conflicted):
-    """Return Resolved-by trailer value, or None for manual editor.
+    """Return Resolved-by trailer value, or None.
 
-    - patchpal → ``patchpal``
-    - Cursor AI Rule / isb agent → ``isb``
-    - other AI provider → that provider's name
-    - manual editor → None (no Resolved-by line)
+    Non-interactive isb automation only (AI agent / OOS scoping):
 
-    Policy and note evidence are both considered.  ``conflict_notes`` may
-    be empty or rewritten by --ailog; ``inscope_conflicted`` non-empty
-    plus ai/patchpal policy is enough.
+    - Cursor AI Rule / AI build-fix / ``conflict_policy=ai`` →
+      ``isb/<provider>[/<model>]``
+    - OOS-only notes under any policy → ``isb/<provider>``
+    - Interactive patchpal → None (use Assisted-by: patchpal instead)
+    - Manual in-scope editor → None
     """
-    if not inscope_conflicted:
-        return None
     text = "\n".join(conflict_notes or [])
-    # Editor fallback from AI/patchpal — no Resolved-by
-    if re.search(r":\s*editor\b", text):
-        return None
-    # Prefer evidence from per-file notes (survives policy fallbacks)
-    if "Cursor AI Rule" in text:
+    # Prefer explicit AI engine evidence in notes
+    if "Cursor AI Rule" in text or "AI build-fix" in text:
         return _resolved_by_for_ai_provider()
-    if re.search(r":\s*patchpal\b", text):
-        return "patchpal"
-    # Policy alone is enough — ailog may have replaced the per-file notes
+    # Interactive patchpal → Assisted-by, not Resolved-by (unless isb
+    # also authored automated notes such as OOS scoping / config).
+    if _patchpal_assisted(conflict_notes, conflict_policy,
+                          inscope_conflicted):
+        has_isb_auto = any(
+            n.startswith("Limited to")
+            or n.startswith("dropped ")
+            or n.startswith("remaining out-of-scope")
+            or ": new upstream file" in n
+            or "removed per upstream" in n
+            or n.startswith("redhat/configs")
+            or "mkmod build" in n
+            for n in (conflict_notes or [])
+        )
+        if has_isb_auto:
+            return _resolved_by_for_ai_provider(model="")
+        return None
+    # Manual in-scope editor resolution — omit trailer
+    if inscope_conflicted and re.search(r":\s*editor\b", text):
+        return None
+    if not (conflict_notes or inscope_conflicted):
+        return None
+    # Automated AI policy: tag every isb-authored Conflicts stanza
     if conflict_policy == "ai":
         return _resolved_by_for_ai_provider()
-    if conflict_policy == "patchpal":
-        return "patchpal"
+    # edit/patchpal policy with only automated OOS/scoping notes
+    if conflict_notes and not inscope_conflicted:
+        return _resolved_by_for_ai_provider(model="")
     return None
 
 
@@ -6995,10 +7327,11 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                                             break_long_words=False,
                                             break_on_hyphens=False):
                         lines.append(f"    {wl}")
-        # Always last line of the Conflicts stanza when an automated
-        # resolver handled in-scope conflicts (isb / patchpal / provider).
+        # Last line of Conflicts when non-interactive isb automation
+        # handled the work (AI agent / OOS scoping).  Interactive
+        # patchpal uses Assisted-by instead.  Indent under Conflicts:.
         if resolved_by:
-            lines.append(f"Resolved-by: {resolved_by}")
+            lines.append(f"  Resolved-by: {resolved_by}")
 
     lines.append("")
     lines.append(f"commit {commit_hash}")
@@ -7057,6 +7390,8 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     # Engine that actually resolved in-scope markers (survives ailog rewrite
     # and note replacement).  Updated on each resolve attempt.
     resolver_engine = None
+    # Fresh model list for Resolved-by: isb/<provider>/<model>
+    _clear_ai_models()
 
     _redo_resolution = True
     while _redo_resolution:
@@ -7092,6 +7427,12 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             if conflict_notes == ["prereq-gate:exit"]:
                 _cherrypick_repo = None
                 _cleanup_and_exit()
+            # Pre-resolve inapplicable (no functional change can land)
+            if (conflict_notes
+                    and conflict_notes[0].startswith(
+                        "already present on RHEL or unmergeable")):
+                _cherrypick_repo = None
+                return "skip", conflict_notes
 
             # Remember the engine before --ailog rewrites per-file notes
             if inscope_conflicted and conflict_policy in ("ai", "patchpal"):
@@ -7243,16 +7584,18 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     analyses, "",
                 )
 
-            # Ensure Resolved-by is known before review (ailog may have
-            # replaced "Cursor AI Rule" note text already).
+            # Ensure Resolved-by / Assisted-by are known before review
+            # (ailog may have replaced "Cursor AI Rule" note text).
             if not resolved_by and inscope_conflicted:
                 engine = resolver_engine or conflict_policy
                 resolved_by = _infer_resolved_by(
                     conflict_notes, engine, inscope_conflicted)
             if not resolved_by and resolver_engine == "ai":
                 resolved_by = _resolved_by_for_ai_provider()
-            if not resolved_by and resolver_engine == "patchpal":
-                resolved_by = "patchpal"
+            review_assisted = _infer_assisted_by(
+                conflict_notes, conflict_policy, inscope_conflicted,
+                assisted_by,
+            )
 
             report_path = _write_resolution_report(
                 output_dir, commit_hash, subject, analyses,
@@ -7264,6 +7607,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 commit_hash, subject, analyses, report_path,
                 ai_explanation=ai_explanation,
                 resolved_by=resolved_by,
+                assisted_by=review_assisted or None,
             )
 
             if decision == "redo":
@@ -7442,6 +7786,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                             f"AI build-fix ({attempt} attempt(s)): "
                             f"{ai_note}"
                         )
+                        # Conflicts stanza records the AI fix — tag it.
+                        resolver_engine = resolver_engine or "ai"
+                        if not resolved_by:
+                            resolved_by = _resolved_by_for_ai_provider()
                         ai_fix_ok = True
                         break
                     else:
@@ -7569,21 +7917,22 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         for filepath, desc in spurious:
             warn(f"    {filepath}: {desc}")
 
-    # Re-assert Resolved-by right before commit — ailog may have replaced
-    # the "Cursor AI Rule" / patchpal note text used at first infer.
-    if not resolved_by and inscope_conflicted:
+    # Re-assert Resolved-by / Assisted-by right before commit — ailog
+    # may have replaced note text; AI build-fix may have added notes.
+    if not resolved_by:
         engine = resolver_engine or conflict_policy
         resolved_by = _infer_resolved_by(
             conflict_notes, engine, inscope_conflicted)
-    if not resolved_by and inscope_conflicted and resolver_engine == "ai":
+    if not resolved_by and resolver_engine == "ai":
         resolved_by = _resolved_by_for_ai_provider()
-    if not resolved_by and inscope_conflicted and resolver_engine == "patchpal":
-        resolved_by = "patchpal"
+    commit_assisted = _infer_assisted_by(
+        conflict_notes, conflict_policy, inscope_conflicted, assisted_by,
+    )
 
     msg = format_gort_message(
         subject, commit_hash, upstream_repo,
         jira, upstream_version, conflict_notes,
-        signed_off_by, assisted_by=assisted_by, cve=cve,
+        signed_off_by, assisted_by=commit_assisted, cve=cve,
         resolved_by=resolved_by,
     )
     msg_file = "/tmp/backport_msg.txt"

@@ -42,19 +42,23 @@ RHEL-compliant commit messages suitable for merge requests.
   Out-of-scope dependents go into `Omitted-fixes` / `Omitted-fix:` in
   the MR description so they are not reported as missing. In-scope
   dependents that Phase 2 missed are added to KEEP.
-- **Inapplicable omit** : after apply/resolve (and again after build),
-  if upstream-touched files have no functional staged changes while the
-  upstream commit did, isb omits the commit to `Omitted-fixes` as
-  already present on RHEL or unmergeable. Unrelated AI/build-fix edits
-  outside those files do not keep the commit.
-- **Skip recommendation** : post-conflict AI analysis ends with
-  `RECOMMENDATION: SKIP|ACCEPT`. A missing-prereq / kept-RHEL heuristic
-  always wins over a mistaken AI ACCEPT. The review menu highlights
-  **SKIP RECOMMENDED** and offers `s` to omit into `Omitted-fixes`.
-- **Resolved-by** : Conflicts stanza trailer is `Resolved-by: isb` for
-  the Cursor AI Rule agent, `Resolved-by: patchpal` for patchpal, or
-  `Resolved-by: <provider>` for any other configured AI provider.
-  Manual editor resolutions omit the line.
+- **Inapplicable omit** : before resolving conflicts, isb compares
+  upstream functional +/- lines to RHEL ours/HEAD (and any clean staged
+  merge). If nothing can land (no matching preimage, or additions
+  already present), it omits to `Omitted-fixes` without calling AI/edit.
+  The same check runs again after apply/resolve and after build for
+  residual comment-only diffs. Unrelated AI/build-fix edits outside
+  upstream-touched files do not keep the commit.
+- **Skip recommendation** : the pre-resolve missing-prereq gate and
+  post-conflict AI analysis both recommend SKIP when many prerequisites
+  are missing or hunks are kept-as-RHEL / dropped. The heuristic always
+  wins over a mistaken AI ACCEPT. Menus highlight **SKIP RECOMMENDED**
+  and offer `s` to omit into `Omitted-fixes`.
+- **Resolved-by / Assisted-by** : non-interactive isb AI ends
+  `Conflicts:` with `  Resolved-by: isb/cursor` or
+  `  Resolved-by: isb/cursor/<model>` when an agent ran. Interactive
+  patchpal uses `Assisted-by: patchpal` (not Resolved-by). Manual
+  in-scope editor resolutions omit both.
 - **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
   for newly added `config FOO` options. If `redhat/configs` has no
   matching `CONFIG_FOO` snippet, the keep entry is annotated and
@@ -120,8 +124,8 @@ RHEL-compliant commit messages suitable for merge requests.
   - Known upstream-only APIs flagged via `api-replacements.json`
   - Function names and change characterization
     (e.g. `added return value capture in sev_init()`)
-  - Ends with `Resolved-by: isb` (Cursor AI Rule), `patchpal`, or
-    another configured AI provider name (not added for manual editor)
+  - Ends with `  Resolved-by: isb/cursor[/<model>]` for non-interactive
+    isb AI; interactive patchpal gets `Assisted-by: patchpal` instead
 - **Commit review with omit toggle** : the interactive commit review
   page (`v` hotkey) shows previously omitted commits with a ✘ mark.
   Toggle any entry by number to restore it to the keep list.
