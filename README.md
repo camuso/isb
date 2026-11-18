@@ -77,11 +77,12 @@ RHEL-compliant commit messages suitable for merge requests.
 - **Session persistence** : per-backport parameters are saved to
   `.backport/session.json` and reused across runs with an interactive
   single-keypress menu.
-- **User Config menu (`C`)** : stable preferences live in
+- **User Config** : stable preferences live in
   `~/.config/isb/config.json` — conflict/build policy, editor, ailog,
   AI provider, API key path/env (never the raw secret), and model
-  preference lists. Open with `C` from Parameters / session, or when
-  prompted by `isb new`.
+  preference lists. View with `isb status`, edit with `isb config`
+  (or `C` from Parameters / session, or when prompted by `isb new`).
+  Backport progress is `isb progress`.
 - **Resumable** : interrupted runs save progress and resume automatically
   with `--continue`.
 - **Automatic commit-graph** : on first run, isb writes a git commit-graph
@@ -91,6 +92,9 @@ RHEL-compliant commit messages suitable for merge requests.
   with full conflict resolution and commit message formatting. Detects
   already-backported commits by searching the RHEL log for the upstream
   hash before cherry-picking.
+- **Commit-file mode** : `isb file PATH` uses a KEEP list from a file
+  (`hash [subject]` per line, same as `keep_commits.txt`) and skips
+  Phase 2/3 discovery and classification.
 - **AI conflict explanation & build-fix** : `--ailog` (on by default) calls
   Claude via the Cursor SDK for two purposes:
   1. After every conflict resolution, generates a concise explanation of

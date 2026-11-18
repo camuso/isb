@@ -265,13 +265,41 @@ When invoked without a command,
 runs the full backport flow.
 .TP
 .B status
+Show all user\-config fields from
+.I ~/.config/isb/config.json
+(policies, editor, ailog, AI provider, API key location — never the
+secret — model lists, Signed\-off\-by / Assisted\-by) and exit.
+Does not require a kernel tree.
+.TP
+.B config
+Open the interactive user Config menu (same as hotkey
+.BR C
+in Parameters), save on quit, and exit.
+Does not require a kernel tree.
+.TP
+.B progress
 Show backport progress (current HEAD, commits applied, next commit
 in queue) and exit.
+Must be run from a RHEL kernel tree with a saved session.
 Does not require session parameters such as
 .B \-\-subsystem
 or
 .BR \-\-rhel ;
 reads them from the saved session file.
+.TP
+.BI "file " PATH
+Backport the commits listed in
+.I PATH
+(same format as
+.IR keep_commits.txt :
+.BI hash
+optionally followed by a subject; comments with
+.B #
+ignored).
+Skips Phase\ 2 divergence discovery and Phase\ 3 KEEP/OMIT
+classification; the file is the KEEP list (oldest first).
+Still runs the normal Parameters/session flow for subsystem, scope,
+and policies.
 .TP
 .B continue
 Resume from previously saved state in the output directory.
@@ -780,7 +808,9 @@ as defaults in the interactive menu.
 .B \-\-divergence
 are per-invocation and never saved to the session.
 The
-.BR continue ", " pick ", " reset ", and " status
+.BR continue ", " pick ", " reset ", " status ", " config ", " progress ,
+and
+.B file
 commands are also per-invocation.
 .SH EXAMPLES
 First run (prompts for session parameters):

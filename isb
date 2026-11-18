@@ -328,6 +328,96 @@ def _config_summary_line():
     return f"{provider} / {plabel} / {ailog} / {key}"
 
 
+def _standalone_config_params():
+    """Minimal params dict for standalone ``isb config``."""
+    ensure_user_config(_session)
+    return {
+        "conflict_policy": get_config("conflict_policy"),
+        "build_policy": get_config("build_policy") or "conflict",
+        "editor": get_config("editor") or _get_editor(),
+        "ailog": bool(get_config("ailog")),
+        "signed_off_by": get_config("signed_off_by") or "",
+        "assisted_by": get_config("assisted_by") or "",
+    }
+
+
+def _format_config_field_display(field):
+    """Human-readable value for one user-config field (no secrets)."""
+    ensure_user_config(_session)
+    if field in ("ai_api_key", "ai_api_key_file", "ai_api_key_env"):
+        # Combined key status; also show env/file paths separately below
+        if field == "ai_api_key":
+            return _api_key_status()
+        if field == "ai_api_key_env":
+            return get_config("ai_api_key_env") or "CURSOR_API_KEY"
+        path = get_config("ai_api_key_file") or ""
+        return path if path else "(default search paths)"
+    if field == "conflict_policy":
+        val = get_config(field)
+        if val not in CONFLICT_POLICIES:
+            return "auto"
+        return CONFLICT_POLICY_LABELS.get(val, val)
+    if field == "build_policy":
+        return get_config(field) or "conflict"
+    if field == "ai_provider":
+        return get_config(field) or "cursor"
+    if field == "ailog":
+        return "on" if get_config(field) else "off"
+    if field in ("ai_model_analysis", "ai_model_fix"):
+        prefs = get_config(field) or []
+        if isinstance(prefs, list) and prefs:
+            return ", ".join(prefs)
+        return "(default list)"
+    if field == "editor":
+        return get_config(field) or _get_editor() or "(not set)"
+    val = get_config(field)
+    if val is None or val == "":
+        return "(not set)"
+    return str(val)
+
+
+def show_user_config_status():
+    """Print all user-config fields (no secrets) and return."""
+    ensure_user_config(_session)
+    # Display order: menu fields first, then remaining CONFIG keys
+    labels = {
+        "conflict_policy": "Conflict policy",
+        "build_policy": "Build policy",
+        "editor": "Editor",
+        "ailog": "AI conflict log",
+        "ai_provider": "AI provider",
+        "ai_api_key": "API key",
+        "ai_api_key_env": "API key env",
+        "ai_api_key_file": "API key file",
+        "ai_model_analysis": "Analysis models",
+        "ai_model_fix": "Fix models",
+        "signed_off_by": "Signed-off-by",
+        "assisted_by": "Assisted-by",
+    }
+    ordered = [
+        "conflict_policy", "build_policy", "editor", "ailog",
+        "ai_provider", "ai_api_key", "ai_api_key_env", "ai_api_key_file",
+        "ai_model_analysis", "ai_model_fix",
+        "signed_off_by", "assisted_by",
+    ]
+    seen = set(ordered)
+    for k in CONFIG_FIELD_NAMES:
+        if k not in seen and k not in ("ai_api_key_env", "ai_api_key_file"):
+            # ai_api_key_* already listed; skip unknown duplicates
+            if k not in ordered:
+                ordered.append(k)
+                labels.setdefault(k, k)
+
+    print(f"\n{MNU}    isb Config{OFF}  {DIM}({_USER_CONFIG_FILE}){OFF}")
+    print(f"    {'─' * 50}")
+    for field in ordered:
+        label = labels.get(field, field)
+        display = _format_config_field_display(field)
+        print(f"  {label:<18s}: {INF}{display}{OFF}")
+    print(f"    {'─' * 50}")
+    print(f"  Edit with: {BLD}isb config{OFF}\n")
+
+
 def _load_api_config():
     """Load API replacement rules from the repo baseline and optional user
     override.  Returns (filter_symbols, replacements) where replacements
@@ -831,11 +921,58 @@ _HELP_TOPICS = {
     ),
     "status": (
         "isb status",
+        "Show user config fields and exit.",
+        textwrap.dedent("""\
+            Prints every field from ~/.config/isb/config.json (policies,
+            editor, ailog, AI provider, API key location — never the
+            secret — model lists, Signed-off-by / Assisted-by defaults)
+            and exits.  Does not require a kernel tree.
+
+            Edit interactively with:  isb config
+        """),
+    ),
+    "config": (
+        "isb config",
+        "Open the user Config menu and exit when done.",
+        textwrap.dedent("""\
+            Presents the same Config menu as hotkey C in Parameters /
+            session (conflict/build policy, editor, ailog, AI provider,
+            API key, model lists, Signed-off-by / Assisted-by).  Saves to
+            ~/.config/isb/config.json on quit.  Does not require a
+            kernel tree.
+
+            View current values without editing:  isb status
+        """),
+    ),
+    "progress": (
+        "isb progress",
         "Show backport progress and exit.",
         textwrap.dedent("""\
             Displays the current backport progress: how many commits have
             been applied, how many remain, the current and next commit,
-            and the session parameters.
+            and the session parameters.  Must be run from a RHEL kernel
+            tree with a saved session.
+        """),
+    ),
+    "file": (
+        "isb file <PATH>",
+        "Backport commits listed in a file (skip discovery/classify).",
+        textwrap.dedent("""\
+            Reads PATH for the KEEP list and goes straight to cherry-pick
+            (skips Phase 2 divergence scan and Phase 3 classification).
+            Still uses the normal session/Parameters flow for subsystem,
+            scope, policies, etc.
+
+            File format (same as keep_commits.txt):
+              # comments ignored
+              <hash> [subject]
+
+            Hashes may be abbreviated; subjects are resolved from the
+            upstream repo when omitted.  Oldest-first order is preserved.
+
+            Example:
+              isb file ~/lists/ipmi-keep.txt
+              isb file backports/9.10/ipmi/keep_commits.txt --yes
         """),
     ),
     "reset": (
@@ -994,26 +1131,6 @@ _HELP_TOPICS = {
             and commit list files (keep_commits.txt, omit_commits.txt).
 
             Interactive menu hotkey: 8
-        """),
-    ),
-    "config": (
-        "isb Config menu (C)",
-        "Stable preferences in ~/.config/isb/config.json.",
-        textwrap.dedent("""\
-            Open with C from the Parameters or session menu, or when
-            prompted by 'isb new'.  Holds settings that rarely change
-            between backports:
-
-              conflict-policy, build-policy, editor, ailog
-              AI provider (currently: cursor)
-              API key env/file references (never the raw secret)
-              analysis / fix model preference lists
-              signed-off-by / assisted-by defaults
-
-            Paste-to-file stores the key under
-            ~/.config/isb/api-keys/ with mode 0600.
-
-            Precedence: CLI > session > user config > built-in defaults.
         """),
     ),
     "conflict-policy": (
@@ -1232,13 +1349,14 @@ def _show_topics_list():
     print(f"  e.g.  isb help conflict-policy   "
           f"{DIM}not{OFF}  isb help --conflict-policy\n")
     print(f"{BLD}Commands:{OFF}")
-    for cmd in ("help", "pick", "continue", "status", "reset", "new"):
+    for cmd in ("help", "status", "config", "progress", "file", "pick",
+                "continue", "reset", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<22s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
                 "cve", "jira", "add", "drop",
-                "branch", "output-dir", "config",
+                "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen", "ailog", "skip"):
@@ -1274,13 +1392,14 @@ def _show_general_help():
         return
     print(f"\n{BLD}isb{OFF} -- Intelligent Subsystem Backport for RHEL kernels\n")
     print(f"{BLD}Commands:{OFF}")
-    for cmd in ("help", "pick", "continue", "status", "reset", "new"):
+    for cmd in ("help", "status", "config", "progress", "file", "pick",
+                "continue", "reset", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
     for opt in ("subsystem", "rhel", "upstream-repo", "upstream-version",
                 "cve", "jira", "add", "drop",
-                "branch", "output-dir", "config",
+                "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
                 "divergence", "toolbox", "regen", "ailog"):
@@ -1300,7 +1419,10 @@ def parse_args():
             commands:
               isb                          default backport flow
               isb help [TOPIC]             show help (or topic details)
-              isb status                   show progress and exit
+              isb status                   show user config and exit
+              isb config                   edit user config (menu) and exit
+              isb progress                 show backport progress and exit
+              isb file <PATH>              backport commits listed in a file
               isb continue                 resume from saved state
               isb pick <HASH>              cherry-pick one upstream commit
               isb reset <HASH>             reset to an earlier commit
@@ -1310,6 +1432,7 @@ def parse_args():
               cd ~/kernels/centos-9
               isb --dry-run                first run, prompts for session
               isb                          subsequent runs reuse session
+              isb file keep_commits.txt    skip discovery; use this KEEP list
               isb pick abc123def456        single-commit pick
               isb help conflict-policy     detailed help for an option
         """),
@@ -1391,13 +1514,23 @@ def parse_args():
     p.add_argument("--status", action="store_true",
                     help=argparse.SUPPRESS)
 
-    # Subcommands: help, continue, status, pick, reset, new
+    # Subcommands: help, status, config, progress, continue, pick, reset, new
     sub = p.add_subparsers(dest="command")
     help_p = sub.add_parser("help", help="Show help for a command or option")
     help_p.add_argument("topic", nargs="?", default=None,
                         help="Command or option name")
     sub.add_parser("continue", help="Resume from saved state")
-    sub.add_parser("status", help="Show backport progress and exit")
+    sub.add_parser("status", help="Show user config fields and exit")
+    sub.add_parser("config", help="Edit user config (menu) and exit")
+    sub.add_parser("progress", help="Show backport progress and exit")
+    file_p = sub.add_parser(
+        "file",
+        help="Backport commits listed in a file (skip discovery)",
+    )
+    file_p.add_argument(
+        "path",
+        help="File of commits to KEEP (hash [subject] per line)",
+    )
     pick_p = sub.add_parser("pick",
                             help="Cherry-pick a single upstream commit")
     pick_p.add_argument("hash", help="Full 40-char upstream commit hash")
@@ -1428,7 +1561,8 @@ REQUIRED_SESSION = [
 
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
-                  "command", "hash", "status", "regen", "step"}
+                  "command", "hash", "path", "status", "config",
+                  "progress", "file", "regen", "step"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -8219,7 +8353,11 @@ def _write_commit_list(keep_path, keep, omit_path, omit):
 
 def _read_commit_list(path):
     """Read an edited commit list file.  Returns list of (hash, subject)
-    or None if the file doesn't exist."""
+    or None if the file doesn't exist.
+
+    Accepts ``<hash> <subject>`` or hash-only lines.  Trailing
+    ``| reason`` (omit-list style) is stripped from the subject.
+    """
     if not os.path.isfile(path):
         return None
     result = []
@@ -8229,17 +8367,55 @@ def _read_commit_list(path):
             if not line or line.startswith("#"):
                 continue
             parts = line.split(None, 1)
-            if len(parts) < 2:
-                continue
             commit_hash = parts[0]
-            subject = parts[1]
-            if len(commit_hash) < 12:
+            subject = parts[1] if len(parts) > 1 else ""
+            if " | " in subject:
+                subject = subject.split(" | ", 1)[0].strip()
+            if len(commit_hash) < 7:
                 continue
             result.append((commit_hash, subject))
     return result
 
 
-def show_status(rhel_repo):
+def load_commits_from_file(path, upstream_repo):
+    """Load a KEEP list from *path*, resolving hashes in *upstream_repo*.
+
+    File format matches ``keep_commits.txt``: one commit per line,
+    ``#`` comments ignored, ``<hash> [subject]`` (subject optional).
+    Returns list of ``(full_hash, subject, \"from file\")``.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    raw = _read_commit_list(path)
+    if raw is None:
+        die(f"Commit list not found: {path}")
+    if not raw:
+        die(f"No commits found in {path}")
+
+    keep = []
+    seen = set()
+    with Spinner(f"Resolving {len(raw)} commit(s) from {path} ..."):
+        for i, (raw_h, subj_hint) in enumerate(raw, 1):
+            r = git(f"rev-parse --verify {raw_h}^{{commit}}",
+                    cwd=upstream_repo, check=False)
+            if r.returncode != 0 or not r.stdout.strip():
+                die(f"{path}: line {i}: unknown commit '{raw_h}' "
+                    f"(not in {upstream_repo})")
+            h = r.stdout.strip()
+            if h in seen:
+                continue
+            seen.add(h)
+            sr = git(f"log -1 --format=%s {h}", cwd=upstream_repo,
+                     check=False)
+            subject = (sr.stdout.strip() if sr.returncode == 0 and sr.stdout.strip()
+                       else (subj_hint or h[:12]))
+            keep.append((h, subject, "from file"))
+
+    if not keep:
+        die(f"No usable commits in {path}")
+    return keep
+
+
+def show_progress(rhel_repo):
     """Display backport progress from saved session and state, then exit."""
     session = load_session(rhel_repo)
     if not session:
@@ -8277,7 +8453,7 @@ def show_status(rhel_repo):
                   if "skipped" in reason.lower()) if omit else 0
 
     print(f"\n{MNU}{SEP}{OFF}")
-    print(f"  {BLD}Backport Status{OFF}")
+    print(f"  {BLD}Backport Progress{OFF}")
     print(f"{MNU}{SUB}{OFF}")
     print(f"  {'Subsystem:':<20s} {INF}{subsystem}{OFF}")
     print(f"  {'RHEL version:':<20s} {INF}{rhel_ver}{OFF}")
@@ -8635,9 +8811,14 @@ def main():
     if getattr(args, "exclude_legacy", None):
         args.exclude = (args.exclude or []) + args.exclude_legacy
 
-    _check_and_install_deps()
+    # Normalize hidden compat flags into args.command
+    if not args.command:
+        if getattr(args, "status", False):
+            args.command = "status"
+        elif getattr(args, "resume", False):
+            args.command = "continue"
 
-    # Handle help subcommand before anything else
+    # Commands that do not require a kernel tree (or deps install).
     if args.command == "help":
         topic = getattr(args, "topic", None)
         if topic:
@@ -8645,12 +8826,17 @@ def main():
         else:
             _show_general_help()
 
-    # Normalize hidden compat flags into args.command
-    if not args.command:
-        if getattr(args, "status", False):
-            args.command = "status"
-        elif getattr(args, "resume", False):
-            args.command = "continue"
+    if args.command == "status":
+        ensure_user_config()
+        show_user_config_status()
+        return
+
+    if args.command == "config":
+        ensure_user_config()
+        show_config_menu(_standalone_config_params())
+        return
+
+    _check_and_install_deps()
 
     # realpath so symlink entry points like /work/... become $HOME/...
     # (toolbox only mounts $HOME; see _toolbox_cmd / _subprocess_env).
@@ -8670,8 +8856,8 @@ def main():
     _session_repo = rhel_repo
     ensure_user_config(_session)
 
-    if args.command == "status":
-        show_status(rhel_repo)
+    if args.command == "progress":
+        show_progress(rhel_repo)
         return
 
     if args.command == "new":
@@ -9360,12 +9546,14 @@ def main():
         _save()
 
         # -- Completion check (after menu, so user could edit/regen) --
+        # isb file always (re)loads a KEEP list — do not short-circuit.
         current_head = git("rev-parse HEAD",
                            cwd=rhel_repo, check=False).stdout.strip()
         completed_head = _session.get("_completed_head")
         base_commit = _session.get("_base_commit")
 
-        if completed_head and current_head == completed_head:
+        if (args.command != "file"
+                and completed_head and current_head == completed_head):
             if (conflict_policy == "patchpal"
                     and _session.get("conflict_policy") != "patchpal"
                     and base_commit):
@@ -9389,62 +9577,98 @@ def main():
                      f"patches, use 'p' in the menu or 'isb --regen'.")
                 info(f"  Re-run with different parameters or from a new "
                      f"branch to start a new backport.")
+                info(f"  Or: isb file <path> to apply a commit list.")
                 return
 
-        # -- Try to reuse cached divergence/classification results --
-        cached = load_cached_results(_session)
-        if cached and not args.divergence:
-            divergence, pending, keep, omit = cached
-            status("Using cached results from previous run")
-            info(f"  divergence:  {divergence[:12]}")
-            info(f"  pending:     {len(pending)} commits")
-            info(f"  KEEP: {len(keep)}   OMIT: {len(omit)}")
-        else:
-            if cached:
-                info("--divergence supplied; re-scanning.")
-
-            # -- Phase 1 --
+        # -- Commit list: from file, cache, or Phase 2/3 discovery --
+        if args.command == "file":
+            header("Loading commits from file")
+            commit_file = getattr(args, "path", None)
+            if not commit_file:
+                die("isb file requires a PATH argument.")
+            # Phase 1 still refreshes configs for Kconfig-aware builds
             configs_dir = run_dist_configs(rhel_repo, toolbox_name)
-            config_map = load_enabled_configs(configs_dir)
+            load_enabled_configs(configs_dir)
 
-            # -- Phase 2 --
-            if args.divergence:
-                divergence = args.divergence
-                info(f"Using user-supplied divergence point: "
-                     f"{divergence[:12]}")
-            else:
-                divergence = find_divergence_point(
-                    rhel_repo, upstream_repo, scope_paths,
-                )
-            pending = list_pending_commits(
-                upstream_repo, divergence, scope_paths, rhel_repo,
-                exclude_paths=args.exclude or None,
-            )
-            if not pending:
-                die("No pending commits found. Nothing to backport.")
-
-            # -- Phase 3 --
-            keep, omit = classify_commits(
-                pending, config_map, upstream_repo, rhel_repo, scope_paths,
-            )
+            keep = load_commits_from_file(commit_file, upstream_repo)
+            omit = []
+            pending = [h for h, _, _ in keep]
+            divergence = pending[0] if pending else "file"
+            status(f"Loaded {len(keep)} commit(s) from {commit_file}")
+            info("  Skipping Phase 2 (divergence) and Phase 3 "
+                 "(classification) — file is the KEEP list.")
+            for h, subj, _ in keep[:8]:
+                info(f"  {h[:12]} {subj}")
+            if len(keep) > 8:
+                info(f"  ... and {len(keep) - 8} more")
 
             save_cached_results(_session, divergence, pending, keep, omit)
             _session.pop("_completed_head", None)
+            _session["commit_file"] = os.path.abspath(
+                os.path.expanduser(commit_file))
             _save()
 
-            # Clear stale cherry-pick state from prior runs
             state_file = os.path.join(output_dir, ".backport-state.json")
             if os.path.isfile(state_file):
                 os.remove(state_file)
                 info("  Cleared stale state from previous run.")
+            # File is authoritative — do not seek Fixes: dependents
+        else:
+            cached = load_cached_results(_session)
+            if cached and not args.divergence:
+                divergence, pending, keep, omit = cached
+                status("Using cached results from previous run")
+                info(f"  divergence:  {divergence[:12]}")
+                info(f"  pending:     {len(pending)} commits")
+                info(f"  KEEP: {len(keep)}   OMIT: {len(omit)}")
+            else:
+                if cached:
+                    info("--divergence supplied; re-scanning.")
 
-        # Seek Fixes: dependents of KEEP (out-of-scope → Omitted-fixes)
-        keep, omit = seek_fixes_for_keep(
-            keep, omit, upstream_repo, rhel_repo, scope_paths,
-            exclude_paths=args.exclude or None,
-        )
-        save_cached_results(_session, divergence, pending, keep, omit)
-        _save()
+                # -- Phase 1 --
+                configs_dir = run_dist_configs(rhel_repo, toolbox_name)
+                config_map = load_enabled_configs(configs_dir)
+
+                # -- Phase 2 --
+                if args.divergence:
+                    divergence = args.divergence
+                    info(f"Using user-supplied divergence point: "
+                         f"{divergence[:12]}")
+                else:
+                    divergence = find_divergence_point(
+                        rhel_repo, upstream_repo, scope_paths,
+                    )
+                pending = list_pending_commits(
+                    upstream_repo, divergence, scope_paths, rhel_repo,
+                    exclude_paths=args.exclude or None,
+                )
+                if not pending:
+                    die("No pending commits found. Nothing to backport.")
+
+                # -- Phase 3 --
+                keep, omit = classify_commits(
+                    pending, config_map, upstream_repo, rhel_repo,
+                    scope_paths,
+                )
+
+                save_cached_results(
+                    _session, divergence, pending, keep, omit)
+                _session.pop("_completed_head", None)
+                _save()
+
+                # Clear stale cherry-pick state from prior runs
+                state_file = os.path.join(output_dir, ".backport-state.json")
+                if os.path.isfile(state_file):
+                    os.remove(state_file)
+                    info("  Cleared stale state from previous run.")
+
+            # Seek Fixes: dependents of KEEP (out-of-scope → Omitted-fixes)
+            keep, omit = seek_fixes_for_keep(
+                keep, omit, upstream_repo, rhel_repo, scope_paths,
+                exclude_paths=args.exclude or None,
+            )
+            save_cached_results(_session, divergence, pending, keep, omit)
+            _save()
 
         if args.dry_run:
             header("Dry run complete")
