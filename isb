@@ -579,31 +579,94 @@ def _cleanup_and_exit(*_args):
 # ---------------------------------------------------------------------------
 
 class Spinner:
-    """Animated spinner for long-running operations."""
+    """Animated spinner with elapsed time and same-line progress.
+
+    The status line is fully redrawn every frame::
+
+        ⠋  Building drivers/char/ipmi  (2m 03s)  ·  23 files processed
+
+    Call ``progress()`` to update the live suffix (redrawn with the
+    spinner; not erased).  Call ``note()`` for a sticky milestone on
+    the line above.  Existing ``with Spinner("…"):`` call sites keep
+    working unchanged.
+    """
     _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _INTERVAL = 0.08
 
     def __init__(self, message):
         self._message = message
+        self._progress = ""
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._t0 = None
+        self._last_len = 0
+
+    @staticmethod
+    def _format_elapsed(seconds):
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+
+    def _elapsed(self):
+        if self._t0 is None:
+            return "0s"
+        return self._format_elapsed(time.monotonic() - self._t0)
+
+    def _line(self, glyph):
+        with self._lock:
+            msg = self._message
+            prog = self._progress
+        text = f"  {glyph} {msg}  ({self._elapsed()})"
+        if prog:
+            text += f"  ·  {prog}"
+        return text
+
+    def _paint(self, text, *, final=False):
+        """Redraw the status line; pad so a shorter line clears leftovers."""
+        pad = max(0, self._last_len - len(text))
+        if final:
+            print(f"\r{text}{' ' * pad}", flush=True)
+            self._last_len = 0
+        else:
+            print(f"\r{text}{' ' * pad}", end="", flush=True)
+            self._last_len = len(text)
+
+    def progress(self, text):
+        """Update the live same-line progress suffix (thread-safe)."""
+        with self._lock:
+            self._progress = (text or "").strip()
+
+    def note(self, text):
+        """Print a sticky milestone above the spinner line."""
+        # Clear status line, emit note, leave spinner to redraw below.
+        pad = max(self._last_len, 1)
+        print(f"\r{' ' * pad}\r  {DIM}{text}{OFF}", flush=True)
+        self._last_len = 0
 
     def _spin(self):
         i = 0
         while not self._stop.is_set():
             frame = self._FRAMES[i % len(self._FRAMES)]
-            print(f"\r  {INF}{frame} {self._message}{OFF}", end="", flush=True)
+            self._paint(f"{INF}{self._line(frame)}{OFF}")
             i += 1
-            self._stop.wait(0.08)
-        print(f"\r  {STA}✓ {self._message}{OFF}" + " " * 10)
+            self._stop.wait(self._INTERVAL)
 
     def __enter__(self):
+        self._t0 = time.monotonic()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, *exc):
         self._stop.set()
-        self._thread.join()
+        if self._thread is not None:
+            self._thread.join()
+        glyph = "✓" if exc_type is None else "✗"
+        color = STA if exc_type is None else WRN
+        # Final line keeps elapsed (+ progress) so the user sees duration.
+        self._paint(f"{color}{self._line(glyph)}{OFF}", final=True)
 
 
 class Progress:
@@ -3364,7 +3427,8 @@ def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
     # Map short prefixes -> (full_hash, subject) for matching Fixes: lines
     keep_by_prefix = {}
     keep_hashes = [h for h, _, _ in keep]
-    with Spinner("Seeking Fixes: for KEEP commits ..."):
+    with Spinner("Seeking Fixes: for KEEP commits") as sp:
+        sp.progress(f"0/{len(keep_hashes)} KEEP dated")
         # Batch dates for all KEEP commits (one git invocation)
         walk = " ".join(keep_hashes)
         meta = git(
@@ -3382,17 +3446,20 @@ def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
                 dates.append(d)
                 for n in (12, 10, 8):
                     if len(fh) >= n:
-                        keep_by_prefix.setdefault(fh[:n], (fh, subj_by_h.get(fh, "")))
+                        keep_by_prefix.setdefault(
+                            fh[:n], (fh, subj_by_h.get(fh, "")))
         if not keep_by_prefix:
             for h, s, _ in keep:
                 for n in (12, 10, 8):
                     if len(h) >= n:
                         keep_by_prefix.setdefault(h[:n], (h, s))
+        sp.progress(f"{len(keep_hashes)} KEEP dated")
 
         oldest = min(dates) if dates else None
         since_arg = f"--since={oldest}" if oldest else ""
 
         # ONE upstream scan for all Fixes: trailers since oldest KEEP
+        sp.progress("scanning upstream Fixes:")
         r = git(
             f"log --no-merges {since_arg} --grep='^Fixes:' "
             f"--format='%H%x00%s%x00%b%x00'",
@@ -3421,11 +3488,14 @@ def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
                     kh, ksubj = matched
                     candidates.append((fh, fsubj, kh, ksubj))
                     break  # one KEEP match is enough for this fix
+        sp.progress(f"{len(candidates)} Fixes: candidate(s)")
 
         # Batch RHEL citation check (one log since oldest KEEP date)
+        sp.progress(f"checking RHEL for {len(candidates)} candidate(s)")
         cited = _rhel_cited_upstream_shorts(rhel_repo, oldest)
 
-        for fh, fsubj, kh, ksubj in candidates:
+        for i, (fh, fsubj, kh, ksubj) in enumerate(candidates, 1):
+            sp.progress(f"candidate {i}/{len(candidates)}")
             if fh in known or fh[:12] in known_short:
                 continue
             if fh[:12] in cited:
@@ -3457,6 +3527,9 @@ def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
                 omit.append(entry)
             known.add(fh)
             known_short.add(fh[:12])
+        sp.progress(
+            f"{len(added_omit)} omit, {len(added_keep)} keep"
+        )
 
     if added_omit or added_keep:
         info(f"Fixes: seek — "
@@ -7289,12 +7362,14 @@ def _mkmod_build(rhel_repo, toolbox_name, subsystem):
     """
     log = []
 
-    # 1. Refresh generated configs
-    _invalidate_dist_configs_stamp(rhel_repo)
-    src_hash = _config_source_hash(rhel_repo)
-    with Spinner("mkmod: regenerating dist-configs ..."):
+    with Spinner(f"mkmod build M={subsystem}") as sp:
+        # 1. Refresh generated configs
+        sp.progress("dist-configs")
+        _invalidate_dist_configs_stamp(rhel_repo)
+        src_hash = _config_source_hash(rhel_repo)
         # Prefer dist-configs; fall back to rh-configs like mkmod does
         for target in ("dist-configs", "rh-configs"):
+            sp.progress(f"make {target}")
             cmd, cwd = _toolbox_cmd(
                 toolbox_name, f"make {target}", rhel_repo)
             rc, out, err = run_quiet(cmd, cwd=cwd)
@@ -7305,28 +7380,29 @@ def _mkmod_build(rhel_repo, toolbox_name, subsystem):
             return False, "mkmod: make dist-configs/rh-configs failed\n" + \
                 "".join(log)
 
-    stamp = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
-    with open(stamp, "w") as fh:
-        fh.write((src_hash or "unknown") + "\n")
+        stamp = os.path.join(rhel_repo, DIST_CONFIGS_STAMP)
+        with open(stamp, "w") as fh:
+            fh.write((src_hash or "unknown") + "\n")
 
-    # 2. Install host-arch .config
-    cfg = _host_arch_config_path(rhel_repo)
-    if cfg:
-        dest = os.path.join(rhel_repo, ".config")
-        try:
-            shutil.copy2(cfg, dest)
-            info(f"  mkmod: installed {os.path.relpath(cfg, rhel_repo)} "
-                 f"→ .config")
-        except OSError as e:
-            warn(f"  mkmod: could not install .config: {e}")
-    else:
-        warn("  mkmod: no host-arch kernel-*.config found; "
-             "reusing existing .config")
+        # 2. Install host-arch .config
+        sp.progress("install .config")
+        cfg = _host_arch_config_path(rhel_repo)
+        if cfg:
+            dest = os.path.join(rhel_repo, ".config")
+            try:
+                shutil.copy2(cfg, dest)
+                sp.note(
+                    f"mkmod: installed {os.path.relpath(cfg, rhel_repo)} "
+                    f"→ .config")
+            except OSError as e:
+                warn(f"  mkmod: could not install .config: {e}")
+        else:
+            warn("  mkmod: no host-arch kernel-*.config found; "
+                 "reusing existing .config")
 
-    # 3. prepare / modules_prepare (needed after .config refresh)
-    with Spinner("mkmod: make prepare && modules_prepare ..."):
-        for step in ("make prepare",
-                     "make modules_prepare"):
+        # 3. prepare / modules_prepare (needed after .config refresh)
+        for step in ("make prepare", "make modules_prepare"):
+            sp.progress(step)
             cmd, cwd = _toolbox_cmd(toolbox_name, step, rhel_repo)
             rc, out, err = run_quiet(cmd, cwd=cwd)
             log.append(out + err)
@@ -7336,17 +7412,18 @@ def _mkmod_build(rhel_repo, toolbox_name, subsystem):
                 warn(f"  mkmod: '{step}' exited {rc} "
                      f"(continuing to module build)")
 
-    # 4. Clean + build the subsystem module (mkmod's final step)
-    with Spinner(f"mkmod: make M={subsystem} clean ..."):
+        # 4. Clean + build the subsystem module (mkmod's final step)
+        sp.progress(f"make M={subsystem} clean")
         cmd, cwd = _toolbox_cmd(
             toolbox_name, f"make M={subsystem} clean", rhel_repo)
         run_quiet(cmd, cwd=cwd)
 
-    with Spinner(f"mkmod: building M={subsystem} ..."):
+        sp.progress(f"building M={subsystem}")
         # Tree already prepared/cleaned above.
         ok, build_out = build_test(
             rhel_repo, toolbox_name, subsystem, prepare=False,
         )
+        sp.progress("build OK" if ok else "build FAILED")
     log.append(build_out)
     return ok, "".join(log)
 
@@ -7934,16 +8011,16 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             n_files = len(inscope_conflicted)
             hunk_map = getattr(resolve_conflicts, "_hunk_prereqs", {}) or {}
             analyses = []
-            for fi, cf in enumerate(inscope_conflicted, 1):
-                label = (f"Analyzing conflicts [{fi}/{n_files}]: "
-                         f"{cf} ...")
-                with Spinner(label):
+            with Spinner("Analyzing conflicts") as sp:
+                for fi, cf in enumerate(inscope_conflicted, 1):
+                    sp.progress(f"{fi}/{n_files} files · {cf}")
                     analyses.append(
                         _analyze_conflict(
                             cf, commit_hash, upstream_repo, rhel_repo,
                             hunk_prereqs=hunk_map.get(cf),
                         )
                     )
+                sp.progress(f"{n_files}/{n_files} files done")
 
             # Add missing prerequisite notes in reviewer style
             all_missing = []
@@ -7974,10 +8051,12 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     estimate = "~30 seconds"
                 else:
                     estimate = "~15 seconds"
-                with Spinner(f"AI conflict analysis ({estimate}) ..."):
+                with Spinner("AI conflict analysis") as sp:
+                    sp.progress(estimate)
                     ai_explanation = _ai_explain_conflicts(
                         analyses, commit_hash, subject, upstream_repo,
                     )
+                    sp.progress("done")
                 # Always surface SKIP when heuristic says so, even if AI
                 # omitted RECOMMENDATION or wrongly said ACCEPT.
                 ai_explanation = _ensure_skip_recommendation_text(
@@ -8861,8 +8940,9 @@ def load_commits_from_file(path, upstream_repo):
 
     keep = []
     seen = set()
-    with Spinner(f"Resolving {len(raw)} commit(s) from {path} ..."):
+    with Spinner(f"Resolving commits from {os.path.basename(path)}") as sp:
         for i, (raw_h, subj_hint) in enumerate(raw, 1):
+            sp.progress(f"{i}/{len(raw)} commits")
             r = git(f"rev-parse --verify {raw_h}^{{commit}}",
                     cwd=upstream_repo, check=False)
             if r.returncode != 0 or not r.stdout.strip():
@@ -8877,6 +8957,7 @@ def load_commits_from_file(path, upstream_repo):
             subject = (sr.stdout.strip() if sr.returncode == 0 and sr.stdout.strip()
                        else (subj_hint or h[:12]))
             keep.append((h, subject, "from file"))
+        sp.progress(f"{len(keep)} commits resolved")
 
     if not keep:
         die(f"No usable commits in {path}")
@@ -9490,7 +9571,8 @@ def regen_patches(rhel_repo, output_dir, base_commit,
     orig_head = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
     patch_tmpdir = tempfile.mkdtemp(prefix="isb-regen-patches-")
     try:
-        with Spinner("format-patch current series ..."):
+        with Spinner("format-patch current series") as sp:
+            sp.progress(f"{len(commits)} commits")
             r = git(f"format-patch -o {shlex.quote(patch_tmpdir)} "
                     f"{base_commit}..HEAD",
                     cwd=rhel_repo, check=False)
@@ -9502,23 +9584,27 @@ def regen_patches(rhel_repo, output_dir, base_commit,
             warn(f"  format-patch produced {len(patch_files)} patches "
                  f"for {len(commits)} commits — continuing.")
 
-        for i, (patch, c) in enumerate(zip(patch_files, commits)):
-            subj = _rewrite_patch_file(
-                patch, rhel_repo, c, jira, upstream_version,
-                signed_off_by, assisted_by, cve=cve)
-            kind = ("config" if _is_config_snippet_subject(subj)
-                    else "backport")
-            info(f"    [{i + 1}/{len(patch_files)}] "
-                 f"{kind}: {subj[:56]}")
+        with Spinner("Rewriting patch messages") as sp:
+            for i, (patch, c) in enumerate(zip(patch_files, commits)):
+                subj = _rewrite_patch_file(
+                    patch, rhel_repo, c, jira, upstream_version,
+                    signed_off_by, assisted_by, cve=cve)
+                kind = ("config" if _is_config_snippet_subject(subj)
+                        else "backport")
+                sp.progress(
+                    f"{i + 1}/{len(patch_files)} {kind} · {subj[:40]}")
 
         status(f"  Resetting to base {base_commit[:12]} ...")
         git(f"reset --hard {base_commit}", cwd=rhel_repo)
 
-        with Spinner(f"git am {len(patch_files)} rewritten patch(es) ..."):
+        with Spinner(f"git am {len(patch_files)} rewritten patches") as sp:
+            sp.progress(f"0/{len(patch_files)} applied")
             # Apply in sorted order (0011-, 0012-, ...)
             am_cmd = "git am --3way -- " + " ".join(
                 shlex.quote(p) for p in patch_files)
             r = run(am_cmd, cwd=rhel_repo, check=False)
+            if r.returncode == 0:
+                sp.progress(f"{len(patch_files)}/{len(patch_files)} applied")
         if r.returncode != 0:
             warn("git am failed — restoring previous HEAD ...")
             git("am --abort", cwd=rhel_repo, check=False)
