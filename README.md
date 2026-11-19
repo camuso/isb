@@ -72,7 +72,8 @@ RHEL-compliant commit messages suitable for merge requests.
   `redhat/configs/common/generic/CONFIG_FOO` (using the Kconfig
   default, or an explicit y/n/m choice). After the upstream backport
   commit, snippets are committed as their own `redhat/configs:` patch
-  (`Upstream status: RHEL-only`) for bisectability. Any commit that
+  (`Upstream status: RHEL-only`), describing only the new or disabled
+  config option(s). Any commit that
   touches Kconfig (or creates a snippet) forces an mkmod-style
   validation: regenerate dist-configs, install the host-arch `.config`,
   run `prepare`/`modules_prepare`, then `make M=<subsystem>`.
@@ -111,6 +112,10 @@ RHEL-compliant commit messages suitable for merge requests.
   opens the KEEP/OMIT review after the list exists. Default path is
   session `keep_commits.txt`; missing default prompts for a path;
   a missing explicit path exits with a message.
+- **Regen** : `isb regen` (or Parameters menu `p`) rewrites series
+  messages via format-patch → `reset --hard` base → `git am`, then
+  recreates `patches/`, `Omitted-fixes`, and `mr-description.txt`.
+  `redhat/configs` commits keep `Upstream status: RHEL-only`.
 - **Skip → omit_commits.txt** : user skips prompt for a reason; automatic
   isb/AI omits (inapplicable, already applied, etc.) record their reason.
   Both rewrite `omit_commits.txt` (and trim `keep_commits.txt`) immediately.

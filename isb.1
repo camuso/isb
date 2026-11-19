@@ -222,8 +222,8 @@ After the upstream backport commit, isb commits the snippet(s) as a
 separate
 .B redhat/configs:
 patch
-.RB ( Upstream\ status:\ RHEL\-only )
-for bisectability, using
+.RB ( Upstream\ status:\ RHEL\-only ),
+describing only the new or disabled config option(s), using
 .BR git\ commit\ \-s .
 Any commit that touches Kconfig (or creates a snippet) forces an
 mkmod-style build validation before those commits are finalized:
@@ -369,6 +369,28 @@ applied commits.
 Commits that had conflicts are marked with a leading red
 .BR * .
 .TP
+.B regen
+Rewrite every commit message on the backport branch
+.RI ( base..HEAD ),
+re\-apply the series with
+.BR "git reset" / "git am" ,
+and recreate Phase\ 5 outputs
+.RI ( patches/ ", " Omitted\-fixes ", " mr\-description.txt ).
+Session JIRA / Signed\-off\-by / CVE / Assisted\-by are applied to
+backport commits;
+.B redhat/configs
+commits always get
+.B Upstream status: RHEL\-only
+and a config\-only body (no preceding\-backport or bisectability text).
+Useful after updating metadata without re\-running the cherry\-pick
+loop.
+Also available as hotkey
+.B p
+in the Parameters menu.
+Legacy
+.B \-\-regen
+is accepted as an alias.
+.TP
 .B new
 Clear all persistent session data and exit.
 Removes
@@ -393,16 +415,6 @@ to apply the next commit, or
 to apply all remaining commits.
 Also available interactively via the
 .B x
-key in the confirmation menu.
-.TP
-.B \-\-regen
-Rewrite commit messages on the backport branch with the current session
-values for JIRA, Upstream status, Signed-off-by, and Assisted-by, then
-regenerate the patch series.
-Useful after updating metadata fields (e.g.\ adding a real JIRA number)
-without re-running the entire backport.
-Also available interactively via the
-.B p
 key in the confirmation menu.
 .TP
 .B \-\-ailog\fR, \fB\-\-no\-ailog
@@ -861,7 +873,7 @@ as defaults in the interactive menu.
 are per-invocation and never saved to the session.
 The
 .BR continue ", " pick ", " reset ", " status ", " config ", " progress ,
-.BR confirm ", " file
+.BR confirm ", " regen ", " file
 commands are also per-invocation.
 .SH EXAMPLES
 First run (prompts for session parameters):

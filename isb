@@ -968,7 +968,9 @@ _HELP_TOPICS = {
             (skips Phase 2/3 discovery, the Parameters menu, and the
             KEEP review menu).  Reuses the saved session for subsystem,
             scope, and policies.  Does not rewrite PATH when it is the
-            session keep_commits.txt.
+            session keep_commits.txt.  Still seeks Fixes: dependents of
+            KEEP commits and records out-of-scope (or in-scope-but-not-
+            in-file) fixes in omit_commits.txt for the MR.
 
             File format (same as keep_commits.txt):
               # comments ignored
@@ -1091,7 +1093,7 @@ _HELP_TOPICS = {
         "JIRA ticket URL.",
         textwrap.dedent("""\
             Recorded in the RHEL kernel compliant commit message.  Can be updated
-            later via the interactive menu or --regen.
+            later via the interactive menu or isb regen.
 
             Interactive menu hotkey: 6
         """),
@@ -1282,13 +1284,22 @@ _HELP_TOPICS = {
         """),
     ),
     "regen": (
-        "--regen",
-        "Rewrite commit messages and regenerate patches.",
+        "isb regen",
+        "Rewrite messages, reset+am, recreate Phase 5 outputs.",
         textwrap.dedent("""\
-            Rewrites all commit messages on the backport branch with the
-            current session values (JIRA, Signed-off-by, upstream version)
-            and regenerates the patch series.  Also available as hotkey
-            'p' in the interactive menu.
+            Rebuilds the backport series from base..HEAD:
+
+              1. format-patch the current series
+              2. rewrite each patch message (JIRA, SOB, CVE, …)
+                 — redhat/configs commits keep Upstream status:
+                   RHEL-only and refreshed config-only bodies
+              3. git reset --hard to the session base
+              4. git am the rewritten patches
+              5. recreate patches/, Omitted-fixes, and
+                 mr-description.txt (full Phase 5)
+
+            Also available as hotkey 'p' in the Parameters menu.
+            Legacy flag --regen is accepted as an alias.
         """),
     ),
     "ailog": (
@@ -1376,7 +1387,7 @@ def _show_topics_list():
           f"{DIM}not{OFF}  isb help --conflict-policy\n")
     print(f"{BLD}Commands:{OFF}")
     for cmd in ("help", "status", "config", "progress", "file", "confirm",
-                "pick", "continue", "reset", "new"):
+                "pick", "continue", "reset", "regen", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<22s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
@@ -1385,7 +1396,7 @@ def _show_topics_list():
                 "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
-                "divergence", "toolbox", "regen", "ailog", "skip"):
+                "divergence", "toolbox", "ailog", "skip"):
         if opt not in _HELP_TOPICS:
             continue
         usage, summary, _ = _HELP_TOPICS[opt]
@@ -1419,7 +1430,7 @@ def _show_general_help():
     print(f"\n{BLD}isb{OFF} -- Intelligent Subsystem Backport for RHEL kernels\n")
     print(f"{BLD}Commands:{OFF}")
     for cmd in ("help", "status", "config", "progress", "file", "confirm",
-                "pick", "continue", "reset", "new"):
+                "pick", "continue", "reset", "regen", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
@@ -1428,7 +1439,7 @@ def _show_general_help():
                 "branch", "output-dir",
                 "conflict-policy", "editor", "build-policy", "dry-run",
                 "yes", "signed-off-by", "assisted-by", "step",
-                "divergence", "toolbox", "regen", "ailog"):
+                "divergence", "toolbox", "ailog"):
         usage, summary, _ = _HELP_TOPICS[opt]
         print(f"  {usage.split()[0]:<22s} {summary}")
     print(f"\nRun 'isb help topics' for this list, "
@@ -1453,6 +1464,7 @@ def parse_args():
               isb continue                 resume from saved state
               isb pick <HASH>              cherry-pick one upstream commit
               isb reset <HASH>             reset to an earlier commit
+              isb regen                    rewrite messages; recreate outputs
               isb new                      clear session and start fresh
 
             examples:
@@ -1461,6 +1473,7 @@ def parse_args():
               isb                          subsequent runs reuse session
               isb file keep_commits.txt    skip discovery; use this KEEP list
               isb confirm                  review session keep_commits.txt
+              isb regen                    refresh messages + Phase 5 files
               isb pick abc123def456        single-commit pick
               isb help conflict-policy     detailed help for an option
         """),
@@ -1575,10 +1588,12 @@ def parse_args():
     reset_p = sub.add_parser("reset",
                              help="Reset backport to an earlier commit")
     reset_p.add_argument("hash", help="Commit hash to reset to")
+    sub.add_parser("regen",
+                   help="Rewrite messages and recreate Phase 5 outputs")
     sub.add_parser("new", help="Clear all session data and start fresh")
-    p.add_argument("--regen", action="store_true",
-                   help="Rewrite commit messages with current session "
-                        "fields and regenerate patches")
+    # Hidden backward-compat alias for the old flag form
+    p.add_argument("--regen", dest="regen_flag", action="store_true",
+                   help=argparse.SUPPRESS)
 
     return p.parse_args()
 
@@ -1600,7 +1615,8 @@ REQUIRED_SESSION = [
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
                   "command", "hash", "path", "status", "config",
-                  "progress", "file", "confirm", "regen", "step"}
+                  "progress", "file", "confirm", "regen", "regen_flag",
+                  "step"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -2778,6 +2794,8 @@ def show_confirmation_menu(params):
                 continue
             _params_to_session(params)
             _save()
+            cached = _session.get("_cached") or {}
+            omit_list = [tuple(x) for x in cached.get("omit", [])]
             regen_patches(
                 _session_repo, out_dir, base_commit,
                 params.get("jira", ""),
@@ -2785,6 +2803,9 @@ def show_confirmation_menu(params):
                 sob,
                 params.get("assisted_by", ""),
                 cve=params.get("cve", ""),
+                omit_list=omit_list,
+                rhel_ver=str(params.get("rhel", "")),
+                subsystem=params.get("subsystem", ""),
             )
             continue
 
@@ -3291,15 +3312,41 @@ def _rhel_references_commit(rhel_repo, commit_hash):
     return False
 
 
+_FIXES_LINE_RE = re.compile(
+    r'(?im)^Fixes:\s+([0-9a-f]{7,40})\b'
+)
+
+
+def _rhel_cited_upstream_shorts(rhel_repo, since_date=None):
+    """Return 12-char upstream hashes cited in RHEL commit messages.
+
+    Single ``git log --format=%B`` pass (optionally ``--since``), much
+    cheaper than per-hash greps when checking many Fixes: candidates.
+    """
+    cmd = "log --format=%B"
+    if since_date:
+        cmd += f" --since={since_date}"
+    r = git(cmd, cwd=rhel_repo, check=False)
+    if r.returncode != 0 or not r.stdout:
+        return set()
+    cited = set()
+    for m in re.finditer(
+            r'(?im)(?:^|\s)(?:commit|cherry picked from commit)\s+'
+            r'([0-9a-f]{7,40})\b',
+            r.stdout):
+        cited.add(m.group(1)[:12])
+    return cited
+
+
 def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
-                        exclude_paths=None):
+                        exclude_paths=None, *, update_keep=True):
     """Find Fixes: dependents of KEEP commits (patchreview-style).
 
-    Out-of-scope fixes are added to *omit* (for Omitted-fixes /
-    ``Omitted-fix:`` in the MR description) so patchreview treats them
-    as intentionally omitted rather than missing.
-
-    In-scope fixes that Phase 2 somehow missed are appended to *keep*.
+    Uses **one** upstream ``git log --grep='^Fixes:'`` since the oldest
+    KEEP commit date, then matches Fixes: trailers against KEEP hashes.
+    Out-of-scope (or in-scope-but-not-in-file) hits go to *omit* for
+    Omitted-fix / patchreview.  In-scope hits append to *keep* only
+    when *update_keep* is True.
 
     Returns updated (keep, omit).
     """
@@ -3307,66 +3354,113 @@ def seek_fixes_for_keep(keep, omit, upstream_repo, rhel_repo, scope_paths,
         return keep, omit
 
     known = {h for h, _, _ in keep} | {h for h, _, _ in omit}
+    known_short = {h[:12] for h in known}
     added_omit = []
     added_keep = []
 
+    scope_paths = list(scope_paths or [])
     scope_label = ", ".join(scope_paths) if scope_paths else "(all)"
+
+    # Map short prefixes -> (full_hash, subject) for matching Fixes: lines
+    keep_by_prefix = {}
+    keep_hashes = [h for h, _, _ in keep]
     with Spinner("Seeking Fixes: for KEEP commits ..."):
-        for h, subj, _reason in list(keep):
-            meta = git(f"log -1 --format='%h|%ad' --date=short {h}",
-                       cwd=upstream_repo, check=False)
-            if meta.returncode != 0 or "|" not in meta.stdout:
+        # Batch dates for all KEEP commits (one git invocation)
+        walk = " ".join(keep_hashes)
+        meta = git(
+            f"log --no-walk --format='%H %ad' --date=short {walk}",
+            cwd=upstream_repo, check=False,
+        )
+        dates = []
+        subj_by_h = {h: s for h, s, _ in keep}
+        if meta.returncode == 0:
+            for line in meta.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                fh, d = parts
+                dates.append(d)
+                for n in (12, 10, 8):
+                    if len(fh) >= n:
+                        keep_by_prefix.setdefault(fh[:n], (fh, subj_by_h.get(fh, "")))
+        if not keep_by_prefix:
+            for h, s, _ in keep:
+                for n in (12, 10, 8):
+                    if len(h) >= n:
+                        keep_by_prefix.setdefault(h[:n], (h, s))
+
+        oldest = min(dates) if dates else None
+        since_arg = f"--since={oldest}" if oldest else ""
+
+        # ONE upstream scan for all Fixes: trailers since oldest KEEP
+        r = git(
+            f"log --no-merges {since_arg} --grep='^Fixes:' "
+            f"--format='%H%x00%s%x00%b%x00'",
+            cwd=upstream_repo, check=False,
+        )
+        # Candidates: (fix_hash, subject, fixed_keep_hash, fixed_subj)
+        candidates = []
+        if r.returncode == 0 and r.stdout:
+            for m in re.finditer(
+                    r'([0-9a-f]{40})\x00([^\x00]*)\x00([^\x00]*)\x00',
+                    r.stdout):
+                fh, fsubj, body = m.group(1), m.group(2), m.group(3)
+                if fh in known or fh[:12] in known_short:
+                    continue
+                for fm in _FIXES_LINE_RE.finditer(body):
+                    prefix = fm.group(1)
+                    matched = None
+                    for n in (len(prefix), 12, 10, 8):
+                        if n < 8 or n > len(prefix):
+                            continue
+                        matched = keep_by_prefix.get(prefix[:n])
+                        if matched:
+                            break
+                    if not matched:
+                        continue
+                    kh, ksubj = matched
+                    candidates.append((fh, fsubj, kh, ksubj))
+                    break  # one KEEP match is enough for this fix
+
+        # Batch RHEL citation check (one log since oldest KEEP date)
+        cited = _rhel_cited_upstream_shorts(rhel_repo, oldest)
+
+        for fh, fsubj, kh, ksubj in candidates:
+            if fh in known or fh[:12] in known_short:
                 continue
-            short, date = meta.stdout.strip().split("|", 1)
-            # Prefer 12-char (common Fixes: form) and %h
-            greps = []
-            for prefix in dict.fromkeys(
-                    [h[:12], short, h[:10], h[:8]]):
-                if len(prefix) >= 8:
-                    greps.append(prefix)
-            fix_hashes = []
-            for prefix in greps:
-                r = git(
-                    f"log --no-merges --since={date} "
-                    f"--grep='Fixes: {prefix}' --format='%H'",
-                    cwd=upstream_repo, check=False,
-                )
-                if r.returncode != 0:
-                    continue
-                for fh in r.stdout.splitlines():
-                    if fh and fh not in fix_hashes:
-                        fix_hashes.append(fh)
-            for fh in fix_hashes:
-                if fh in known or fh == h:
-                    continue
-                if _rhel_references_commit(rhel_repo, fh):
-                    known.add(fh)
-                    continue
-                sr = git(f"log -1 --format=%s {fh}",
-                         cwd=upstream_repo, check=False)
-                fsubj = (sr.stdout.strip() if sr.returncode == 0
-                         else "(subject unavailable)")
-                in_scope = _commit_in_scope_files(
-                    fh, upstream_repo, scope_paths, exclude_paths,
-                )
-                if in_scope:
-                    entry = (fh, fsubj,
-                             f"Fixes: {h[:12]} ({subj})")
-                    added_keep.append(entry)
-                    keep.append(entry)
-                else:
-                    entry = (
-                        fh, fsubj,
-                        f"Fixes: {h[:12]}; out of scope "
-                        f"(does not touch {scope_label})",
-                    )
-                    added_omit.append(entry)
-                    omit.append(entry)
+            if fh[:12] in cited:
                 known.add(fh)
+                known_short.add(fh[:12])
+                continue
+            in_scope = bool(_commit_in_scope_files(
+                fh, upstream_repo, scope_paths, exclude_paths,
+            )) if scope_paths else False
+            if in_scope and update_keep:
+                entry = (fh, fsubj, f"Fixes: {kh[:12]} ({ksubj})")
+                added_keep.append(entry)
+                keep.append(entry)
+            elif in_scope and not update_keep:
+                entry = (
+                    fh, fsubj,
+                    f"Fixes: {kh[:12]}; in-scope but not in "
+                    f"KEEP file (left omitted)",
+                )
+                added_omit.append(entry)
+                omit.append(entry)
+            else:
+                entry = (
+                    fh, fsubj,
+                    f"Fixes: {kh[:12]}; out of scope "
+                    f"(does not touch {scope_label})",
+                )
+                added_omit.append(entry)
+                omit.append(entry)
+            known.add(fh)
+            known_short.add(fh[:12])
 
     if added_omit or added_keep:
         info(f"Fixes: seek — "
-             f"{len(added_omit)} out-of-scope omitted, "
+             f"{len(added_omit)} omitted for MR, "
              f"{len(added_keep)} in-scope added to KEEP")
         for fh, fsubj, reason in added_omit:
             info(f"  OMIT {fh[:12]} {fsubj}")
@@ -3878,7 +3972,9 @@ def _format_config_snippet_commit_message(created_snippets, for_hash,
 
     Signed-off-by is left to ``git commit -s``.
     Upstream status is always ``RHEL-only`` (snippets are not upstream).
-    *upstream_version* is accepted for call-site symmetry and ignored.
+    *for_hash* / *for_subject* / *upstream_version* are accepted for
+    call-site symmetry and ignored — the message describes only the
+    config change itself (new or disabled functionality).
     """
     symbols = [os.path.basename(rel) for rel, _ in created_snippets]
     if len(symbols) == 1:
@@ -3895,15 +3991,43 @@ def _format_config_snippet_commit_message(created_snippets, for_hash,
         lines.append(f"JIRA: {jira}")
     lines.append("Upstream status: RHEL-only")
     lines.append("")
-    body = (
-        "Add redhat/configs snippet(s) required by the preceding "
-        "backport, as a separate commit for bisectability."
-    )
-    lines.extend(_wrap_commit_lines(body, 70))
-    lines.append("")
-    if for_hash:
-        cite = f"{for_hash[:12]} {for_subject or ''}".rstrip()
-        lines.extend(_wrap_commit_lines(cite, 70))
+
+    # Body: only what the snippet introduces or leaves unset — never
+    # mention the preceding backport or bisectability.
+    enabled = []
+    disabled = []
+    for rel, desc in created_snippets:
+        sym = os.path.basename(rel)
+        if desc == "not set" or desc in ("=n", "n"):
+            disabled.append(sym)
+        else:
+            enabled.append((sym, desc))
+
+    body_parts = []
+    if enabled:
+        if len(enabled) == 1:
+            sym, desc = enabled[0]
+            body_parts.append(
+                f"Introduce {sym} ({desc}) for the new Kconfig option.")
+        else:
+            names = ", ".join(f"{s} ({d})" for s, d in enabled)
+            body_parts.append(
+                f"Introduce configuration for new Kconfig options: "
+                f"{names}.")
+    if disabled:
+        if len(disabled) == 1:
+            body_parts.append(
+                f"Add {disabled[0]} as not set "
+                f"(new option left disabled).")
+        else:
+            body_parts.append(
+                "Add the following new options as not set "
+                "(left disabled): " + ", ".join(disabled) + ".")
+    if not body_parts:
+        body_parts.append("Add redhat/configs snippet(s) for new "
+                          "Kconfig option(s).")
+    for para in body_parts:
+        lines.extend(_wrap_commit_lines(para, 70))
         lines.append("")
     for rel, desc in created_snippets:
         lines.extend(_wrap_commit_lines(f"{rel} ({desc})", 70))
@@ -9120,13 +9244,50 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
 # Commit-message rewriting (regen)
 # ---------------------------------------------------------------------------
 
+def _is_config_snippet_subject(subject):
+    """True if *subject* is a redhat/configs snippet commit."""
+    return bool(subject) and subject.startswith("redhat/configs:")
+
+
+def _snippets_from_commit(rhel_repo, commit_hash):
+    """Return ``[(rel_path, desc), ...]`` for redhat/configs files in commit."""
+    r = git(f"diff-tree --no-commit-id --name-only -r --diff-filter=A "
+            f"{commit_hash}", cwd=rhel_repo, check=False)
+    snippets = []
+    if r.returncode != 0 or not r.stdout.strip():
+        return snippets
+    for path in r.stdout.strip().split("\n"):
+        if not path.startswith("redhat/configs/"):
+            continue
+        show = git(f"show {commit_hash}:{path}",
+                   cwd=rhel_repo, check=False)
+        content = show.stdout if show.returncode == 0 else ""
+        desc = "not set"
+        for line in content.splitlines():
+            line = line.strip()
+            m = re.match(r'^#\s*(CONFIG_\S+)\s+is not set\s*$', line)
+            if m:
+                desc = "not set"
+                break
+            m = re.match(r'^(CONFIG_\S+)=(.*)$', line)
+            if m:
+                desc = f"={m.group(2).strip()}"
+                break
+        snippets.append((path, desc))
+    return snippets
+
+
 def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by,
-                     cve=""):
+                     cve="", *, config_snippet=False):
     """Replace metadata fields in an RHEL kernel compliant commit message.
 
     Preserves conflict notes, upstream commit citation, and body verbatim.
     Only touches the well-known trailer/header lines.
+
+    Config-snippet commits always get ``Upstream status: RHEL-only``.
     """
+    status_value = ("RHEL-only" if config_snippet
+                    else upstream_version)
     if cve:
         if re.search(r'^CVE: ', msg, re.MULTILINE):
             msg = re.sub(r'^CVE: .*$', f'CVE: {cve}',
@@ -9136,16 +9297,36 @@ def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by,
                          msg, count=1, flags=re.MULTILINE)
     elif re.search(r'^CVE: ', msg, re.MULTILINE):
         msg = re.sub(r'^CVE: .*\n?', '', msg, count=1, flags=re.MULTILINE)
-    msg = re.sub(r'^JIRA: .*$', f'JIRA: {jira}', msg, flags=re.MULTILINE)
-    msg = re.sub(r'^Upstream status: .*$',
-                 f'Upstream status: {upstream_version}',
-                 msg, flags=re.MULTILINE)
+    if jira:
+        if re.search(r'^JIRA: ', msg, re.MULTILINE):
+            msg = re.sub(r'^JIRA: .*$', f'JIRA: {jira}',
+                         msg, flags=re.MULTILINE)
+        else:
+            # Insert after subject blank line / CVE if present
+            msg = re.sub(r'^(CVE: .*\n)',
+                         rf'\1JIRA: {jira}\n',
+                         msg, count=1, flags=re.MULTILINE)
+            if not re.search(r'^JIRA: ', msg, re.MULTILINE):
+                parts = msg.split("\n", 2)
+                if len(parts) >= 2 and parts[1] == "":
+                    msg = (f"{parts[0]}\n\nJIRA: {jira}\n"
+                           + (parts[2] if len(parts) > 2 else ""))
+    if status_value:
+        if re.search(r'^Upstream status: ', msg, re.MULTILINE):
+            msg = re.sub(r'^Upstream status: .*$',
+                         f'Upstream status: {status_value}',
+                         msg, flags=re.MULTILINE)
+        else:
+            msg = re.sub(r'^(JIRA: .*\n)',
+                         rf'\1Upstream status: {status_value}\n',
+                         msg, count=1, flags=re.MULTILINE)
     # Replace existing Signed-off-by (first occurrence only)
-    msg = re.sub(r'^Signed-off-by: .*$',
-                 f'Signed-off-by: {signed_off_by}',
-                 msg, count=1, flags=re.MULTILINE)
-    # Assisted-by: update, add, or leave alone
-    if assisted_by:
+    if signed_off_by:
+        msg = re.sub(r'^Signed-off-by: .*$',
+                     f'Signed-off-by: {signed_off_by}',
+                     msg, count=1, flags=re.MULTILINE)
+    # Assisted-by: update, add, or leave alone (not on config snippets)
+    if assisted_by and not config_snippet:
         if re.search(r'^Assisted-by:', msg, re.MULTILINE):
             msg = re.sub(r'^Assisted-by: .*$',
                          f'Assisted-by: {assisted_by}',
@@ -9157,86 +9338,252 @@ def _rewrite_message(msg, jira, upstream_version, signed_off_by, assisted_by,
     return msg
 
 
+def _rebuild_config_commit_message(rhel_repo, commit_hash, jira, cve,
+                                   signed_off_by):
+    """Build a fresh RHEL-only config-snippet message from the commit tree."""
+    old_msg = git(f"log --format=%B -1 {commit_hash}",
+                  cwd=rhel_repo, check=False).stdout
+    subject = (old_msg.split("\n", 1)[0].strip()
+               if old_msg else "redhat/configs: add snippet")
+    snippets = _snippets_from_commit(rhel_repo, commit_hash)
+    if not snippets:
+        # Fall back to metadata-only rewrite preserving body
+        return _rewrite_message(old_msg.rstrip(), jira, "RHEL-only",
+                                signed_off_by, "", cve=cve,
+                                config_snippet=True)
+    msg = _format_config_snippet_commit_message(
+        snippets, None, None, jira, "RHEL-only", cve=cve)
+    msg = msg.rstrip() + "\n\n"
+    if signed_off_by:
+        msg += f"Signed-off-by: {signed_off_by}\n"
+    # Keep subject from original if formatter shortened oddly
+    new_subj = msg.split("\n", 1)[0]
+    if subject.startswith("redhat/configs:") and new_subj != subject:
+        # Prefer formatter subject (describes symbols); OK
+        pass
+    return msg
+
+
+def _split_mail_patch(text):
+    """Split a format-patch file into (headers, message, diff).
+
+    *message* is the commit message body (may include Subject line
+    content already unfolded into headers).  Returns
+    ``(header_lines, subject, msg_body, diff_text)``.
+    """
+    if "\n---\n" in text:
+        head, diff = text.split("\n---\n", 1)
+        diff = "---\n" + diff
+    else:
+        head, diff = text, ""
+    lines = head.split("\n")
+    # RFC2822 headers until first blank line
+    hdr_end = 0
+    for i, ln in enumerate(lines):
+        if ln == "":
+            hdr_end = i
+            break
+    else:
+        hdr_end = len(lines)
+    headers = lines[:hdr_end]
+    msg_body = "\n".join(lines[hdr_end + 1:]) if hdr_end < len(lines) else ""
+    subject = ""
+    for ln in headers:
+        if ln.startswith("Subject: "):
+            subject = ln[len("Subject: "):]
+            # Strip [PATCH n/m] prefix
+            subject = re.sub(r'^\[PATCH[^\]]*\]\s*', '', subject)
+            break
+    return headers, subject, msg_body, diff
+
+
+def _join_mail_patch(headers, subject, msg_body, diff):
+    """Rebuild a format-patch file from parts."""
+    out_headers = []
+    subj_written = False
+    for ln in headers:
+        if ln.startswith("Subject: "):
+            # Preserve [PATCH n/m] tag if present
+            m = re.match(r'^(Subject: \[PATCH[^\]]*\]\s*)', ln)
+            prefix = m.group(1) if m else "Subject: "
+            out_headers.append(f"{prefix}{subject}")
+            subj_written = True
+        else:
+            out_headers.append(ln)
+    if not subj_written:
+        out_headers.append(f"Subject: {subject}")
+    body = msg_body.rstrip() + "\n"
+    return "\n".join(out_headers) + "\n\n" + body + "\n" + diff
+
+
+def _rewrite_patch_file(path, rhel_repo, commit_hash, jira, upstream_version,
+                        signed_off_by, assisted_by, cve=""):
+    """Rewrite the commit message inside a format-patch file in place."""
+    with open(path) as fh:
+        text = fh.read()
+    headers, subject, msg_body, diff = _split_mail_patch(text)
+    config = _is_config_snippet_subject(subject)
+    if config:
+        # Rebuild full message; subject/body from formatter
+        full = _rebuild_config_commit_message(
+            rhel_repo, commit_hash, jira, cve, signed_off_by)
+        parts = full.split("\n", 1)
+        new_subject = parts[0]
+        new_body = parts[1].lstrip("\n") if len(parts) > 1 else ""
+        # strip trailing Signed-off-by blank handling — keep as in full
+        new_body = new_body.rstrip() + "\n"
+    else:
+        # msg_body in patch is the commit message without subject
+        # Reconstruct a full message for _rewrite_message
+        full_old = subject + "\n\n" + msg_body.lstrip("\n")
+        full_new = _rewrite_message(
+            full_old.rstrip(), jira, upstream_version,
+            signed_off_by, assisted_by, cve=cve, config_snippet=False)
+        parts = full_new.split("\n", 1)
+        new_subject = parts[0]
+        new_body = (parts[1].lstrip("\n") if len(parts) > 1 else "")
+        if not new_body.endswith("\n"):
+            new_body += "\n"
+    new_text = _join_mail_patch(headers, new_subject, new_body, diff)
+    with open(path, "w") as fh:
+        fh.write(new_text)
+    return new_subject
+
+
 def regen_patches(rhel_repo, output_dir, base_commit,
                   jira, upstream_version, signed_off_by, assisted_by,
-                  cve=""):
-    """Rewrite commit messages on the backport branch and regenerate patches.
+                  cve="", omit_list=None, rhel_ver="", subsystem="",
+                  upstream_repo=None, scope_paths=None,
+                  exclude_paths=None):
+    """Rewrite series messages via format-patch → reset → am, then Phase 5.
 
-    Uses git filter-branch --msg-filter to update JIRA, Upstream status,
-    Signed-off-by, CVE, and Assisted-by in every commit since base_commit.
+    Config-snippet commits are rewritten with Upstream status: RHEL-only
+    and a config-only body (no backport/bisectability wording).
+    Recreates patches/, Omitted-fixes, and mr-description.txt.
+    Re-seeks Fixes: dependents into omit (KEEP unchanged) so patchreview
+    does not report Missing Fix for out-of-scope dependents.
     """
-    header("Regenerating patches")
+    header("Regenerating backport series")
 
     r = git(f"rev-list --reverse {base_commit}..HEAD",
             cwd=rhel_repo, check=False)
     if r.returncode != 0:
         warn(f"Cannot list commits from {base_commit[:12]}..HEAD "
              f"— base commit may be stale.")
-        return
+        return 0
     commits = [c for c in r.stdout.strip().split("\n") if c]
     if not commits:
         warn("No commits found since base -- nothing to regenerate.")
-        return
+        return 0
 
-    info(f"  Rewriting {len(commits)} commit message(s) ...")
+    info(f"  Rewriting {len(commits)} commit(s) via "
+         f"format-patch → reset → am ...")
     if cve:
         info(f"    CVE:             {cve}")
     info(f"    JIRA:            {jira}")
-    info(f"    Upstream status: {upstream_version}")
+    info(f"    Upstream status: {upstream_version} "
+         f"(RHEL-only for redhat/configs)")
     info(f"    Signed-off-by:   {signed_off_by}")
     if assisted_by:
         info(f"    Assisted-by:     {assisted_by}")
 
-    msg_dir = tempfile.mkdtemp(prefix="isb-regen-")
+    orig_head = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
+    patch_tmpdir = tempfile.mkdtemp(prefix="isb-regen-patches-")
     try:
-        for c in commits:
-            old_msg = git(f"log --format=%B -1 {c}",
-                          cwd=rhel_repo).stdout.rstrip()
-            new_msg = _rewrite_message(old_msg, jira, upstream_version,
-                                       signed_off_by, assisted_by,
-                                       cve=cve)
-            with open(os.path.join(msg_dir, c), "w") as fh:
-                fh.write(new_msg)
-
-        filter_cmd = (
-            f"git filter-branch -f --msg-filter "
-            f"'cat {msg_dir}/$GIT_COMMIT' "
-            f"-- {base_commit}..HEAD"
-        )
-        with Spinner("Rewriting commit messages ..."):
-            r = run(filter_cmd, cwd=rhel_repo, check=False)
+        with Spinner("format-patch current series ..."):
+            r = git(f"format-patch -o {shlex.quote(patch_tmpdir)} "
+                    f"{base_commit}..HEAD",
+                    cwd=rhel_repo, check=False)
         if r.returncode != 0:
-            warn("filter-branch failed. Restoring original branch ...")
-            git("update-ref refs/heads/HEAD refs/original/refs/heads/HEAD",
-                cwd=rhel_repo, check=False)
-            die("Commit message rewrite failed. Branch restored.")
+            die(f"format-patch failed: {r.stderr.strip()}")
+
+        patch_files = sorted(glob(os.path.join(patch_tmpdir, "*.patch")))
+        if len(patch_files) != len(commits):
+            warn(f"  format-patch produced {len(patch_files)} patches "
+                 f"for {len(commits)} commits — continuing.")
+
+        for i, (patch, c) in enumerate(zip(patch_files, commits)):
+            subj = _rewrite_patch_file(
+                patch, rhel_repo, c, jira, upstream_version,
+                signed_off_by, assisted_by, cve=cve)
+            kind = ("config" if _is_config_snippet_subject(subj)
+                    else "backport")
+            info(f"    [{i + 1}/{len(patch_files)}] "
+                 f"{kind}: {subj[:56]}")
+
+        status(f"  Resetting to base {base_commit[:12]} ...")
+        git(f"reset --hard {base_commit}", cwd=rhel_repo)
+
+        with Spinner(f"git am {len(patch_files)} rewritten patch(es) ..."):
+            # Apply in sorted order (0011-, 0012-, ...)
+            am_cmd = "git am --3way -- " + " ".join(
+                shlex.quote(p) for p in patch_files)
+            r = run(am_cmd, cwd=rhel_repo, check=False)
+        if r.returncode != 0:
+            warn("git am failed — restoring previous HEAD ...")
+            git("am --abort", cwd=rhel_repo, check=False)
+            git(f"reset --hard {orig_head}", cwd=rhel_repo, check=False)
+            die("Regen aborted; branch restored to pre-regen HEAD. "
+                f"See git am output above.")
+
+        status(f"  Re-applied {len(patch_files)} commit(s).")
     finally:
-        shutil.rmtree(msg_dir, ignore_errors=True)
+        shutil.rmtree(patch_tmpdir, ignore_errors=True)
 
-    git("update-ref -d refs/original/refs/heads/HEAD",
-        cwd=rhel_repo, check=False)
-    status(f"  Rewrote {len(commits)} commit(s).")
+    # Full Phase 5: patches/, Omitted-fixes, mr-description.txt
+    cached = (_session or {}).get("_cached") or {}
+    if omit_list is None:
+        omit_list = [tuple(x) for x in cached.get("omit", [])]
+    keep_list = [tuple(x) for x in cached.get("keep", [])]
+    if not rhel_ver:
+        rhel_ver = (_session or {}).get("rhel", "")
+    if not subsystem:
+        subsystem = (_session or {}).get("subsystem", "")
+    if not upstream_repo:
+        upstream_repo = (_session or {}).get("upstream_repo")
+    if scope_paths is None:
+        # Session stores scope as only_paths (see _params_to_session)
+        scope_paths = list(
+            (_session or {}).get("scope_paths")
+            or (_session or {}).get("only_paths")
+            or []
+        )
+    if exclude_paths is None:
+        exclude_paths = list((_session or {}).get("exclude") or [])
 
-    # Regenerate format-patch output
-    patches_dir = os.path.join(output_dir, "patches")
-    os.makedirs(patches_dir, exist_ok=True)
-    for old in glob(os.path.join(patches_dir, "*.patch")):
-        os.remove(old)
-    with Spinner("Generating patch series ..."):
-        git(f"format-patch -o {patches_dir} {base_commit}..HEAD",
-            cwd=rhel_repo)
-    patch_files = sorted(glob(os.path.join(patches_dir, "*.patch")))
-    n = len(patch_files)
-    print(f"\n{STA}{'=' * 74}{OFF}")
-    print(f"  {BLD}Patch series regenerated: {n} file{'s' if n != 1 else ''}{OFF}")
-    print(f"  {INF}{patches_dir}{OFF}")
-    print(f"{STA}{'=' * 74}{OFF}\n")
+    # Re-seek Fixes: into omit so MR / Omitted-fixes stay complete
+    # (e.g. after isb file, which used to skip seek entirely).
+    if keep_list and upstream_repo and os.path.isdir(upstream_repo):
+        keep_list, omit_list = seek_fixes_for_keep(
+            keep_list, list(omit_list), upstream_repo, rhel_repo,
+            scope_paths, exclude_paths=exclude_paths or None,
+            update_keep=False,
+        )
+        omit_file = os.path.join(output_dir, "omit_commits.txt")
+        keep_file = os.path.join(output_dir, "keep_commits.txt")
+        _write_commit_list(keep_file, keep_list, omit_file, omit_list,
+                           write_keep=False)
+        if _session is not None:
+            save_cached_results(
+                _session,
+                cached.get("divergence") or base_commit,
+                cached.get("pending") or [h for h, _, _ in keep_list],
+                keep_list, omit_list,
+            )
+            _save()
 
-    # Update completed head after rewrite (hashes changed)
+    n = generate_output(
+        rhel_repo, output_dir, base_commit, omit_list,
+        rhel_ver=rhel_ver, subsystem=subsystem,
+        jira=jira, upstream_version=upstream_version,
+        signed_off_by=signed_off_by, cve=cve,
+    )
+
     new_head = git("rev-parse HEAD", cwd=rhel_repo).stdout.strip()
-    _session["_completed_head"] = new_head
-    _save()
-
+    if _session is not None:
+        _session["_completed_head"] = new_head
+        _session["_base_commit"] = base_commit
+        _save()
     return n
 
 
@@ -9408,6 +9755,8 @@ def main():
             args.command = "status"
         elif getattr(args, "resume", False):
             args.command = "continue"
+        elif getattr(args, "regen_flag", False):
+            args.command = "regen"
 
     # Commands that do not require a kernel tree (or deps install).
     if args.command == "help":
@@ -9530,7 +9879,7 @@ def main():
         do_reset(rhel_repo, args.hash, output_dir, base_commit, keep)
         return
 
-    if args.regen:
+    if args.command == "regen" or getattr(args, "regen_flag", False):
         base_commit = _session.get("_base_commit")
         output_dir = _session.get("output_dir")
         if not output_dir:
@@ -9560,6 +9909,8 @@ def main():
         if not args.signed_off_by:
             die("Signed-off-by is required. Set it with -s or in the "
                 "session menu.")
+        cached = _session.get("_cached") or {}
+        omit_list = [tuple(x) for x in cached.get("omit", [])]
         regen_patches(
             rhel_repo, output_dir, base_commit,
             args.jira or _session.get("jira", ""),
@@ -9568,6 +9919,9 @@ def main():
             args.signed_off_by,
             args.assisted_by or _session.get("assisted_by", ""),
             cve=args.cve or _session.get("cve", ""),
+            omit_list=omit_list,
+            rhel_ver=str(args.rhel or _session.get("rhel", "")),
+            subsystem=args.subsystem or _session.get("subsystem", ""),
         )
         return
 
@@ -10173,7 +10527,7 @@ def main():
             else:
                 status("Backport already completed with current session.")
                 info(f"  To update JIRA, Signed-off-by, etc. and regenerate "
-                     f"patches, use 'p' in the menu or 'isb --regen'.")
+                     f"outputs, use 'p' in the menu or 'isb regen'.")
                 info(f"  Re-run with different parameters or from a new "
                      f"branch to start a new backport.")
                 info(f"  Or: isb file <path> to apply a commit list.")
@@ -10211,7 +10565,19 @@ def main():
             if os.path.isfile(state_file):
                 os.remove(state_file)
                 info("  Cleared stale state from previous run.")
-            # File is authoritative — do not seek Fixes: dependents
+
+            # KEEP file is authoritative for cherry-pick, but still seek
+            # Fixes: dependents so out-of-scope (and in-scope-not-in-file)
+            # fixes land in omit_commits.txt / Omitted-fix for
+            # patchreview — otherwise they show up as Missing Fix.
+            keep, omit = seek_fixes_for_keep(
+                keep, omit, upstream_repo, rhel_repo, scope_paths,
+                exclude_paths=args.exclude or None,
+                update_keep=False,
+            )
+            save_cached_results(
+                _session, divergence, pending, keep, omit)
+            _save()
         else:
             cached = load_cached_results(_session)
             if cached and not args.divergence:
