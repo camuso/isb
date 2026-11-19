@@ -171,9 +171,16 @@ and offer
 .B s
 to omit into
 .IR Omitted\-fixes .
-Non\-interactive isb AI ends the
+The
 .B Conflicts:
-stanza with an indented
+stanza is written only when the cherry\-pick actually conflicted with
+upstream.
+Clean applies — including Kconfig commits that run mkmod validation,
+or commits that only create a follow\-up
+.B redhat/configs
+snippet — do not get a Conflicts stanza.
+When there was a conflict, non\-interactive isb AI ends the stanza with
+an indented
 .BR Resolved\-by:\ isb/cursor
 or
 .BI Resolved\-by:\ isb/cursor/ <model>
@@ -210,10 +217,16 @@ During cherry-pick, isb prompts to create
 .I redhat/configs/common/generic/CONFIG_FOO
 using the Kconfig default
 .RB ( y / n / m )
-or an explicit per-option choice, then stages the snippet into the
-backport commit.
+or an explicit per-option choice.
+After the upstream backport commit, isb commits the snippet(s) as a
+separate
+.B redhat/configs:
+patch
+.RB ( Upstream\ status:\ RHEL\-only )
+for bisectability, using
+.BR git\ commit\ \-s .
 Any commit that touches Kconfig (or creates a snippet) forces an
-mkmod-style build validation before the commit is finalized:
+mkmod-style build validation before those commits are finalized:
 regenerate
 .BR dist\-configs ,
 install the host-arch
@@ -303,6 +316,10 @@ and policies.
 .TP
 .B continue
 Resume from previously saved state in the output directory.
+Offers the same proceed / review-commits menu as a fresh run so the
+user can edit
+.I keep_commits.txt
+before cherry-picking continues.
 .TP
 .BI "pick " HASH
 Cherry-pick a single upstream commit (by its full 40-character hash)
@@ -316,6 +333,8 @@ state so the next run resumes from the commit after
 .IR HASH .
 The commit must be in the range between the session base commit and
 HEAD.
+After the reset, offers an optional review of
+.IR keep_commits.txt .
 Also available interactively via the
 .B r
 key in the confirmation menu, which presents a numbered list of
@@ -468,6 +487,12 @@ presents a mini-menu:
 Skipped commits are persisted and will be auto-skipped on subsequent
 runs, including after a reset to zero.
 They can be restored from the commit review page.
+Interactive skips prompt for an omit reason; automatic isb/AI omits
+(inapplicable, already applied, etc.) record their reason.
+Both rewrite
+.I omit_commits.txt
+immediately (and trim
+.IR keep_commits.txt ).
 .SH OPTIONS
 .SS "Session parameters (prompted interactively or via CLI)"
 These are saved to

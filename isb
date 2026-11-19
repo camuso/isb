@@ -565,9 +565,13 @@ def _cleanup_and_exit(*_args):
                        shell=True, cwd=_cherrypick_repo,
                        capture_output=True)
         print(f"\n{WRN}Interrupted -- cherry-pick aborted, "
-              f"working tree cleaned, progress saved (will resume).{OFF}")
+              f"working tree cleaned, progress saved.{OFF}")
+        print(f"{DIM}  Resume with {BLD}isb continue{DIM}; you can "
+              f"review keep_commits.txt before proceeding.{OFF}")
     else:
         print(f"\n{WRN}Interrupted -- session saved.{OFF}")
+        print(f"{DIM}  Resume with {BLD}isb continue{DIM}; you can "
+              f"review keep_commits.txt before proceeding.{OFF}")
     sys.exit(130)
 
 # ---------------------------------------------------------------------------
@@ -917,6 +921,8 @@ _HELP_TOPICS = {
             Resumes a previously interrupted backport session.  isb reads
             the saved progress from .backport/session.json and
             .backport-state.json and continues from where it left off.
+            Before cherry-picking, offers the proceed / review menu so
+            you can edit keep_commits.txt if needed.
         """),
     ),
     "status": (
@@ -980,7 +986,8 @@ _HELP_TOPICS = {
         "Reset backport progress to an earlier commit.",
         textwrap.dedent("""\
             Resets the backport branch to the specified commit HASH and
-            discards the saved progress beyond that point.  In interactive
+            discards the saved progress beyond that point.  After reset,
+            offers an optional review of keep_commits.txt.  In interactive
             mode (menu hotkey 'r'), presents a numbered list of applied
             commits; conflicted commits are marked with a red *.
         """),
@@ -3813,6 +3820,113 @@ def _prompt_create_config_snippets(missing_options, rhel_repo):
     return created
 
 
+def _wrap_commit_lines(text, width=70):
+    """Wrap paragraphs to *width* columns (git commit style)."""
+    out = []
+    for para in (text or "").split("\n"):
+        if not para.strip():
+            out.append("")
+            continue
+        out.extend(textwrap.wrap(
+            para, width=width,
+            break_long_words=False, break_on_hyphens=False,
+        ) or [""])
+    return out
+
+
+def _format_config_snippet_commit_message(created_snippets, for_hash,
+                                          for_subject, jira,
+                                          upstream_version, cve=""):
+    """Build a ≤70-col message for a redhat/configs-only commit.
+
+    Signed-off-by is left to ``git commit -s``.
+    Upstream status is always ``RHEL-only`` (snippets are not upstream).
+    *upstream_version* is accepted for call-site symmetry and ignored.
+    """
+    symbols = [os.path.basename(rel) for rel, _ in created_snippets]
+    if len(symbols) == 1:
+        subject = f"redhat/configs: add {symbols[0]} snippet"
+    else:
+        subject = f"redhat/configs: add {len(symbols)} CONFIG snippets"
+    if len(subject) > 70:
+        subject = subject[:67] + "..."
+
+    lines = [subject, ""]
+    if cve:
+        lines.append(f"CVE: {cve}")
+    if jira:
+        lines.append(f"JIRA: {jira}")
+    lines.append("Upstream status: RHEL-only")
+    lines.append("")
+    body = (
+        "Add redhat/configs snippet(s) required by the preceding "
+        "backport, as a separate commit for bisectability."
+    )
+    lines.extend(_wrap_commit_lines(body, 70))
+    lines.append("")
+    if for_hash:
+        cite = f"{for_hash[:12]} {for_subject or ''}".rstrip()
+        lines.extend(_wrap_commit_lines(cite, 70))
+        lines.append("")
+    for rel, desc in created_snippets:
+        lines.extend(_wrap_commit_lines(f"{rel} ({desc})", 70))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _unstage_config_snippets(rhel_repo, created_snippets):
+    """Keep snippet files on disk but out of the staged cherry-pick."""
+    for rel, _ in created_snippets:
+        git(f"reset HEAD -- {shlex.quote(rel)}", cwd=rhel_repo, check=False)
+
+
+def _commit_config_snippets_after(rhel_repo, created_snippets, subject,
+                                  commit_hash, jira, upstream_version,
+                                  cve=""):
+    """Commit new redhat/configs snippets immediately after the backport.
+
+    Call after the upstream cherry-pick commit has been created.  Snippet
+    files must still exist on disk (unstaged).  Uses ``git commit -s``.
+
+    Returns True if a config commit was created.
+    """
+    if not created_snippets:
+        return False
+
+    for rel, _ in created_snippets:
+        if not os.path.isfile(os.path.join(rhel_repo, rel)):
+            warn(f"  Config snippet missing on disk: {rel}")
+            continue
+        git(f"add -- {shlex.quote(rel)}", cwd=rhel_repo, check=False)
+
+    staged_snips = git("diff --cached --name-only", cwd=rhel_repo,
+                       check=False).stdout.strip()
+    if not staged_snips:
+        warn("  No config snippets staged; skipping config commit.")
+        return False
+
+    msg = _format_config_snippet_commit_message(
+        created_snippets, commit_hash, subject, jira, upstream_version,
+        cve=cve,
+    )
+    msg_file = "/tmp/isb_config_msg.txt"
+    with open(msg_file, "w") as fh:
+        fh.write(msg)
+        if not msg.endswith("\n"):
+            fh.write("\n")
+
+    status("  Committing redhat/configs snippet(s) after backport ...")
+    for rel, desc in created_snippets:
+        info(f"    {rel} ({desc})")
+    r = git(f"commit -s --file={msg_file}", cwd=rhel_repo, check=False)
+    if r.returncode != 0:
+        warn("  Config snippet commit failed.")
+        warn(f"  {r.stderr.strip()}" if r.stderr else "  (no details)")
+        warn("  Snippet files remain in the working tree / index.")
+        return False
+    return True
+
+
 def _annotate_keep_reason(base_reason, missing_options):
     """Append missing-config annotation to a keep reason string."""
     if not missing_options:
@@ -5724,6 +5838,13 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                 return "skip"
 
 
+def _user_skip_notes(suggested=""):
+    """Notes list marking an interactive user skip (optional suggestion)."""
+    if suggested:
+        return ["skipped by user", suggested]
+    return ["skipped by user"]
+
+
 def _describe_diff_changes(added_lines, removed_lines):
     """Produce a short human description of the diff between RHEL and upstream.
 
@@ -6054,7 +6175,7 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
             else:
                 # Skip: abort cherry-pick, signal skip to caller
                 git("reset --hard HEAD", cwd=rhel_repo, check=False)
-                return ["skipped by user"], []
+                return _user_skip_notes("patchpal: user skipped"), []
         still_unmerged = git(
             f"diff --name-only --diff-filter=U -- {cf}",
             cwd=rhel_repo, check=False,
@@ -6074,7 +6195,8 @@ def _resolve_inscope_patchpal(in_scope_conflicts, rhel_repo,
                 die("Aborted by user.")
             else:
                 git("reset --hard HEAD", cwd=rhel_repo, check=False)
-                return ["skipped by user"], []
+                return _user_skip_notes(
+                    "patchpal: unresolved conflicts, user skipped"), []
         detail = _classify_conflict(cf, rhel_repo, commit_hash,
                                     upstream_repo)
         notes.append(f"{cf}: patchpal {detail}")
@@ -6430,7 +6552,9 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
                     commit_hash, subject or "", gate_analyses)
                 if gate == "skip":
                     git("reset --hard HEAD", cwd=rhel_repo, check=False)
-                    return ["skipped by user"], len(oos_excluded), []
+                    return (_user_skip_notes(
+                                "missing prerequisites (prereq gate)"),
+                            len(oos_excluded), [])
                 if gate == "menu":
                     git("reset --hard HEAD", cwd=rhel_repo, check=False)
                     return ["prereq-gate:menu"], len(oos_excluded), []
@@ -7381,7 +7505,6 @@ def _infer_resolved_by(conflict_notes, conflict_policy, inscope_conflicted):
             or ": new upstream file" in n
             or "removed per upstream" in n
             or n.startswith("redhat/configs")
-            or "mkmod build" in n
             for n in (conflict_notes or [])
         )
         if has_isb_auto:
@@ -7405,7 +7528,13 @@ def format_gort_message(subject, commit_hash, upstream_repo,
                         jira, upstream_version, conflict_notes,
                         signed_off_by, assisted_by="", cve="",
                         resolved_by=None):
-    """Build an RHEL kernel compliant commit message."""
+    """Build an RHEL kernel compliant commit message.
+
+    The Conflicts: stanza (and Resolved-by under it) is only for actual
+    cherry-pick conflicts with upstream.  Callers must pass an empty
+    conflict_notes list for clean applies — do not invent Conflicts
+    entries for build validation or config-snippet follow-ups.
+    """
     # Single git call to fetch author, date, and body
     sep = "---8<---"
     r = git(f"log --format='%an <%ae>{sep}"
@@ -7552,7 +7681,8 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         )
 
             # User chose to skip from within patchpal/editor / prereq gate
-            if conflict_notes == ["skipped by user"]:
+            if (conflict_notes
+                    and conflict_notes[0] == "skipped by user"):
                 _cherrypick_repo = None
                 return "skip", conflict_notes
             if conflict_notes == ["prereq-gate:menu"]:
@@ -7764,7 +7894,9 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             elif decision == "skip":
                 git("reset --hard HEAD", cwd=rhel_repo, check=False)
                 _cherrypick_repo = None
-                return "skip", conflict_notes
+                kind, msg = _skip_recommendation(analyses, ai_explanation)
+                suggested = msg if kind == "skip" else ""
+                return "skip", _user_skip_notes(suggested)
 
             elif decision == "menu":
                 git("reset --hard HEAD", cwd=rhel_repo, check=False)
@@ -7812,15 +7944,18 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     if missing_cfgs:
         created_snippets = _prompt_create_config_snippets(
             missing_cfgs, rhel_repo)
+        # Notes for the *backport* commit: snippets land in the next
+        # commit (see _commit_config_snippets_after).
+        # Snippet follow-ups are not Conflicts material — they land in
+        # the separate RHEL-only redhat/configs commit.  Log only.
         for rel, desc in created_snippets:
-            conflict_notes.append(
-                f"{rel}: created redhat/configs snippet ({desc})")
+            info(f"  {rel}: will follow as redhat/configs commit "
+                 f"({desc})")
         if not created_snippets:
             for opt in missing_cfgs:
-                conflict_notes.append(
-                    f"needs redhat/configs snippet for {opt['symbol']} "
-                    f"(Kconfig default: "
-                    f"{opt['default'] if opt['default'] is not None else 'n'})")
+                info(f"  needs redhat/configs snippet for "
+                     f"{opt['symbol']} (Kconfig default: "
+                     f"{opt['default'] if opt['default'] is not None else 'n'})")
 
     config_changed = (
         _commit_touches_kconfig(commit_hash, upstream_repo)
@@ -7836,6 +7971,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     )
 
     build_ok = True
+    cherry_pick_commit._last_built = False
     if should_build:
         tb_label = f" in toolbox '{toolbox_name}'" if toolbox_name else ""
         if config_changed:
@@ -7844,9 +7980,11 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             build_ok, build_output = _mkmod_build(
                 rhel_repo, toolbox_name, subsystem,
             )
+            # Do not record mkmod success under Conflicts: — that
+            # stanza is only for actual upstream merge conflicts.
             if build_ok:
-                conflict_notes.append(
-                    "mkmod build validation after config change")
+                status("  mkmod build validation OK")
+            cherry_pick_commit._last_built = True
         else:
             build_reason = ("post-conflict" if had_conflict
                             else "post-apply")
@@ -7855,6 +7993,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 build_ok, build_output = build_test(
                     rhel_repo, toolbox_name, subsystem,
                 )
+            cherry_pick_commit._last_built = True
         if not build_ok:
             warn("  Build FAILED -- attempting diagnosis ...")
             fixed, fix_note = diagnose_build_failure(
@@ -7865,7 +8004,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             )
             if fixed:
                 status(f"  Auto-fixed: {fix_note}")
-                conflict_notes.append(fix_note)
+                # Build fixes belong under Conflicts: only when this
+                # cherry-pick actually conflicted with upstream.
+                if had_conflict:
+                    conflict_notes.append(fix_note)
             elif _is_infra_build_failure(build_output):
                 if "BUILD PREP FAILED" in (build_output or ""):
                     warn("  Build prep / environment failure — "
@@ -7916,14 +8058,16 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                     if build_ok:
                         status(f"  AI build-fix succeeded on "
                                f"attempt {attempt}.")
-                        conflict_notes.append(
-                            f"AI build-fix ({attempt} attempt(s)): "
-                            f"{ai_note}"
-                        )
-                        # Conflicts stanza records the AI fix — tag it.
-                        resolver_engine = resolver_engine or "ai"
-                        if not resolved_by:
-                            resolved_by = _resolved_by_for_ai_provider()
+                        if had_conflict:
+                            conflict_notes.append(
+                                f"AI build-fix ({attempt} attempt(s)): "
+                                f"{ai_note}"
+                            )
+                            # Conflicts stanza records the AI fix — tag it.
+                            resolver_engine = resolver_engine or "ai"
+                            if not resolved_by:
+                                resolved_by = (
+                                    _resolved_by_for_ai_provider())
                         ai_fix_ok = True
                         break
                     else:
@@ -7962,7 +8106,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         git("reset --hard HEAD",
                             cwd=rhel_repo, check=False)
                         warn(f"  Skipped {commit_hash[:12]}")
-                        return "skip", conflict_notes
+                        return "skip", _user_skip_notes("build failed")
                     elif ch in ('f', 'F'):
                         print("fix")
                         if conflict_policy == "abort":
@@ -8004,9 +8148,10 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                             )
                         if rebuild_ok:
                             status("  Build OK after fix.")
-                            conflict_notes.append(
-                                f"build fix applied manually for "
-                                f"{commit_hash[:12]}")
+                            if had_conflict:
+                                conflict_notes.append(
+                                    f"build fix applied manually for "
+                                    f"{commit_hash[:12]}")
                             break
                         else:
                             build_output = rb_output
@@ -8051,17 +8196,29 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
         for filepath, desc in spurious:
             warn(f"    {filepath}: {desc}")
 
+    # Keep snippets out of the upstream backport commit; they get their
+    # own RHEL-only commit immediately afterward.
+    if created_snippets:
+        _unstage_config_snippets(rhel_repo, created_snippets)
+
+    # Conflicts: / Resolved-by only when the cherry-pick actually
+    # conflicted with upstream.  Clean applies (including config-only
+    # commits that ran mkmod validation) must not get a Conflicts stanza.
+    if not had_conflict:
+        conflict_notes = []
+        resolved_by = None
+
     # Re-assert Resolved-by / Assisted-by right before commit — ailog
     # may have replaced note text; AI build-fix may have added notes.
-    if not resolved_by:
+    if had_conflict and not resolved_by:
         engine = resolver_engine or conflict_policy
         resolved_by = _infer_resolved_by(
             conflict_notes, engine, inscope_conflicted)
-    if not resolved_by and resolver_engine == "ai":
+    if had_conflict and not resolved_by and resolver_engine == "ai":
         resolved_by = _resolved_by_for_ai_provider()
     commit_assisted = _infer_assisted_by(
         conflict_notes, conflict_policy, inscope_conflicted, assisted_by,
-    )
+    ) if had_conflict else (assisted_by or "")
 
     msg = format_gort_message(
         subject, commit_hash, upstream_repo,
@@ -8082,6 +8239,13 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
              "manually to recover.")
         die("Cannot continue — commit failed.")
     _cherrypick_repo = None
+
+    # RHEL-only redhat/configs snippet commit (after the upstream backport)
+    if created_snippets:
+        _commit_config_snippets_after(
+            rhel_repo, created_snippets, subject, commit_hash,
+            jira, upstream_version, cve=cve,
+        )
 
     # Post-commit validation against upstream
     validation = validate_patch_vs_upstream(
@@ -8331,6 +8495,93 @@ def _review_commits(keep, omit, keep_path, omit_path, output_dir):
     return new_keep
 
 
+def _offer_keep_list_menu(keep, omit, keep_file, omit_file, output_dir,
+                          divergence, pending, *, resume=False):
+    """Proceed / review / return / quit for keep_commits.txt.
+
+    Returns (keep, action) where action is 'proceed' or 'menu'.
+    Quit calls _cleanup_and_exit().
+    """
+    while True:
+        print(f"\n  {BLD}{len(keep)} commits to cherry-pick{OFF}")
+        print(f"  Commit list: {INF}{keep_file}{OFF}")
+        if resume:
+            print(f"  {DIM}Resuming — review the KEEP list if the "
+                  f"set of commits should change{OFF}")
+        print(f"\n  {MNU}g{OFF}  Proceed with cherry-pick")
+        print(f"  {MNU}v{OFF}  Review/edit commits")
+        print(f"  {MNU}r{OFF}  Return to main menu")
+        print(f"  {MNU}q{OFF}  Quit")
+        print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+        ch = _getch()
+        if ch in ('q', 'Q', '\x03'):
+            print("q")
+            _cleanup_and_exit()
+        elif ch in ('r', 'R'):
+            print("r")
+            return keep, "menu"
+        elif ch in ('v', 'V'):
+            print("v")
+            keep = _review_commits(keep, omit, keep_file,
+                                   omit_file, output_dir)
+            _write_commit_list(keep_file, keep, omit_file, omit)
+            save_cached_results(
+                _session, divergence, pending, keep, omit)
+            _save()
+            continue
+        elif ch in ('g', 'G', '\r', '\n'):
+            print("g")
+            return keep, "proceed"
+        else:
+            print(ch)
+            continue
+
+
+def _offer_keep_review_after_reset(output_dir, keep):
+    """After reset, optionally open the KEEP list review.
+
+    Returns the (possibly updated) keep list.
+    """
+    if not keep or not output_dir:
+        return keep
+    if not sys.stdin.isatty():
+        return keep
+
+    omit = []
+    cached = _session.get("_cached") if _session else None
+    if cached:
+        omit = [tuple(x) for x in cached.get("omit", [])]
+    keep_file = os.path.join(output_dir, "keep_commits.txt")
+    omit_file = os.path.join(output_dir, "omit_commits.txt")
+    os.makedirs(output_dir, exist_ok=True)
+    if not os.path.isfile(keep_file):
+        _write_commit_list(keep_file, keep, omit_file, omit)
+
+    print(f"\n  {BLD}Review keep_commits.txt?{OFF}")
+    print(f"  Commit list: {INF}{keep_file}{OFF}")
+    print(f"\n  {MNU}v{OFF}  Review/edit commits")
+    print(f"  {MNU}Enter{OFF}  Done (resume later with "
+          f"{BLD}isb continue{OFF})")
+    print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
+    ch = _getch()
+    if ch in ('v', 'V'):
+        print("v")
+        keep = _review_commits(keep, omit, keep_file,
+                               omit_file, output_dir)
+        _write_commit_list(keep_file, keep, omit_file, omit)
+        if cached is not None:
+            divergence = cached.get("divergence")
+            pending = cached.get("pending") or [h for h, _, _ in keep]
+            save_cached_results(
+                _session, divergence, pending, keep, omit)
+            _save()
+        else:
+            _sync_commit_list_files(output_dir, keep, omit)
+    else:
+        print()
+    return keep
+
+
 def _write_commit_list(keep_path, keep, omit_path, omit):
     """Write editable commit list files in git-log --oneline format."""
     with open(keep_path, "w") as fh:
@@ -8346,9 +8597,56 @@ def _write_commit_list(keep_path, keep, omit_path, omit):
     with open(omit_path, "w") as fh:
         fh.write("# isb omit list -- commits excluded from cherry-pick\n")
         fh.write("# Move lines from here to keep_commits.txt to include them.\n")
+        fh.write("# Format: <hash> <subject> | <reason>\n")
         fh.write("#\n")
         for h, subj, reason in omit:
             fh.write(f"{h} {subj} | {reason}\n")
+
+
+def _prompt_omit_reason(commit_hash, subject, suggested=""):
+    """Ask the user why a commit is being omitted; return a reason string."""
+    print(f"\n  {BLD}Omit reason for {commit_hash[:12]} {subject}{OFF}")
+    if suggested:
+        # Soft-wrap long suggested text for display
+        body = suggested.strip()
+        if body.upper().startswith("RECOMMENDATION:"):
+            body = body.split(":", 1)[1].strip()
+        print(f"  Suggested: {DIM}{body}{OFF}")
+        print(f"  Enter reason (Enter = use suggested): ", end="", flush=True)
+    else:
+        print(f"  Enter reason: ", end="", flush=True)
+    try:
+        reason = input().strip()
+    except EOFError:
+        reason = ""
+    if not reason:
+        if suggested:
+            body = suggested.strip()
+            if body.upper().startswith("RECOMMENDATION:"):
+                body = body.split(":", 1)[1].strip()
+            reason = body
+        else:
+            reason = "skipped by user"
+    # Keep omit_commits.txt lines manageable
+    if len(reason) > 200:
+        reason = reason[:197] + "..."
+    return reason
+
+
+def _sync_commit_list_files(output_dir, keep, omit):
+    """Rewrite keep_commits.txt / omit_commits.txt after an omit/skip.
+
+    KEEP file lists only commits not present in *omit* (by hash).
+    """
+    if not output_dir:
+        return
+    omit_hashes = {h for h, _, _ in omit}
+    active_keep = [(h, s, r) for h, s, r in keep if h not in omit_hashes]
+    keep_file = os.path.join(output_dir, "keep_commits.txt")
+    omit_file = os.path.join(output_dir, "omit_commits.txt")
+    os.makedirs(output_dir, exist_ok=True)
+    _write_commit_list(keep_file, active_keep, omit_file, omit)
+    info(f"  Updated {omit_file} ({len(omit)} omitted)")
 
 
 def _read_commit_list(path):
@@ -8528,6 +8826,7 @@ def do_reset(rhel_repo, target_hash, output_dir, base_commit, keep):
     total = len(keep) if keep else "?"
     status(f"Reset to {full_hash[:12]} {subject}")
     info(f"  Next run will resume from commit [{new_next_idx + 1}/{total}].")
+    return _offer_keep_review_after_reset(output_dir, keep)
 
 
 def interactive_reset(rhel_repo, output_dir, base_commit, keep):
@@ -8591,11 +8890,11 @@ def interactive_reset(rhel_repo, output_dir, base_commit, keep):
             info(f"  {n_skipped} user-skipped commit(s) will be "
                  f"excluded on replay (toggle in commit review).")
         info(f"  Next run will start from commit [1/{len(keep)}].")
-        return
+        return _offer_keep_review_after_reset(output_dir, keep)
 
     full_hash = lines[idx - 1].split()[0]
-    do_reset(rhel_repo, full_hash, output_dir,
-             base_commit, keep)
+    return do_reset(rhel_repo, full_hash, output_dir,
+                    base_commit, keep)
 
 
 # ---------------------------------------------------------------------------
@@ -9705,42 +10004,19 @@ def main():
         omit_file = os.path.join(output_dir, "omit_commits.txt")
         _write_commit_list(keep_file, keep, omit_file, omit)
 
-        # Show commit list locations; the main menu already collected
-        # the user's g/x choice so no second g/x prompt is needed.
-        if not args.yes and args.command != "continue":
-            while True:
-                print(f"\n  {BLD}{len(keep)} commits to cherry-pick{OFF}")
-                print(f"  Commit list: {INF}{keep_file}{OFF}")
-                print(f"\n  {MNU}g{OFF}  Proceed with cherry-pick")
-                print(f"  {MNU}v{OFF}  Review/edit commits")
-                print(f"  {MNU}r{OFF}  Return to main menu")
-                print(f"  {MNU}q{OFF}  Quit")
-                print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
-                ch = _getch()
-                if ch in ('q', 'Q', '\x03'):
-                    print("q")
-                    _cleanup_and_exit()
-                elif ch in ('r', 'R'):
-                    print("r")
-                    _step_loop = True
-                    break
-                elif ch in ('v', 'V'):
-                    print("v")
-                    keep = _review_commits(keep, omit, keep_file,
-                                           omit_file, output_dir)
-                    _write_commit_list(keep_file, keep, omit_file, omit)
-                    save_cached_results(
-                        _session, divergence, pending, keep, omit)
-                    _save()
-                    continue
-                elif ch in ('g', 'G', '\r', '\n'):
-                    print("g")
-                    break
-                else:
-                    # Unknown key — redisplay the menu
-                    print(ch)
-                    continue
-            if _step_loop:
+        # Proceed/review menu: always offered on first run, continue,
+        # and auto-resume after interrupt/reset (unless --yes).
+        if not args.yes:
+            _st_resume = load_state(output_dir)
+            _is_resume = (
+                args.command == "continue"
+                or bool(_st_resume and _st_resume.get("next_idx", 0) > 0)
+            )
+            keep, _menu_action = _offer_keep_list_menu(
+                keep, omit, keep_file, omit_file, output_dir,
+                divergence, pending, resume=_is_resume)
+            if _menu_action == "menu":
+                _step_loop = True
                 continue
 
         # If resuming, reload the commit list (user may have edited it)
@@ -9851,7 +10127,9 @@ def main():
             if h in _user_skipped:
                 info(f"{num} {CAU}✘{OFF} {h[:12]} {subj}  "
                      f"{DIM}(skipped by user){OFF}")
-                omit.append((h, subj, "skipped by user"))
+                if not any(oh == h for oh, _, _ in omit):
+                    omit.append((h, subj, "skipped by user"))
+                    _sync_commit_list_files(output_dir, keep, omit)
                 _save_progress(output_dir, idx + 1, base_commit, rhel_repo)
                 continue
 
@@ -9860,7 +10138,9 @@ def main():
             # Quick duplicate check: skip if already backported
             if h in _applied_hashes:
                 warn(f"  Already applied — omitting.")
-                omit.append((h, subj, "already applied on this branch"))
+                if not any(oh == h for oh, _, _ in omit):
+                    omit.append((h, subj, "already applied on this branch"))
+                    _sync_commit_list_files(output_dir, keep, omit)
                 _save_progress(output_dir, idx + 1, base_commit, rhel_repo)
                 continue
 
@@ -9878,17 +10158,25 @@ def main():
             )
 
             if result == "skip":
-                if notes == ["skipped by user"]:
-                    reason = "skipped by user"
+                notes = notes or []
+                if notes and notes[0] == "skipped by user":
+                    # Interactive skip — always prompt for the omit reason
+                    suggested = notes[1] if len(notes) > 1 else ""
+                    reason = _prompt_omit_reason(h, subj, suggested)
                     _record_user_skip(output_dir, h)
                 elif notes:
-                    # notes[0] is the Omitted-fixes reason; keep it intact
+                    # Automatic isb/AI omit — notes[0] is the reason
                     reason = notes[0]
                     if len(reason) > 200:
                         reason = reason[:197] + "..."
                 else:
                     reason = "skipped (no in-scope changes)"
                 omit.append((h, subj, reason))
+                _sync_commit_list_files(output_dir, keep, omit)
+                save_cached_results(
+                    _session, divergence, pending, keep, omit)
+                _save()
+                warn(f"  Omitted: {reason}")
                 _save_progress(output_dir, idx + 1, base_commit, rhel_repo)
                 continue
 
@@ -9908,12 +10196,7 @@ def main():
             else:
                 clean_count += 1
 
-            should_build = (
-                (build_policy == "every") or
-                (build_policy == "conflict" and notes) or
-                any("mkmod build validation" in n for n in (notes or []))
-            )
-            if should_build:
+            if getattr(cherry_pick_commit, "_last_built", False):
                 build_tests += 1
 
             _save_progress(output_dir, idx + 1, base_commit, rhel_repo)

@@ -54,20 +54,27 @@ RHEL-compliant commit messages suitable for merge requests.
   are missing or hunks are kept-as-RHEL / dropped. The heuristic always
   wins over a mistaken AI ACCEPT. Menus highlight **SKIP RECOMMENDED**
   and offer `s` to omit into `Omitted-fixes`.
-- **Resolved-by / Assisted-by** : non-interactive isb AI ends
-  `Conflicts:` with `  Resolved-by: isb/cursor` or
-  `  Resolved-by: isb/cursor/<model>` when an agent ran. Interactive
-  patchpal uses `Assisted-by: patchpal` (not Resolved-by). Manual
-  in-scope editor resolutions omit both.
+- **Conflicts: only for real conflicts** : the `Conflicts:` stanza is
+  written only when the cherry-pick actually conflicted with upstream.
+  Clean applies (including Kconfig commits that run mkmod validation,
+  or commits that only create a follow-up `redhat/configs` snippet)
+  do not get a Conflicts stanza.
+- **Resolved-by / Assisted-by** : when there *was* a conflict,
+  non-interactive isb AI ends `Conflicts:` with
+  `  Resolved-by: isb/cursor` or `  Resolved-by: isb/cursor/<model>`
+  when an agent ran. Interactive patchpal uses `Assisted-by: patchpal`
+  (not Resolved-by). Manual in-scope editor resolutions omit both.
 - **New Kconfig detection** : Phase 3 parses each commit's Kconfig diff
   for newly added `config FOO` options. If `redhat/configs` has no
   matching `CONFIG_FOO` snippet, the keep entry is annotated and
   cherry-pick prompts to create
   `redhat/configs/common/generic/CONFIG_FOO` (using the Kconfig
-  default, or an explicit y/n/m choice). Any commit that touches
-  Kconfig (or creates a snippet) forces an mkmod-style validation:
-  regenerate dist-configs, install the host-arch `.config`, run
-  `prepare`/`modules_prepare`, then `make M=<subsystem>`.
+  default, or an explicit y/n/m choice). After the upstream backport
+  commit, snippets are committed as their own `redhat/configs:` patch
+  (`Upstream status: RHEL-only`) for bisectability. Any commit that
+  touches Kconfig (or creates a snippet) forces an mkmod-style
+  validation: regenerate dist-configs, install the host-arch `.config`,
+  run `prepare`/`modules_prepare`, then `make M=<subsystem>`.
 - **Extensible API replacement rules** : upstream-to-RHEL API mappings
   (e.g. `kzalloc_obj` -> `kzalloc(sizeof(...), GFP_KERNEL)`) are used to
   filter commits during classification and auto-fix build errors. Rules
@@ -83,8 +90,10 @@ RHEL-compliant commit messages suitable for merge requests.
   preference lists. View with `isb status`, edit with `isb config`
   (or `C` from Parameters / session, or when prompted by `isb new`).
   Backport progress is `isb progress`.
-- **Resumable** : interrupted runs save progress and resume automatically
-  with `--continue`.
+- **Resumable** : interrupted runs save progress and resume with
+  `isb continue` (or plain `isb`). On resume — and after `isb reset` /
+  interactive reset — you are offered a chance to review/edit
+  `keep_commits.txt` before cherry-picking continues.
 - **Automatic commit-graph** : on first run, isb writes a git commit-graph
   for both the RHEL and upstream repos if one doesn't exist, dramatically
   speeding up ancestry walks (cherry-pick, merge-base, log) on large repos.
@@ -95,6 +104,9 @@ RHEL-compliant commit messages suitable for merge requests.
 - **Commit-file mode** : `isb file PATH` uses a KEEP list from a file
   (`hash [subject]` per line, same as `keep_commits.txt`) and skips
   Phase 2/3 discovery and classification.
+- **Skip → omit_commits.txt** : user skips prompt for a reason; automatic
+  isb/AI omits (inapplicable, already applied, etc.) record their reason.
+  Both rewrite `omit_commits.txt` (and trim `keep_commits.txt`) immediately.
 - **AI conflict explanation & build-fix** : `--ailog` (on by default) calls
   Claude via the Cursor SDK for two purposes:
   1. After every conflict resolution, generates a concise explanation of
