@@ -309,10 +309,33 @@ Backport the commits listed in
 optionally followed by a subject; comments with
 .B #
 ignored).
-Skips Phase\ 2 divergence discovery and Phase\ 3 KEEP/OMIT
-classification; the file is the KEEP list (oldest first).
-Still runs the normal Parameters/session flow for subsystem, scope,
-and policies.
+Skips Phase\ 2 divergence discovery, Phase\ 3 KEEP/OMIT
+classification, the Parameters menu, and the KEEP review menu;
+the file is the KEEP list (oldest first) and cherry\-pick starts
+immediately using the saved session for subsystem, scope, and
+policies.
+Does not rewrite
+.I PATH
+when it is already the session
+.IR keep_commits.txt .
+.TP
+.BI "confirm " "[PATH]"
+Review and edit the KEEP/OMIT commit list interactively, then exit.
+With no
+.IR PATH ,
+uses the session
+.IR keep_commits.txt .
+If that default file is missing, prompts for a path.
+If
+.I PATH
+is given but does not exist, prints a message and exits.
+Updates
+.IR keep_commits.txt ,
+.IR omit_commits.txt ,
+and the session cache; does not start cherry\-pick.
+Also available as hotkey
+.B v
+in the Parameters menu.
 .TP
 .B continue
 Resume from previously saved state in the output directory.
@@ -330,9 +353,13 @@ Skips the normal multi-commit workflow phases.
 .BI "reset " HASH
 Hard-reset the backport branch to an earlier commit and update saved
 state so the next run resumes from the commit after
-.IR HASH .
-The commit must be in the range between the session base commit and
-HEAD.
+.IR HASH
+(or from the first KEEP entry when
+.I HASH
+is the session base).
+.I HASH
+may be the pre\-backport session base (start over) or any commit in
+.IR base..HEAD .
 After the reset, offers an optional review of
 .IR keep_commits.txt .
 Also available interactively via the
@@ -834,8 +861,7 @@ as defaults in the interactive menu.
 are per-invocation and never saved to the session.
 The
 .BR continue ", " pick ", " reset ", " status ", " config ", " progress ,
-and
-.B file
+.BR confirm ", " file
 commands are also per-invocation.
 .SH EXAMPLES
 First run (prompts for session parameters):

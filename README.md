@@ -39,9 +39,10 @@ RHEL-compliant commit messages suitable for merge requests.
   comment-only backport.
 - **Fixes: seek** : after KEEP/OMIT classification, isb searches upstream
   for commits that `Fixes:` a KEEP hash (same idea as patchreview).
-  Out-of-scope dependents go into `Omitted-fixes` / `Omitted-fix:` in
-  the MR description so they are not reported as missing. In-scope
-  dependents that Phase 2 missed are added to KEEP.
+  Out-of-scope dependents go into `Omitted-fixes` and the MR
+  description as `Omitted-fix: <12-char>: summary` plus a ≤70-col
+  indented explanation, so they are not reported as missing.
+  In-scope dependents that Phase 2 missed are added to KEEP.
 - **Inapplicable omit** : before resolving conflicts, isb compares
   upstream functional +/- lines to RHEL ours/HEAD (and any clean staged
   merge). If nothing can land (no matching preimage, or additions
@@ -102,8 +103,14 @@ RHEL-compliant commit messages suitable for merge requests.
   already-backported commits by searching the RHEL log for the upstream
   hash before cherry-picking.
 - **Commit-file mode** : `isb file PATH` uses a KEEP list from a file
-  (`hash [subject]` per line, same as `keep_commits.txt`) and skips
-  Phase 2/3 discovery and classification.
+  (`hash [subject]` per line, same as `keep_commits.txt`), skips
+  Phase 2/3 and both menus, and starts cherry-pick immediately from
+  the saved session. Does not rewrite `PATH` when it is already
+  `keep_commits.txt`.
+- **Confirm KEEP list** : `isb confirm [PATH]` (or Parameters menu `v`)
+  opens the KEEP/OMIT review after the list exists. Default path is
+  session `keep_commits.txt`; missing default prompts for a path;
+  a missing explicit path exits with a message.
 - **Skip → omit_commits.txt** : user skips prompt for a reason; automatic
   isb/AI omits (inapplicable, already applied, etc.) record their reason.
   Both rewrite `omit_commits.txt` (and trim `keep_commits.txt`) immediately.

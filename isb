@@ -965,9 +965,10 @@ _HELP_TOPICS = {
         "Backport commits listed in a file (skip discovery/classify).",
         textwrap.dedent("""\
             Reads PATH for the KEEP list and goes straight to cherry-pick
-            (skips Phase 2 divergence scan and Phase 3 classification).
-            Still uses the normal session/Parameters flow for subsystem,
-            scope, policies, etc.
+            (skips Phase 2/3 discovery, the Parameters menu, and the
+            KEEP review menu).  Reuses the saved session for subsystem,
+            scope, and policies.  Does not rewrite PATH when it is the
+            session keep_commits.txt.
 
             File format (same as keep_commits.txt):
               # comments ignored
@@ -978,7 +979,23 @@ _HELP_TOPICS = {
 
             Example:
               isb file ~/lists/ipmi-keep.txt
-              isb file backports/9.10/ipmi/keep_commits.txt --yes
+              isb file backports/9.10/ipmi/keep_commits.txt
+        """),
+    ),
+    "confirm": (
+        "isb confirm [PATH]",
+        "Review/edit the KEEP commit list and exit.",
+        textwrap.dedent("""\
+            Opens the interactive KEEP/OMIT review for PATH (toggle
+            commits on/off).  With no PATH, uses the session
+            keep_commits.txt.  If that default file is missing, prompts
+            for a path.  If PATH is given but does not exist, prints a
+            message and exits.
+
+            Updates keep_commits.txt, omit_commits.txt, and the session
+            cache.  Does not start cherry-pick — use isb / isb continue
+            afterward.  Also available as hotkey v in the Parameters
+            menu.
         """),
     ),
     "reset": (
@@ -986,10 +1003,12 @@ _HELP_TOPICS = {
         "Reset backport progress to an earlier commit.",
         textwrap.dedent("""\
             Resets the backport branch to the specified commit HASH and
-            discards the saved progress beyond that point.  After reset,
-            offers an optional review of keep_commits.txt.  In interactive
-            mode (menu hotkey 'r'), presents a numbered list of applied
-            commits; conflicted commits are marked with a red *.
+            discards the saved progress beyond that point.  HASH may be
+            the session base (pre-backport) to start over, or any commit
+            in base..HEAD.  After reset, offers an optional review of
+            keep_commits.txt.  In interactive mode (menu hotkey 'r'),
+            presents a numbered list of applied commits; conflicted
+            commits are marked with a red *.
         """),
     ),
     "new": (
@@ -1356,8 +1375,8 @@ def _show_topics_list():
     print(f"  e.g.  isb help conflict-policy   "
           f"{DIM}not{OFF}  isb help --conflict-policy\n")
     print(f"{BLD}Commands:{OFF}")
-    for cmd in ("help", "status", "config", "progress", "file", "pick",
-                "continue", "reset", "new"):
+    for cmd in ("help", "status", "config", "progress", "file", "confirm",
+                "pick", "continue", "reset", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<22s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
@@ -1399,8 +1418,8 @@ def _show_general_help():
         return
     print(f"\n{BLD}isb{OFF} -- Intelligent Subsystem Backport for RHEL kernels\n")
     print(f"{BLD}Commands:{OFF}")
-    for cmd in ("help", "status", "config", "progress", "file", "pick",
-                "continue", "reset", "new"):
+    for cmd in ("help", "status", "config", "progress", "file", "confirm",
+                "pick", "continue", "reset", "new"):
         _, summary, _ = _HELP_TOPICS[cmd]
         print(f"  {cmd:<12s} {summary}")
     print(f"\n{BLD}Options:{OFF}")
@@ -1430,6 +1449,7 @@ def parse_args():
               isb config                   edit user config (menu) and exit
               isb progress                 show backport progress and exit
               isb file <PATH>              backport commits listed in a file
+              isb confirm [PATH]           review/edit the KEEP commit list
               isb continue                 resume from saved state
               isb pick <HASH>              cherry-pick one upstream commit
               isb reset <HASH>             reset to an earlier commit
@@ -1440,6 +1460,7 @@ def parse_args():
               isb --dry-run                first run, prompts for session
               isb                          subsequent runs reuse session
               isb file keep_commits.txt    skip discovery; use this KEEP list
+              isb confirm                  review session keep_commits.txt
               isb pick abc123def456        single-commit pick
               isb help conflict-policy     detailed help for an option
         """),
@@ -1538,6 +1559,16 @@ def parse_args():
         "path",
         help="File of commits to KEEP (hash [subject] per line)",
     )
+    confirm_p = sub.add_parser(
+        "confirm",
+        help="Review/edit the KEEP commit list and exit",
+    )
+    confirm_p.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="KEEP list file (default: session keep_commits.txt)",
+    )
     pick_p = sub.add_parser("pick",
                             help="Cherry-pick a single upstream commit")
     pick_p.add_argument("hash", help="Full 40-char upstream commit hash")
@@ -1569,7 +1600,7 @@ REQUIRED_SESSION = [
 TRANSIENT_ARGS = {"dry_run", "pick", "resume", "yes", "divergence",
                   "branch", "output_dir", "rhel_repo",
                   "command", "hash", "path", "status", "config",
-                  "progress", "file", "regen", "step"}
+                  "progress", "file", "confirm", "regen", "step"}
 
 # Fields whose change invalidates cached divergence/classification results.
 REQUISITE_FIELDS = {
@@ -2641,8 +2672,9 @@ def show_confirmation_menu(params):
               f"{MNU}p{OFF}  Regen patches")
         print(f"  {MNU}r{OFF}  Reset to commit           "
               f"{MNU}h{OFF}  Help")
-        print(f"  {MNU}g{OFF}  Go (apply all)            "
+        print(f"  {MNU}v{OFF}  Review/edit KEEP list     "
               f"{MNU}x{OFF}  Single-step (one commit)")
+        print(f"  {MNU}g{OFF}  Go (apply all)")
         if has_cache:
             print(f"  {MNU}G{OFF}  Clear cache & apply all")
         print(f"  {MNU}q{OFF}  Quit")
@@ -2714,6 +2746,11 @@ def show_confirmation_menu(params):
             keep_list = cached.get("keep", [])
             interactive_reset(_session_repo, out_dir,
                               base_commit, keep_list)
+            continue
+
+        elif ch in ('v', 'V'):
+            if not confirm_keep_list(_session_repo, None, from_menu=True):
+                warn("  No KEEP list to review.")
             continue
 
         elif ch == 'p':
@@ -8582,21 +8619,30 @@ def _offer_keep_review_after_reset(output_dir, keep):
     return keep
 
 
-def _write_commit_list(keep_path, keep, omit_path, omit):
-    """Write editable commit list files in git-log --oneline format."""
-    with open(keep_path, "w") as fh:
-        fh.write("# isb commit list -- commits to cherry-pick (oldest first)\n")
-        fh.write("# Edit this file to add, remove, or reorder commits.\n")
-        fh.write("# Lines starting with # are comments and will be ignored.\n")
-        fh.write("# Format: <40-char-hash> <subject line>\n")
-        fh.write("#\n")
-        for h, subj, reason in keep:
-            if reason and "needs redhat/configs" in reason:
-                fh.write(f"# NOTE: {reason}\n")
-            fh.write(f"{h} {subj}\n")
+def _write_commit_list(keep_path, keep, omit_path, omit, write_keep=True):
+    """Write editable commit list files in git-log --oneline format.
+
+    When *write_keep* is False, only omit_path is rewritten (used by
+    ``isb file`` when PATH is already keep_commits.txt).
+    """
+    if write_keep:
+        with open(keep_path, "w") as fh:
+            fh.write("# isb commit list -- commits to cherry-pick "
+                     "(oldest first)\n")
+            fh.write("# Edit this file to add, remove, or reorder "
+                     "commits.\n")
+            fh.write("# Lines starting with # are comments and will "
+                     "be ignored.\n")
+            fh.write("# Format: <40-char-hash> <subject line>\n")
+            fh.write("#\n")
+            for h, subj, reason in keep:
+                if reason and "needs redhat/configs" in reason:
+                    fh.write(f"# NOTE: {reason}\n")
+                fh.write(f"{h} {subj}\n")
     with open(omit_path, "w") as fh:
         fh.write("# isb omit list -- commits excluded from cherry-pick\n")
-        fh.write("# Move lines from here to keep_commits.txt to include them.\n")
+        fh.write("# Move lines from here to keep_commits.txt to "
+                 "include them.\n")
         fh.write("# Format: <hash> <subject> | <reason>\n")
         fh.write("#\n")
         for h, subj, reason in omit:
@@ -8713,6 +8759,159 @@ def load_commits_from_file(path, upstream_repo):
     return keep
 
 
+def _read_omit_list(path):
+    """Read omit_commits.txt.  Returns ``[(hash, subject, reason), ...]``."""
+    if not os.path.isfile(path):
+        return []
+    result = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            reason = "user-excluded"
+            subject = ""
+            if " | " in line:
+                left, reason = line.split(" | ", 1)
+                reason = reason.strip() or "user-excluded"
+                parts = left.split(None, 1)
+            else:
+                parts = line.split(None, 1)
+            if not parts or len(parts[0]) < 7:
+                continue
+            h = parts[0]
+            subject = parts[1] if len(parts) > 1 else ""
+            result.append((h, subject, reason))
+    return result
+
+
+def _session_output_dir(session, rhel_repo):
+    """Return the backport output directory for *session*."""
+    output_dir = session.get("output_dir") if session else None
+    if output_dir:
+        return output_dir
+    sub = (session or {}).get("subsystem", "unknown")
+    rhel_ver = (session or {}).get("rhel", "0")
+    return os.path.join(
+        os.path.dirname(os.path.abspath(rhel_repo)), "backports",
+        str(rhel_ver),
+        os.path.basename(str(sub).rstrip("/")),
+    )
+
+
+def _resolve_keep_path_for_confirm(output_dir, filename=None, *,
+                                   interactive_missing=True):
+    """Resolve the KEEP list path for ``isb confirm`` / menu review.
+
+    *filename* None → default ``output_dir/keep_commits.txt``.
+    If that default is missing and *interactive_missing*, prompt.
+    If an explicit *filename* is missing → message and return None
+    (caller should exit).
+    """
+    default_keep = os.path.join(output_dir, "keep_commits.txt")
+    if filename:
+        keep_path = os.path.abspath(os.path.expanduser(filename))
+        if not os.path.isfile(keep_path):
+            warn(f"Commit list not found: {keep_path}")
+            print(f"  Provide an existing KEEP list file and re-run "
+                  f"(default: {default_keep}).")
+            return None
+        return keep_path
+
+    keep_path = default_keep
+    if os.path.isfile(keep_path):
+        return keep_path
+
+    warn(f"Default KEEP list not found: {keep_path}")
+    if not interactive_missing or not sys.stdin.isatty():
+        return None
+    try:
+        raw = input("  Enter path to keep_commits file: ").strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        warn("  No file given.")
+        return None
+    keep_path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isfile(keep_path):
+        warn(f"Commit list not found: {keep_path}")
+        return None
+    return keep_path
+
+
+def confirm_keep_list(rhel_repo, filename=None, *, from_menu=False):
+    """Interactive review/edit of a KEEP list; update cache and files.
+
+    Returns True if a review ran, False if cancelled / file missing.
+    """
+    session = _session if _session is not None else load_session(rhel_repo)
+    if not session:
+        die("No session found. Run isb first.")
+
+    output_dir = _session_output_dir(session, rhel_repo)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Menu convenience: seed keep_commits.txt from cache when missing
+    default_keep = os.path.join(output_dir, "keep_commits.txt")
+    cached = session.get("_cached") or {}
+    if (from_menu and not filename and not os.path.isfile(default_keep)
+            and cached.get("keep")):
+        omit = [tuple(x) for x in cached.get("omit", [])]
+        keep = [tuple(x) for x in cached["keep"]]
+        _write_commit_list(default_keep, keep,
+                           os.path.join(output_dir, "omit_commits.txt"),
+                           omit)
+        info(f"  Wrote {default_keep} from cached KEEP list.")
+
+    keep_path = _resolve_keep_path_for_confirm(
+        output_dir, filename, interactive_missing=True)
+    if not keep_path:
+        return False
+
+    omit_path = os.path.join(os.path.dirname(keep_path), "omit_commits.txt")
+    if os.path.dirname(keep_path) != os.path.abspath(output_dir):
+        # Prefer session omit alongside keep when reviewing an external list
+        sess_omit = os.path.join(output_dir, "omit_commits.txt")
+        if not os.path.isfile(omit_path) and os.path.isfile(sess_omit):
+            omit_path = sess_omit
+
+    upstream_repo = session.get("upstream_repo")
+    if not upstream_repo or not os.path.isdir(upstream_repo):
+        die("Session has no valid upstream_repo; cannot resolve commits.")
+
+    keep = load_commits_from_file(keep_path, upstream_repo)
+    omit = _read_omit_list(omit_path)
+
+    # Prefer cached reasons / omit entries when hashes match
+    if cached.get("keep"):
+        by_h = {h: (h, s, r) for h, s, r in cached["keep"]}
+        keep = [by_h.get(h, (h, s, r)) for h, s, r in keep]
+    if not omit and cached.get("omit"):
+        omit = [tuple(x) for x in cached["omit"]]
+
+    # Drop omit entries that are still in KEEP (file is authoritative)
+    keep_hashes = {h for h, _, _ in keep}
+    omit = [(h, s, r) for h, s, r in omit if h not in keep_hashes]
+
+    status(f"Reviewing {len(keep)} KEEP / {len(omit)} OMIT "
+           f"from {keep_path}")
+    keep = _review_commits(keep, omit, keep_path, omit_path, output_dir)
+    _write_commit_list(keep_path, keep, omit_path, omit)
+
+    divergence = cached.get("divergence") or (
+        keep[0][0] if keep else "confirm")
+    pending = cached.get("pending") or [h for h, _, _ in keep]
+    save_cached_results(session, divergence, pending, keep, omit)
+    session["output_dir"] = output_dir
+    if _session is not None:
+        _save()
+    else:
+        save_session(rhel_repo, session)
+    status(f"Updated KEEP list: {len(keep)} commit(s) selected")
+    info(f"  {keep_path}")
+    return True
+
+
 def show_progress(rhel_repo):
     """Display backport progress from saved session and state, then exit."""
     session = load_session(rhel_repo)
@@ -8796,36 +8995,56 @@ def show_progress(rhel_repo):
 def do_reset(rhel_repo, target_hash, output_dir, base_commit, keep):
     """Hard-reset the branch to target_hash and update saved state.
 
-    The target must be in the range base_commit..HEAD.  After reset,
-    the cherry-pick loop state is updated so the next run resumes from
-    the commit after target_hash.
+    The target must be the session base commit (start over) or a commit
+    in base_commit..HEAD.  After reset, the cherry-pick loop state is
+    updated so the next run resumes from the commit after target_hash
+    (or from the first KEEP entry when resetting to the base).
     """
     r = git(f"rev-parse {target_hash}", cwd=rhel_repo, check=False)
     if r.returncode != 0:
         die(f"Commit {target_hash} not found in this repo.")
     full_hash = r.stdout.strip()
 
-    log_r = git(f"log --format=%H --reverse {base_commit}..HEAD",
+    base_r = git(f"rev-parse {base_commit}", cwd=rhel_repo, check=False)
+    if base_r.returncode != 0:
+        die(f"Session base commit {base_commit[:12]} not found.")
+    base_full = base_r.stdout.strip()
+
+    log_r = git(f"log --format=%H --reverse {base_full}..HEAD",
                 cwd=rhel_repo, check=False)
     applied_hashes = [h for h in log_r.stdout.strip().split("\n") if h]
 
-    if full_hash not in applied_hashes:
-        die(f"{target_hash} is not in the range {base_commit[:12]}..HEAD.")
-
-    target_pos = applied_hashes.index(full_hash)
-    new_next_idx = target_pos + 1
+    # Allow the pre-backport base itself (same as interactive reset "0")
+    if full_hash == base_full:
+        new_next_idx = 0
+    elif full_hash in applied_hashes:
+        new_next_idx = applied_hashes.index(full_hash) + 1
+    else:
+        die(f"{target_hash} is not the session base "
+            f"({base_full[:12]}) or in the range "
+            f"{base_full[:12]}..HEAD.")
 
     subject = git(f"log --format=%s -1 {full_hash}",
                   cwd=rhel_repo, check=False).stdout.strip()
 
     git(f"reset --hard {full_hash}", cwd=rhel_repo)
-    _save_progress(output_dir, new_next_idx, base_commit, rhel_repo)
+    _save_progress(output_dir, new_next_idx, base_full, rhel_repo)
     _session.pop("_completed_head", None)
     _save()
 
     total = len(keep) if keep else "?"
     status(f"Reset to {full_hash[:12]} {subject}")
-    info(f"  Next run will resume from commit [{new_next_idx + 1}/{total}].")
+    if new_next_idx == 0:
+        info(f"  Next run will start from commit [1/{total}].")
+        _us_state = load_state(output_dir)
+        n_skipped = len(_us_state.get("user_skipped", [])
+                        ) if _us_state else 0
+        if n_skipped:
+            info(f"  {n_skipped} user-skipped commit(s) will be "
+                 f"excluded on replay (toggle in commit review).")
+    else:
+        info(f"  Next run will resume from commit "
+             f"[{new_next_idx + 1}/{total}].")
     return _offer_keep_review_after_reset(output_dir, keep)
 
 
@@ -9025,6 +9244,76 @@ def regen_patches(rhel_repo, output_dir, base_commit,
 # Phase 5: output generation
 # ---------------------------------------------------------------------------
 
+def _format_omitted_fix_entry(commit_hash, subject, reason, width=70):
+    """Format one Omitted-fix block for Omitted-fixes / MR text.
+
+    Summary line is unrestricted; explanation lines wrap to *width*
+    and hang-indent under the summary text::
+
+        Omitted-fix: <12-char>: summary line
+                               indented explanation...
+    """
+    short = (commit_hash or "")[:12]
+    subj = (subject or "").strip() or short
+    header = f"Omitted-fix: {short}: {subj}"
+    # Hang under the summary (after "Omitted-fix: <hash>: ")
+    indent = " " * len(f"Omitted-fix: {short}: ")
+    lines = [header]
+    body = (reason or "").strip()
+    if body:
+        # Soft-strip common SKIP / Recommendation prefixes for readability
+        if body.upper().startswith("RECOMMENDATION:"):
+            body = body.split(":", 1)[1].strip()
+        wrapped = textwrap.wrap(
+            body, width=width,
+            initial_indent=indent,
+            subsequent_indent=indent,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if wrapped:
+            lines.extend(wrapped)
+        else:
+            lines.append(f"{indent}{body}")
+    return "\n".join(lines)
+
+
+def _merge_omit_lists(*lists):
+    """Merge omit tuples by hash; later lists win on subject/reason."""
+    by_h = {}
+    order = []
+    for lst in lists:
+        for h, subject, reason in (lst or []):
+            if not h:
+                continue
+            key = h[:12]
+            if key not in by_h:
+                order.append(key)
+            # Prefer longer hash / non-empty reason when replacing
+            prev = by_h.get(key)
+            if prev is None:
+                by_h[key] = (h, subject, reason)
+                continue
+            ph, ps, pr = prev
+            use_h = h if len(h) >= len(ph) else ph
+            use_s = subject or ps
+            use_r = reason if (reason and reason.strip()) else pr
+            by_h[key] = (use_h, use_s, use_r)
+    return [by_h[k] for k in order]
+
+
+def _omit_list_for_output(output_dir, omit_list):
+    """Combine in-memory omits with omit_commits.txt (file is authoritative).
+
+    Cherry-pick skips are synced to omit_commits.txt during the loop;
+    always re-read that file so MR / Omitted-fixes include them with
+    their reasons.
+    """
+    file_omit = _read_omit_list(
+        os.path.join(output_dir, "omit_commits.txt"))
+    return _merge_omit_lists(omit_list or [], file_omit)
+
+
 def generate_output(rhel_repo, output_dir, base_commit, omit_list,
                     rhel_ver="", subsystem="", jira="",
                     upstream_version="", signed_off_by="", cve=""):
@@ -9045,16 +9334,18 @@ def generate_output(rhel_repo, output_dir, base_commit, omit_list,
     print(f"  {INF}{patches_dir}{OFF}")
     print(f"{STA}{'=' * 74}{OFF}\n")
 
+    omits = _omit_list_for_output(output_dir, omit_list)
+
     omitted_path = os.path.join(output_dir, "Omitted-fixes")
     with open(omitted_path, "w") as fh:
-        fh.write(f"# Omitted upstream commits ({len(omit_list)} entries)\n")
-        fh.write(f"# Generated by isb\n\n")
-        for h, subject, reason in omit_list:
-            fh.write(f"{h[:12]} {subject}\n")
-            fh.write(f"  Reason: {reason}\n\n")
-    info(f"Wrote {omitted_path} ({len(omit_list)} entries)")
+        fh.write(f"# Omitted upstream commits ({len(omits)} entries)\n")
+        fh.write("# Generated by isb\n\n")
+        for h, subject, reason in omits:
+            fh.write(_format_omitted_fix_entry(h, subject, reason))
+            fh.write("\n\n")
+    info(f"Wrote {omitted_path} ({len(omits)} entries)")
 
-    # Generate MR description
+    # Generate MR description (same Omitted-fix blocks, with reasons)
     sub_name = os.path.basename(subsystem.rstrip("/")) if subsystem else ""
     mr_path = os.path.join(output_dir, "mr-description.txt")
     with open(mr_path, "w") as fh:
@@ -9063,11 +9354,12 @@ def generate_output(rhel_repo, output_dir, base_commit, omit_list,
         fh.write(f"Upstream status: {upstream_version}\n")
         if cve:
             fh.write(f"CVE: {cve}\n")
-        if omit_list:
+        if omits:
             fh.write("\n")
-            for h, subject, _reason in omit_list:
-                fh.write(f"Omitted-fix: {h[:12]} {subject}\n")
-        fh.write(f"\nSigned-off-by: {signed_off_by}\n")
+            for h, subject, reason in omits:
+                fh.write(_format_omitted_fix_entry(h, subject, reason))
+                fh.write("\n\n")
+        fh.write(f"Signed-off-by: {signed_off_by}\n")
     info(f"Wrote {mr_path}")
 
     return len(patch_files)
@@ -9157,6 +9449,12 @@ def main():
 
     if args.command == "progress":
         show_progress(rhel_repo)
+        return
+
+    if args.command == "confirm":
+        path = getattr(args, "path", None)
+        if not confirm_keep_list(rhel_repo, path, from_menu=False):
+            sys.exit(1)
         return
 
     if args.command == "new":
@@ -9816,7 +10114,9 @@ def main():
     while _step_loop:
         _step_loop = False
 
-        if not args.yes:
+        # isb file: KEEP list is authoritative — skip Parameters menu
+        # and go straight to cherry-pick with the saved session.
+        if not args.yes and args.command != "file":
             show_confirmation_menu(params)
 
         scope_paths = params["scope_paths"]
@@ -9998,15 +10298,31 @@ def main():
                      f"commit(s)")
                 keep = new_keep
 
-        # Write editable commit list
+        # Write editable commit list.  For isb file, do not clobber the
+        # user-supplied PATH when it is already keep_commits.txt.
         os.makedirs(output_dir, exist_ok=True)
         keep_file = os.path.join(output_dir, "keep_commits.txt")
         omit_file = os.path.join(output_dir, "omit_commits.txt")
-        _write_commit_list(keep_file, keep, omit_file, omit)
+        _src_file = ""
+        if args.command == "file":
+            _src_file = os.path.abspath(os.path.expanduser(
+                getattr(args, "path", "") or ""))
+        _same_keep = (
+            bool(_src_file) and os.path.isfile(_src_file)
+            and os.path.abspath(keep_file) == _src_file
+        )
+        if _same_keep:
+            # Preserve the authoritative KEEP file; refresh omit only.
+            _write_commit_list(keep_file, keep, omit_file, omit,
+                               write_keep=False)
+            info(f"  Using KEEP list as-is: {keep_file}")
+        else:
+            _write_commit_list(keep_file, keep, omit_file, omit)
 
-        # Proceed/review menu: always offered on first run, continue,
-        # and auto-resume after interrupt/reset (unless --yes).
-        if not args.yes:
+        # Proceed/review menu: offered on first run, continue, and
+        # auto-resume after interrupt/reset.  Skipped for isb file
+        # (file is the KEEP list) and --yes.
+        if not args.yes and args.command != "file":
             _st_resume = load_state(output_dir)
             _is_resume = (
                 args.command == "continue"
