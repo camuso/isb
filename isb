@@ -4051,9 +4051,9 @@ def _format_config_snippet_commit_message(created_snippets, for_hash,
     """
     symbols = [os.path.basename(rel) for rel, _ in created_snippets]
     if len(symbols) == 1:
-        subject = f"redhat/configs: add {symbols[0]} snippet"
+        subject = f"redhat/configs: add {symbols[0]}"
     else:
-        subject = f"redhat/configs: add {len(symbols)} CONFIG snippets"
+        subject = f"redhat/configs: add {len(symbols)} CONFIG options"
     if len(subject) > 70:
         subject = subject[:67] + "..."
 
