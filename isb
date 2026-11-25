@@ -329,9 +329,14 @@ def _config_summary_line():
 
 
 def _standalone_config_params():
-    """Minimal params dict for standalone ``isb config``."""
+    """Minimal params dict for standalone ``isb config``.
+
+    When cwd (or ``--rhel-repo``) is a RHEL kernel tree with a session,
+    merge session paths so Config ``v`` can find conflict reports.
+    """
+    global _session, _session_repo
     ensure_user_config(_session)
-    return {
+    params = {
         "conflict_policy": get_config("conflict_policy"),
         "build_policy": get_config("build_policy") or "conflict",
         "editor": get_config("editor") or _get_editor(),
@@ -339,6 +344,20 @@ def _standalone_config_params():
         "signed_off_by": get_config("signed_off_by") or "",
         "assisted_by": get_config("assisted_by") or "",
     }
+    # Best-effort: load session from the current tree so viewers work
+    repo = os.path.realpath(os.path.abspath(os.getcwd()))
+    if os.path.isdir(os.path.join(repo, ".git")):
+        sess = load_session(repo)
+        if sess:
+            _session.update(sess)
+            _session_repo = repo
+            for key in ("rhel_repo", "upstream_repo", "output_dir",
+                        "subsystem", "rhel"):
+                if sess.get(key):
+                    params[key] = sess[key]
+            if "rhel_repo" not in params:
+                params["rhel_repo"] = repo
+    return params
 
 
 def _format_config_field_display(field):
@@ -1009,6 +1028,11 @@ _HELP_TOPICS = {
             API key, model lists, Signed-off-by / Assisted-by).  Saves to
             ~/.config/isb/config.json on quit.  Does not require a
             kernel tree.
+
+            Menu key v lists conflict-report-*.txt from the session
+            output dir and opens upstream vs RHEL-resolved side-by-side
+            in the configured editor (widens to 224 columns, or spawns
+            a wide graphical terminal if needed).
 
             View current values without editing:  isb status
         """),
@@ -2562,6 +2586,7 @@ def show_config_menu(params):
                 display = val if val else f"{WRN}(not set){OFF}"
             print(f"  {MNU}{key}{OFF}  {label:<18s}: {INF}{display}{OFF}")
         print(f"    {'─' * 50}")
+        print(f"  {MNU}v{OFF}  View conflict resolutions (side-by-side)")
         print(f"  {MNU}q{OFF}  Done (save & return)")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -2577,6 +2602,10 @@ def show_config_menu(params):
             _cached_models.clear()
             status("  Config saved.")
             return
+
+        if ch in ('v', 'V'):
+            view_conflict_resolutions(params)
+            continue
 
         hit = None
         for key, field, label, ftype in _CONFIG_MENU_FIELDS:
@@ -4888,6 +4917,470 @@ def _get_editor():
     if shutil.which("vim"):
         return "vim"
     return "vi"
+
+
+# Side-by-side conflict-resolution viewer (Config menu → v).
+SIDE_BY_SIDE_COLS = 224
+_MIN_SIDE_BY_SIDE_COLS = 160  # below this, prefer a spawned wide terminal
+_DIFF_SECTION_MARK = "." * 40
+_GUI_EDITORS = frozenset({
+    "gvim", "code", "code-insiders", "gedit", "kate",
+    "subl", "sublime_text", "emacsclient",
+})
+
+
+def _editor_argv():
+    """Split the configured editor into an argv list."""
+    return shlex.split(_get_editor() or "vim")
+
+
+def _editor_is_gui(argv):
+    """True when the editor opens its own window (no TTY needed)."""
+    if not argv:
+        return False
+    return os.path.basename(argv[0]) in _GUI_EDITORS
+
+
+def _resolve_backport_context(params=None):
+    """Return (rhel_repo, upstream_repo, output_dir) from params/session."""
+    params = params or {}
+    rhel = (params.get("rhel_repo")
+            or _session.get("rhel_repo")
+            or _session_repo)
+    upstream = (params.get("upstream_repo")
+                or _session.get("upstream_repo"))
+    out = params.get("output_dir") or _session.get("output_dir")
+    if not out and rhel:
+        sub = params.get("subsystem") or _session.get("subsystem")
+        rhel_ver = params.get("rhel") or _session.get("rhel")
+        if sub and rhel_ver:
+            out = os.path.join(
+                os.path.dirname(rhel), "backports",
+                str(rhel_ver),
+                os.path.basename(str(sub).rstrip("/")),
+            )
+    return rhel, upstream, out
+
+
+def _list_conflict_reports(output_dir):
+    """Return sorted paths to conflict-report-*.txt under *output_dir*."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return []
+    return sorted(glob(os.path.join(
+        output_dir, "conflict-report-*.txt")))
+
+
+def _parse_conflict_report(report_path):
+    """Parse a conflict-report file into metadata and per-file diffs.
+
+    Returns dict:
+      path, upstream (12-char), subject, files=[{file, diff}, ...]
+    """
+    with open(report_path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    meta = {
+        "path": report_path,
+        "upstream": None,
+        "subject": "",
+        "files": [],
+    }
+    m = re.search(r"^Upstream commit:\s+(\S+)\s+(.*)$", text, re.M)
+    if m:
+        meta["upstream"] = m.group(1)
+        meta["subject"] = m.group(2).strip()
+    parts = re.split(r"(?m)^File:\s+", text)
+    mark = re.escape(_DIFF_SECTION_MARK)
+    for part in parts[1:]:
+        lines = part.splitlines()
+        if not lines:
+            continue
+        fpath = lines[0].strip()
+        diff = None
+        dm = re.search(
+            r"Diff \(resolved vs upstream\):\n"
+            + mark + r"\n(.*?)" + mark,
+            part, re.S,
+        )
+        if dm:
+            diff = dm.group(1)
+        meta["files"].append({"file": fpath, "diff": diff})
+    return meta
+
+
+def _git_show_blob(repo, rev, path):
+    """Return file contents at *rev*:*path*, or None if missing."""
+    if not repo or not rev or not path:
+        return None
+    r = git(f"show {shlex.quote(rev)}:{shlex.quote(path)}",
+            cwd=repo, check=False)
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def _find_rhel_backport_commit(rhel_repo, upstream_hash):
+    """Find a RHEL commit whose message cites *upstream_hash*.
+
+    Searches the current branch only (recent backports are on HEAD's
+    history).  Avoid ``--all`` — it is slow on large kernel repos.
+    """
+    if not rhel_repo or not upstream_hash:
+        return None
+    uh = upstream_hash[:12]
+    r = git(f"log --format=%H -1 --grep={shlex.quote(uh)}",
+            cwd=rhel_repo, check=False)
+    h = (r.stdout or "").strip()
+    return h or None
+
+
+def _apply_unified_to_content(upstream_content, diff_text):
+    """Apply a report unified-diff body to upstream; return resolved text.
+
+    Report diffs use ``--- upstream`` / ``+++ resolved`` headers; those
+    are rewritten to a/file + b/file for ``patch -p1``.
+    """
+    if upstream_content is None:
+        return None
+    if not diff_text or not diff_text.strip():
+        return upstream_content
+    lines = diff_text.splitlines(True)
+    hunk_i = 0
+    for i, ln in enumerate(lines):
+        if ln.startswith("@@"):
+            hunk_i = i
+            break
+    body = "".join(lines[hunk_i:])
+    if not body.strip():
+        return upstream_content
+    if not body.endswith("\n"):
+        body += "\n"
+    if not shutil.which("patch"):
+        return None
+    with tempfile.TemporaryDirectory(prefix="isb-patch-") as td:
+        src = os.path.join(td, "file")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(upstream_content)
+        patch_path = os.path.join(td, "diff.patch")
+        with open(patch_path, "w", encoding="utf-8") as fh:
+            fh.write("--- a/file\n+++ b/file\n")
+            fh.write(body)
+        r = subprocess.run(
+            ["patch", "-p1", "--batch", "--quiet",
+             "-i", patch_path, "file"],
+            cwd=td, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        # 0 = clean, 1 = offsets/fuzz still applied
+        if r.returncode not in (0, 1):
+            return None
+        with open(src, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+
+def _materialize_resolution_pair(rhel_repo, upstream_repo, meta, file_entry,
+                                 tmpdir):
+    """Write upstream + RHEL-resolved temps for one conflicted file.
+
+    Returns (upstream_path, rhel_path) or (None, None) on failure.
+    """
+    rel = file_entry["file"]
+    uh = meta.get("upstream")
+    safe = rel.replace("/", "__")
+    up_path = os.path.join(tmpdir, f"upstream--{safe}")
+    rh_path = os.path.join(tmpdir, f"rhel--{safe}")
+
+    # Upstream blob: prefer dedicated upstream repo, else RHEL objects
+    up_content = None
+    for repo in (upstream_repo, rhel_repo):
+        up_content = _git_show_blob(repo, uh, rel)
+        if up_content is not None:
+            break
+    if up_content is None:
+        return None, None
+
+    with open(up_path, "w", encoding="utf-8") as fh:
+        fh.write(up_content)
+
+    rh_content = None
+    # 1) Accepted backport commit that cites this upstream hash
+    if rhel_repo:
+        bp = _find_rhel_backport_commit(rhel_repo, uh)
+        if bp:
+            rh_content = _git_show_blob(rhel_repo, bp, rel)
+    # 2) Reconstruct from the report's resolved-vs-upstream diff
+    #    (covers skipped commits and anything not yet cited in RHEL)
+    if rh_content is None:
+        rh_content = _apply_unified_to_content(
+            up_content, file_entry.get("diff"))
+    if rh_content is None:
+        return None, None
+
+    with open(rh_path, "w", encoding="utf-8") as fh:
+        fh.write(rh_content)
+    return up_path, rh_path
+
+
+def _ensure_terminal_cols(want=SIDE_BY_SIDE_COLS):
+    """Try to widen the current terminal to *want* columns.
+
+    Returns (columns, resized, restore_size) where restore_size is
+    (cols, lines) to put back after viewing, or None.
+    """
+    try:
+        cur = shutil.get_terminal_size(fallback=(80, 24))
+    except OSError:
+        return 80, False, None
+    if cur.columns >= want:
+        return cur.columns, False, None
+    # xterm windowops: CSI 8 ; rows ; cols t
+    try:
+        sys.stdout.write(f"\033[8;{cur.lines};{want}t")
+        sys.stdout.flush()
+        time.sleep(0.08)
+    except OSError:
+        return cur.columns, False, None
+    try:
+        new = shutil.get_terminal_size(fallback=(cur.columns, cur.lines))
+    except OSError:
+        return cur.columns, False, None
+    if new.columns > cur.columns:
+        return new.columns, True, (cur.columns, cur.lines)
+    return new.columns, False, None
+
+
+def _restore_terminal_size(saved):
+    """Restore terminal geometry saved by _ensure_terminal_cols."""
+    if not saved:
+        return
+    cols, lines = saved
+    try:
+        sys.stdout.write(f"\033[8;{lines};{cols}t")
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+def _side_by_side_argv(left, right, left_label="upstream",
+                       right_label="rhel-resolved"):
+    """Build argv for a side-by-side diff of *left* vs *right*."""
+    argv = _editor_argv()
+    name = os.path.basename(argv[0]) if argv else "vim"
+
+    if name in ("vim", "vim.basic", "vim.nox", "vim.tiny",
+                "nvim", "neovim", "gvim"):
+        # -d diff, -O vertical split (side-by-side), -R readonly
+        cmd = argv + ["-d", "-O", "-R", left, right]
+        # Set buffer names for clarity in the statusline
+        cmd += [
+            "-c", f"file {left_label}",
+            "-c", "wincmd l",
+            "-c", f"file {right_label}",
+            "-c", "wincmd h",
+            "-c", "wincmd =",
+        ]
+        if name == "gvim":
+            # Stay in foreground until the GUI window closes
+            cmd[1:1] = ["-f"]
+        return cmd
+
+    if name in ("code", "code-insiders"):
+        return argv + ["--wait", "--diff", left, right]
+
+    if name in ("emacs", "emacsclient"):
+        lisp = (f'(ediff-files "{left}" "{right}")')
+        if name == "emacsclient":
+            return argv + ["-c", "-a", "", "-e", lisp]
+        return argv + ["--eval", lisp]
+
+    # Generic fallback: vimdiff if available, else open both files
+    if shutil.which("vimdiff"):
+        return ["vimdiff", "-O", "-R", left, right]
+    return argv + [left, right]
+
+
+def _spawn_gui_terminal(argv, cols=SIDE_BY_SIDE_COLS, rows=60):
+    """Run *argv* in a new graphical terminal. Return True on success."""
+    if not _has_display():
+        return False
+    geo = f"{cols}x{rows}"
+    candidates = []
+    if shutil.which("gnome-terminal"):
+        candidates.append(
+            ["gnome-terminal", f"--geometry={geo}", "--"] + argv)
+    if shutil.which("konsole"):
+        candidates.append(
+            ["konsole", "-p", f"TerminalColumns={cols}",
+             "-e"] + argv)
+    if shutil.which("xfce4-terminal"):
+        candidates.append(
+            ["xfce4-terminal", f"--geometry={geo}", "-e",
+             " ".join(shlex.quote(a) for a in argv)])
+    if shutil.which("xterm"):
+        candidates.append(
+            ["xterm", "-geometry", geo, "-e"] + argv)
+    for cmd in candidates:
+        try:
+            subprocess.Popen(cmd, start_new_session=True)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _run_side_by_side_viewer(left, right, left_label, right_label,
+                             cleanup_dir=None):
+    """Open left|right side-by-side in the editor.
+
+    Prefer the current terminal (widening to SIDE_BY_SIDE_COLS when
+    needed).  If the TTY is still too narrow and a display is available,
+    spawn a new wide terminal.  GUI editors are launched in-process.
+    """
+    cmd = _side_by_side_argv(left, right, left_label, right_label)
+    restore = None
+    try:
+        if _editor_is_gui(cmd):
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(cmd, check=False)
+            return
+
+        use_spawn = False
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            use_spawn = True
+        else:
+            cols, _resized, restore = _ensure_terminal_cols(
+                SIDE_BY_SIDE_COLS)
+            if cols < _MIN_SIDE_BY_SIDE_COLS and _has_display():
+                use_spawn = True
+
+        if use_spawn:
+            # Delete temps after the editor exits in the child shell
+            if cleanup_dir:
+                shell = (
+                    " ".join(shlex.quote(a) for a in cmd)
+                    + f"; rm -rf {shlex.quote(cleanup_dir)}"
+                )
+                spawn_argv = ["bash", "-lc", shell]
+            else:
+                spawn_argv = cmd
+            if _spawn_gui_terminal(spawn_argv):
+                info(f"  Opened side-by-side view in a new "
+                     f"{SIDE_BY_SIDE_COLS}-column terminal.")
+                cleanup_dir = None  # child owns cleanup
+                return
+            warn("  Could not spawn a graphical terminal; "
+                 "using this terminal.")
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        subprocess.run(cmd, check=False)
+    finally:
+        _restore_terminal_size(restore)
+        if cleanup_dir and os.path.isdir(cleanup_dir):
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+def view_conflict_resolutions(params=None):
+    """Config-menu action: browse conflict reports side-by-side.
+
+    Lists conflict-report-*.txt from the session output dir, lets the
+    user pick a report (and file), then opens upstream vs RHEL-resolved
+    in the configured editor.
+    """
+    rhel_repo, upstream_repo, output_dir = _resolve_backport_context(
+        params)
+    reports = _list_conflict_reports(output_dir)
+    if not reports:
+        where = output_dir or "(no output dir in session)"
+        warn(f"  No conflict reports found in {where}")
+        info("  Conflict reports are written during cherry-pick "
+             "when a commit has real conflicts.")
+        return
+
+    while True:
+        print(f"\n{MNU}    Conflict Resolutions{OFF}  "
+              f"{DIM}({output_dir}){OFF}")
+        print(f"    {'─' * 50}")
+        for i, rp in enumerate(reports, 1):
+            meta = _parse_conflict_report(rp)
+            uh = meta.get("upstream") or "?"
+            subj = meta.get("subject") or os.path.basename(rp)
+            nfiles = len(meta.get("files") or [])
+            print(f"  {MNU}{i}{OFF}  {INF}{uh}{OFF}  {subj}"
+                  f"  {DIM}({nfiles} file"
+                  f"{'s' if nfiles != 1 else ''}){OFF}")
+        print(f"    {'─' * 50}")
+        print(f"  {MNU}q{OFF}  Back")
+        print(f"\n  {BLD}Report #:{OFF} ", end="", flush=True)
+        raw = input().strip()
+        if raw.lower() in ("q", "", "\x03"):
+            return
+        try:
+            idx = int(raw)
+        except ValueError:
+            continue
+        if idx < 1 or idx > len(reports):
+            continue
+
+        meta = _parse_conflict_report(reports[idx - 1])
+        files = meta.get("files") or []
+        if not files:
+            warn("  Report has no File: entries.")
+            # Fall back to opening the text report
+            editor = _get_editor()
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(f"{editor} {shlex.quote(meta['path'])}",
+                           shell=True)
+            continue
+
+        chosen = files
+        if len(files) > 1:
+            print(f"\n  Files in {INF}{meta.get('upstream')}{OFF}:")
+            for j, fe in enumerate(files, 1):
+                print(f"    {MNU}{j}{OFF}  {fe['file']}")
+            print(f"    {MNU}a{OFF}  All files (one after another)")
+            print(f"    {MNU}r{OFF}  Open text report instead")
+            print(f"\n  {BLD}File:{OFF} ", end="", flush=True)
+            pick = input().strip().lower()
+            if pick in ("q", ""):
+                continue
+            if pick == "r":
+                editor = _get_editor()
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                subprocess.run(
+                    f"{editor} {shlex.quote(meta['path'])}",
+                    shell=True)
+                continue
+            if pick != "a":
+                try:
+                    fi = int(pick)
+                except ValueError:
+                    continue
+                if fi < 1 or fi > len(files):
+                    continue
+                chosen = [files[fi - 1]]
+
+        uh = meta.get("upstream") or "upstream"
+        for fe in chosen:
+            tmpdir = tempfile.mkdtemp(prefix="isb-view-")
+            up_path, rh_path = _materialize_resolution_pair(
+                rhel_repo, upstream_repo, meta, fe, tmpdir)
+            if not up_path or not rh_path:
+                warn(f"  Could not materialize side-by-side for "
+                     f"{fe['file']}; opening text report.")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                editor = _get_editor()
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                subprocess.run(
+                    f"{editor} {shlex.quote(meta['path'])}",
+                    shell=True)
+                continue
+            left_label = f"upstream-{uh}-{os.path.basename(fe['file'])}"
+            right_label = f"rhel-resolved-{os.path.basename(fe['file'])}"
+            info(f"  Viewing {fe['file']}  "
+                 f"(left=upstream {uh}, right=RHEL resolved)")
+            _run_side_by_side_viewer(
+                up_path, rh_path, left_label, right_label,
+                cleanup_dir=tmpdir,
+            )
 
 
 # Conflict / prerequisite analysis limits (documented in README + man).
