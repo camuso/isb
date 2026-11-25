@@ -88,6 +88,7 @@ CONFIG_DEFAULTS = {
     "build_policy": "conflict",
     "editor": None,                   # None = VISUAL/EDITOR/vim
     "ailog": True,
+    "view_resolutions": False,
     "assisted_by": "",
     "signed_off_by": "",
     "ai_provider": "cursor",
@@ -324,8 +325,10 @@ def _config_summary_line():
     plabel = CONFLICT_POLICY_LABELS.get(pol, pol)
     provider = get_config("ai_provider") or "cursor"
     ailog = "ailog on" if get_config("ailog") else "ailog off"
+    vres = ("view-res on" if get_config("view_resolutions")
+            else "view-res off")
     key = "key ok" if _get_api_key() else "no key"
-    return f"{provider} / {plabel} / {ailog} / {key}"
+    return f"{provider} / {plabel} / {ailog} / {vres} / {key}"
 
 
 def _standalone_config_params():
@@ -380,7 +383,7 @@ def _format_config_field_display(field):
         return get_config(field) or "conflict"
     if field == "ai_provider":
         return get_config(field) or "cursor"
-    if field == "ailog":
+    if field in ("ailog", "view_resolutions"):
         return "on" if get_config(field) else "off"
     if field in ("ai_model_analysis", "ai_model_fix"):
         prefs = get_config(field) or []
@@ -404,6 +407,7 @@ def show_user_config_status():
         "build_policy": "Build policy",
         "editor": "Editor",
         "ailog": "AI conflict log",
+        "view_resolutions": "View resolutions",
         "ai_provider": "AI provider",
         "ai_api_key": "API key",
         "ai_api_key_env": "API key env",
@@ -415,6 +419,7 @@ def show_user_config_status():
     }
     ordered = [
         "conflict_policy", "build_policy", "editor", "ailog",
+        "view_resolutions",
         "ai_provider", "ai_api_key", "ai_api_key_env", "ai_api_key_file",
         "ai_model_analysis", "ai_model_fix",
         "signed_off_by", "assisted_by",
@@ -1024,15 +1029,16 @@ _HELP_TOPICS = {
         "Open the user Config menu and exit when done.",
         textwrap.dedent("""\
             Presents the same Config menu as hotkey C in Parameters /
-            session (conflict/build policy, editor, ailog, AI provider,
-            API key, model lists, Signed-off-by / Assisted-by).  Saves to
+            session (conflict/build policy, editor, ailog, view
+            resolutions, AI provider, API key, model lists,
+            Signed-off-by / Assisted-by).  Saves to
             ~/.config/isb/config.json on quit.  Does not require a
             kernel tree.
 
-            Menu key v lists conflict-report-*.txt from the session
-            output dir and opens upstream vs RHEL-resolved side-by-side
-            in the configured editor (widens to 224 columns, or spawns
-            a wide graphical terminal if needed).
+            Menu key v toggles View resolutions (on/off).  When on,
+            the conflict-review menu opens upstream vs RHEL-resolved
+            side-by-side in the configured editor (widens to 224
+            columns, or spawns a wide graphical terminal if needed).
 
             View current values without editing:  isb status
         """),
@@ -2324,6 +2330,7 @@ _CONFIG_MENU_FIELDS = [
     ("b", "build_policy",      "Build policy",     "cycle"),
     ("e", "editor",            "Editor",           "text"),
     ("i", "ailog",             "AI conflict log",  "toggle"),
+    ("v", "view_resolutions",  "View resolutions", "toggle"),
     ("p", "ai_provider",       "AI provider",      "provider"),
     ("k", "ai_api_key",        "API key",          "apikey"),
     ("m", "ai_model_analysis", "Analysis models",  "modellist"),
@@ -2586,7 +2593,6 @@ def show_config_menu(params):
                 display = val if val else f"{WRN}(not set){OFF}"
             print(f"  {MNU}{key}{OFF}  {label:<18s}: {INF}{display}{OFF}")
         print(f"    {'─' * 50}")
-        print(f"  {MNU}v{OFF}  View conflict resolutions (side-by-side)")
         print(f"  {MNU}q{OFF}  Done (save & return)")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
@@ -2602,10 +2608,6 @@ def show_config_menu(params):
             _cached_models.clear()
             status("  Config saved.")
             return
-
-        if ch in ('v', 'V'):
-            view_conflict_resolutions(params)
-            continue
 
         hit = None
         for key, field, label, ftype in _CONFIG_MENU_FIELDS:
@@ -5278,15 +5280,77 @@ def _run_side_by_side_viewer(left, right, left_label, right_label,
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
-def view_conflict_resolutions(params=None):
-    """Config-menu action: browse conflict reports side-by-side.
+def _view_conflict_report_side_by_side(report_path, params=None,
+                                       files=None):
+    """Open upstream vs RHEL-resolved side-by-side for one report.
 
-    Lists conflict-report-*.txt from the session output dir, lets the
-    user pick a report (and file), then opens upstream vs RHEL-resolved
-    in the configured editor.
+    *files* limits which report File: entries to show (default: all).
+    Falls back to the text report if materialization fails.
     """
-    rhel_repo, upstream_repo, output_dir = _resolve_backport_context(
-        params)
+    rhel_repo, upstream_repo, _out = _resolve_backport_context(params)
+    meta = _parse_conflict_report(report_path)
+    chosen = list(files) if files is not None else list(
+        meta.get("files") or [])
+    if not chosen:
+        warn("  Report has no File: entries; opening text report.")
+        editor = _get_editor()
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        subprocess.run(f"{editor} {shlex.quote(report_path)}",
+                       shell=True)
+        return
+
+    if files is None and len(chosen) > 1:
+        print(f"\n  Files in {INF}{meta.get('upstream')}{OFF}:")
+        for j, fe in enumerate(chosen, 1):
+            print(f"    {MNU}{j}{OFF}  {fe['file']}")
+        print(f"    {MNU}a{OFF}  All files (one after another)")
+        print(f"    {MNU}r{OFF}  Open text report instead")
+        print(f"\n  {BLD}File:{OFF} ", end="", flush=True)
+        pick = input().strip().lower()
+        if pick in ("q", ""):
+            return
+        if pick == "r":
+            editor = _get_editor()
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(f"{editor} {shlex.quote(report_path)}",
+                           shell=True)
+            return
+        if pick != "a":
+            try:
+                fi = int(pick)
+            except ValueError:
+                return
+            if fi < 1 or fi > len(chosen):
+                return
+            chosen = [chosen[fi - 1]]
+
+    uh = meta.get("upstream") or "upstream"
+    for fe in chosen:
+        tmpdir = tempfile.mkdtemp(prefix="isb-view-")
+        up_path, rh_path = _materialize_resolution_pair(
+            rhel_repo, upstream_repo, meta, fe, tmpdir)
+        if not up_path or not rh_path:
+            warn(f"  Could not materialize side-by-side for "
+                 f"{fe['file']}; opening text report.")
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            editor = _get_editor()
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(f"{editor} {shlex.quote(report_path)}",
+                           shell=True)
+            continue
+        left_label = f"upstream-{uh}-{os.path.basename(fe['file'])}"
+        right_label = f"rhel-resolved-{os.path.basename(fe['file'])}"
+        info(f"  Viewing {fe['file']}  "
+             f"(left=upstream {uh}, right=RHEL resolved)")
+        _run_side_by_side_viewer(
+            up_path, rh_path, left_label, right_label,
+            cleanup_dir=tmpdir,
+        )
+
+
+def view_conflict_resolutions(params=None):
+    """Browse conflict-report-*.txt and open side-by-side views."""
+    _rhel, _up, output_dir = _resolve_backport_context(params)
     reports = _list_conflict_reports(output_dir)
     if not reports:
         where = output_dir or "(no output dir in session)"
@@ -5319,68 +5383,7 @@ def view_conflict_resolutions(params=None):
             continue
         if idx < 1 or idx > len(reports):
             continue
-
-        meta = _parse_conflict_report(reports[idx - 1])
-        files = meta.get("files") or []
-        if not files:
-            warn("  Report has no File: entries.")
-            # Fall back to opening the text report
-            editor = _get_editor()
-            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-            subprocess.run(f"{editor} {shlex.quote(meta['path'])}",
-                           shell=True)
-            continue
-
-        chosen = files
-        if len(files) > 1:
-            print(f"\n  Files in {INF}{meta.get('upstream')}{OFF}:")
-            for j, fe in enumerate(files, 1):
-                print(f"    {MNU}{j}{OFF}  {fe['file']}")
-            print(f"    {MNU}a{OFF}  All files (one after another)")
-            print(f"    {MNU}r{OFF}  Open text report instead")
-            print(f"\n  {BLD}File:{OFF} ", end="", flush=True)
-            pick = input().strip().lower()
-            if pick in ("q", ""):
-                continue
-            if pick == "r":
-                editor = _get_editor()
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-                subprocess.run(
-                    f"{editor} {shlex.quote(meta['path'])}",
-                    shell=True)
-                continue
-            if pick != "a":
-                try:
-                    fi = int(pick)
-                except ValueError:
-                    continue
-                if fi < 1 or fi > len(files):
-                    continue
-                chosen = [files[fi - 1]]
-
-        uh = meta.get("upstream") or "upstream"
-        for fe in chosen:
-            tmpdir = tempfile.mkdtemp(prefix="isb-view-")
-            up_path, rh_path = _materialize_resolution_pair(
-                rhel_repo, upstream_repo, meta, fe, tmpdir)
-            if not up_path or not rh_path:
-                warn(f"  Could not materialize side-by-side for "
-                     f"{fe['file']}; opening text report.")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                editor = _get_editor()
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-                subprocess.run(
-                    f"{editor} {shlex.quote(meta['path'])}",
-                    shell=True)
-                continue
-            left_label = f"upstream-{uh}-{os.path.basename(fe['file'])}"
-            right_label = f"rhel-resolved-{os.path.basename(fe['file'])}"
-            info(f"  Viewing {fe['file']}  "
-                 f"(left=upstream {uh}, right=RHEL resolved)")
-            _run_side_by_side_viewer(
-                up_path, rh_path, left_label, right_label,
-                cleanup_dir=tmpdir,
-            )
+        _view_conflict_report_side_by_side(reports[idx - 1], params)
 
 
 # Conflict / prerequisite analysis limits (documented in README + man).
@@ -6530,7 +6533,11 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
             print(f"  {MNU}s{OFF}  Skip / omit this commit")
         print(f"  {MNU}2{OFF}  Re-do resolution (reopen in editor/patchpal)")
         print(f"  {MNU}3{OFF}  Abort this cherry-pick")
-        print(f"  {MNU}v{OFF}  View conflict report")
+        if get_config("view_resolutions"):
+            print(f"  {MNU}v{OFF}  View resolution side-by-side")
+            print(f"  {MNU}r{OFF}  View text conflict report")
+        else:
+            print(f"  {MNU}v{OFF}  View conflict report")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         ch = _getch()
@@ -6543,9 +6550,19 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         elif ch == '2':
             return "redo"
         elif ch in ('v', 'V'):
+            if get_config("view_resolutions"):
+                _view_conflict_report_side_by_side(report_path)
+            else:
+                editor = _get_editor()
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                subprocess.run(f"{editor} {shlex.quote(report_path)}",
+                               shell=True)
+            continue
+        elif ch in ('r', 'R') and get_config("view_resolutions"):
             editor = _get_editor()
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-            subprocess.run(f"{editor} {report_path}", shell=True)
+            subprocess.run(f"{editor} {shlex.quote(report_path)}",
+                           shell=True)
             continue
         elif ch in ('3', '\x03'):
             print(f"\n  {CAU}Abort — what next?{OFF}")

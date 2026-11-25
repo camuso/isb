@@ -91,10 +91,10 @@ RHEL-compliant commit messages suitable for merge requests.
   AI provider, API key path/env (never the raw secret), and model
   preference lists. View with `isb status`, edit with `isb config`
   (or `C` from Parameters / session, or when prompted by `isb new`).
-  Config menu `v` opens conflict-resolution reports side-by-side
-  (upstream vs RHEL-resolved) in the configured editor; widens the
-  terminal to 224 columns when needed, or spawns a wide graphical
-  terminal if the current one cannot. Backport progress is
+  Config menu `v` toggles **View resolutions** (on/off). When on,
+  the post-conflict review menu opens upstream vs RHEL-resolved
+  side-by-side in the configured editor (widens to 224 columns, or
+  spawns a wide graphical terminal if needed). Backport progress is
   `isb progress`.
 - **Resumable** : interrupted runs save progress and resume with
   `isb continue` (or plain `isb`). On resume — and after `isb reset` /
