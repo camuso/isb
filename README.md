@@ -92,9 +92,12 @@ RHEL-compliant commit messages suitable for merge requests.
   preference lists. View with `isb status`, edit with `isb config`
   (or `C` from Parameters / session, or when prompted by `isb new`).
   Config menu `v` toggles **View resolutions** (on/off). When on,
-  the post-conflict review menu opens upstream vs RHEL-resolved
-  side-by-side in the configured editor (widens to 224 columns, or
-  spawns a wide graphical terminal if needed). Backport progress is
+  every in-scope conflict resolution auto-opens the
+  **resolution patch** (resolved vs upstream) in the configured
+  editor. Conflicted files are snapshotted with markers for Redo.
+  Review menu: Accept, Edit (tweak resolved files), Redo (restore
+  markers), Skip; `v`/`m`/`f`/`r` re-open patch, markers, full-file
+  side-by-side, or the text report. Backport progress is
   `isb progress`.
 - **Resumable** : interrupted runs save progress and resume with
   `isb continue` (or plain `isb`). On resume — and after `isb reset` /

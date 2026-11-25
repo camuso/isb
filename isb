@@ -1036,9 +1036,11 @@ _HELP_TOPICS = {
             kernel tree.
 
             Menu key v toggles View resolutions (on/off).  When on,
-            the conflict-review menu opens upstream vs RHEL-resolved
-            side-by-side in the configured editor (widens to 224
-            columns, or spawns a wide graphical terminal if needed).
+            every in-scope conflict resolution auto-opens the
+            resolution patch (resolved vs upstream).  Marker
+            snapshots support Redo; the review menu offers Accept,
+            Edit, Redo, Skip, and v/m/f/r views (patch, markers,
+            full-file, text report).
 
             View current values without editing:  isb status
         """),
@@ -5280,11 +5282,102 @@ def _run_side_by_side_viewer(left, right, left_label, right_label,
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
+def _view_resolution_patch(output_dir, commit_hash, report_path=None):
+    """Open the resolved-vs-upstream patch in the configured editor.
+
+    Prefers ``conflict-resolution-<hash>.diff``; falls back to the text
+    report when the patch file is missing.
+    """
+    patch = None
+    if output_dir and commit_hash:
+        cand = _resolution_patch_path(output_dir, commit_hash)
+        if os.path.isfile(cand):
+            patch = cand
+    if not patch and report_path and os.path.isfile(report_path):
+        patch = report_path
+    if not patch:
+        warn("  No resolution patch available.")
+        return
+    editor = _get_editor()
+    info(f"  Opening resolution patch: {patch}")
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    # Prefer read-only when using vim
+    argv = _editor_argv()
+    name = os.path.basename(argv[0]) if argv else ""
+    if name in ("vim", "vim.basic", "vim.nox", "nvim", "neovim", "gvim"):
+        cmd = argv + ["-R", patch]
+        if name == "gvim":
+            cmd[1:1] = ["-f"]
+        subprocess.run(cmd, check=False)
+    else:
+        subprocess.run(f"{editor} {shlex.quote(patch)}", shell=True)
+
+
+def _view_marker_snapshots(output_dir, commit_hash, analyses=None,
+                           params=None, vs_resolved=True):
+    """Open pre-resolve marker snapshots (optionally vs RHEL-resolved).
+
+    When *vs_resolved* is True, side-by-side markers | resolved for each
+    file.  Otherwise open marker files alone in the editor.
+    """
+    snaps = _load_marker_snapshots(output_dir, commit_hash)
+    if not snaps:
+        warn("  No marker snapshots for this commit.")
+        return
+    files = []
+    if analyses:
+        for a in analyses:
+            rel = a.get("file")
+            if rel and rel in snaps:
+                files.append(rel)
+    if not files:
+        files = sorted(snaps.keys())
+
+    if not vs_resolved:
+        editor = _get_editor()
+        args = " ".join(shlex.quote(snaps[f]) for f in files)
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        subprocess.run(f"{editor} {args}", shell=True)
+        return
+
+    rhel_repo, _upstream_repo, _out = _resolve_backport_context(params)
+
+    for rel in files:
+        snap = snaps[rel]
+        tmpdir = tempfile.mkdtemp(prefix="isb-markers-")
+        # Left = markers; right = current resolved worktree (or report)
+        left = os.path.join(tmpdir, f"markers--{rel.replace('/', '__')}")
+        shutil.copy2(snap, left)
+        right = None
+        wt = os.path.join(rhel_repo, rel) if rhel_repo else ""
+        if wt and os.path.isfile(wt):
+            right = os.path.join(
+                tmpdir, f"rhel--{rel.replace('/', '__')}")
+            shutil.copy2(wt, right)
+        if not right:
+            warn(f"  No resolved copy for {rel}; opening markers only.")
+            editor = _get_editor()
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            subprocess.run(f"{editor} {shlex.quote(left)}", shell=True)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            continue
+        info(f"  Viewing {rel}  "
+             f"(left=conflict markers, right=RHEL resolved)")
+        _run_side_by_side_viewer(
+            left, right,
+            f"markers-{os.path.basename(rel)}",
+            f"rhel-resolved-{os.path.basename(rel)}",
+            cleanup_dir=tmpdir,
+        )
+
+
 def _view_conflict_report_side_by_side(report_path, params=None,
-                                       files=None):
+                                       files=None, prompt=True):
     """Open upstream vs RHEL-resolved side-by-side for one report.
 
     *files* limits which report File: entries to show (default: all).
+    When *prompt* is False (auto-view after resolve), every file is
+    shown in turn with no interactive picker.
     Falls back to the text report if materialization fails.
     """
     rhel_repo, upstream_repo, _out = _resolve_backport_context(params)
@@ -5299,7 +5392,7 @@ def _view_conflict_report_side_by_side(report_path, params=None,
                        shell=True)
         return
 
-    if files is None and len(chosen) > 1:
+    if prompt and files is None and len(chosen) > 1:
         print(f"\n  Files in {INF}{meta.get('upstream')}{OFF}:")
         for j, fe in enumerate(chosen, 1):
             print(f"    {MNU}{j}{OFF}  {fe['file']}")
@@ -6266,6 +6359,9 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
                              ai_explanation="", resolved_by=None):
     """Write a detailed conflict resolution report file.
 
+    Also writes ``conflict-resolution-<hash>.diff`` (resolved vs upstream)
+    for patch-first review.  Indexes marker snapshot paths when present.
+
     Args:
         output_dir: directory for the report file
         commit_hash: upstream commit hash
@@ -6280,6 +6376,9 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
     report_path = os.path.join(
         output_dir, f"conflict-report-{commit_hash[:12]}.txt"
     )
+    patch_path = _write_resolution_patch(output_dir, commit_hash, analyses)
+    snaps = _load_marker_snapshots(output_dir, commit_hash)
+    snap_root = _marker_snapshot_root(output_dir, commit_hash)
 
     with open(report_path, "w") as fh:
         fh.write(f"Conflict Resolution Report\n")
@@ -6289,6 +6388,10 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
         fh.write(f"Files with conflicts: {len(analyses)}\n")
         if resolved_by:
             fh.write(f"Resolved-by:     {resolved_by}\n")
+        if patch_path:
+            fh.write(f"Resolution patch: {patch_path}\n")
+        if snaps:
+            fh.write(f"Marker snapshots: {snap_root}\n")
         fh.write("\n")
 
         all_missing = []
@@ -6300,6 +6403,18 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
             if a["rhel_specific_count"]:
                 fh.write(f"RHEL-specific lines: "
                          f"{a['rhel_specific_count']}\n")
+
+            snap = snaps.get(a["file"])
+            if snap:
+                fh.write(f"Marker snapshot: {snap}\n")
+                excerpt = _marker_excerpt(snap)
+                if excerpt:
+                    fh.write(f"\nConflict markers (pre-resolve excerpt):\n")
+                    fh.write(f"{'.' * 40}\n")
+                    fh.write(excerpt)
+                    if not excerpt.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(f"{'.' * 40}\n")
 
             real_missing = [
                 (h, s) for h, s in a.get("missing_prereqs", []) if h
@@ -6412,12 +6527,12 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
 
 def _show_review_menu(commit_hash, subject, analyses, report_path,
                       ai_explanation="", resolved_by=None,
-                      assisted_by=None):
-    """Display post-conflict review and present A/B/C menu.
+                      assisted_by=None, output_dir=None, rhel_repo=None):
+    """Display post-conflict review and present Accept/Edit/Redo/Skip.
 
     Shows:
       - Summary of each conflicted file and its classification
-      - Path to the full resolution report
+      - Path to the full resolution report / resolution patch
       - Compact diff summary (hunk counts)
       - Missing prerequisites warning if any
       - AI explanation if available
@@ -6433,6 +6548,10 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
       "exit"    -- user aborted, exit isb
     """
     rec_kind, rec_msg = _skip_recommendation(analyses, ai_explanation)
+    if not output_dir:
+        _r, _u, output_dir = _resolve_backport_context()
+    if not rhel_repo:
+        rhel_repo, _u, _o = _resolve_backport_context()
 
     while True:
         print(f"\n{CAU}{'=' * 70}{OFF}")
@@ -6523,6 +6642,10 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                 print(f"    {DIM}{wl}{OFF}")
 
         print(f"\n  Report: {INF}{report_path}{OFF}")
+        patch = (_resolution_patch_path(output_dir, commit_hash)
+                 if output_dir else None)
+        if patch and os.path.isfile(patch):
+            print(f"  Patch:  {INF}{patch}{OFF}")
         print(f"  {'─' * 66}")
         if rec_kind == "skip":
             print(f"  {MNU}s{OFF}  Skip / omit this commit  "
@@ -6531,13 +6654,15 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         else:
             print(f"  {MNU}1{OFF}  Accept and continue")
             print(f"  {MNU}s{OFF}  Skip / omit this commit")
-        print(f"  {MNU}2{OFF}  Re-do resolution (reopen in editor/patchpal)")
+        print(f"  {MNU}e{OFF}  Edit resolved files (tweak, then re-review)")
+        print(f"  {MNU}2{OFF}  Redo resolution "
+              f"(restore conflict markers)")
         print(f"  {MNU}3{OFF}  Abort this cherry-pick")
-        if get_config("view_resolutions"):
-            print(f"  {MNU}v{OFF}  View resolution side-by-side")
-            print(f"  {MNU}r{OFF}  View text conflict report")
-        else:
-            print(f"  {MNU}v{OFF}  View conflict report")
+        print(f"  {MNU}v{OFF}  View resolution patch "
+              f"(resolved vs upstream)")
+        print(f"  {MNU}m{OFF}  View conflict markers vs resolved")
+        print(f"  {MNU}f{OFF}  View full-file upstream | resolved")
+        print(f"  {MNU}r{OFF}  View text conflict report")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
 
         ch = _getch()
@@ -6547,18 +6672,40 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
             return "skip"
         if ch == '1':
             return "accept"
+        elif ch in ('e', 'E'):
+            # Tweak resolved files in place; stay in the review loop
+            paths = [a["file"] for a in analyses if a.get("file")]
+            if not paths:
+                warn("  No resolved files to edit.")
+                continue
+            editor = _get_editor()
+            info(f"  Opening {len(paths)} resolved file(s) in {editor} ...")
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            file_args = " ".join(shlex.quote(p) for p in paths)
+            subprocess.run(f"{editor} {file_args}", shell=True,
+                           cwd=rhel_repo or None)
+            # Re-stage after edits
+            if rhel_repo:
+                for p in paths:
+                    git(f"add -- {shlex.quote(p)}", cwd=rhel_repo,
+                        check=False)
+            status("  Returning to conflict review after edit.")
+            continue
         elif ch == '2':
             return "redo"
         elif ch in ('v', 'V'):
-            if get_config("view_resolutions"):
-                _view_conflict_report_side_by_side(report_path)
-            else:
-                editor = _get_editor()
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-                subprocess.run(f"{editor} {shlex.quote(report_path)}",
-                               shell=True)
+            _view_resolution_patch(
+                output_dir, commit_hash, report_path=report_path)
             continue
-        elif ch in ('r', 'R') and get_config("view_resolutions"):
+        elif ch in ('m', 'M'):
+            _view_marker_snapshots(
+                output_dir, commit_hash, analyses=analyses, vs_resolved=True)
+            continue
+        elif ch in ('f', 'F'):
+            _view_conflict_report_side_by_side(
+                report_path, prompt=True)
+            continue
+        elif ch in ('r', 'R'):
             editor = _get_editor()
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
             subprocess.run(f"{editor} {shlex.quote(report_path)}",
@@ -7148,13 +7295,158 @@ then run git add on the resolved files.
     return notes, list(in_scope_conflicts)
 
 
+def _marker_snapshot_root(output_dir, commit_hash):
+    """Directory for pre-resolve conflict-marker snapshots."""
+    return os.path.join(
+        output_dir, "conflict-snapshots", commit_hash[:12],
+    )
+
+
+def _resolution_patch_path(output_dir, commit_hash):
+    """Path for the combined resolved-vs-upstream patch file."""
+    return os.path.join(
+        output_dir, f"conflict-resolution-{commit_hash[:12]}.diff",
+    )
+
+
+def _snapshot_conflict_markers(rhel_repo, paths, output_dir, commit_hash):
+    """Copy conflicted files (markers intact) under conflict-snapshots/.
+
+    Returns dict {relpath: snapshot_abs_path}.  Also stored on
+    ``resolve_conflicts._marker_snapshots``.
+    """
+    resolve_conflicts._marker_snapshots = {}
+    if not output_dir or not commit_hash or not paths:
+        return {}
+    root = _marker_snapshot_root(output_dir, commit_hash)
+    # Fresh snapshot for this resolve attempt
+    if os.path.isdir(root):
+        shutil.rmtree(root, ignore_errors=True)
+    snaps = {}
+    for rel in paths:
+        src = os.path.join(rhel_repo, rel)
+        if not os.path.isfile(src):
+            continue
+        dest = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        snaps[rel] = dest
+    resolve_conflicts._marker_snapshots = snaps
+    return snaps
+
+
+def _load_marker_snapshots(output_dir, commit_hash):
+    """Return {relpath: snapshot_path} from disk (or in-memory cache)."""
+    mem = getattr(resolve_conflicts, "_marker_snapshots", None) or {}
+    if mem:
+        return dict(mem)
+    if not output_dir or not commit_hash:
+        return {}
+    root = _marker_snapshot_root(output_dir, commit_hash)
+    if not os.path.isdir(root):
+        return {}
+    snaps = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            abs_path = os.path.join(dirpath, name)
+            rel = os.path.relpath(abs_path, root)
+            snaps[rel] = abs_path
+    return snaps
+
+
+def _restore_marker_snapshots(rhel_repo, output_dir, commit_hash):
+    """Copy marker snapshots back into the worktree. Return restored relpaths."""
+    snaps = _load_marker_snapshots(output_dir, commit_hash)
+    restored = []
+    for rel, snap in sorted(snaps.items()):
+        if not os.path.isfile(snap):
+            continue
+        dest = os.path.join(rhel_repo, rel)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        shutil.copy2(snap, dest)
+        restored.append(rel)
+    return restored
+
+
+def _marker_excerpt(snapshot_path, max_lines=40):
+    """Return a short excerpt around the first conflict marker, or \"\"."""
+    if not snapshot_path or not os.path.isfile(snapshot_path):
+        return ""
+    try:
+        with open(snapshot_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("<<<<<<<"):
+            start = max(0, i - 2)
+            break
+    if start is None:
+        return ""
+    end = min(len(lines), start + max_lines)
+    # Prefer ending after a >>>>>>> if present in the window
+    for j in range(start, end):
+        if lines[j].startswith(">>>>>>>"):
+            end = j + 1
+            break
+    return "".join(lines[start:end])
+
+
+def _write_resolution_patch(output_dir, commit_hash, analyses):
+    """Write combined resolved-vs-upstream diffs to a .diff file.
+
+    Returns the patch path, or None if there is nothing to write.
+    """
+    if not output_dir or not commit_hash:
+        return None
+    blocks = []
+    for a in analyses or []:
+        diff = (a.get("diff_summary") or "").strip("\n")
+        if not diff:
+            continue
+        rel = a.get("file") or "file"
+        # Normalize report headers to path-based unified diff headers
+        lines = diff.splitlines(True)
+        body_i = 0
+        for i, ln in enumerate(lines):
+            if ln.startswith("@@"):
+                body_i = i
+                break
+        body = "".join(lines[body_i:])
+        if not body.endswith("\n"):
+            body += "\n"
+        blocks.append(
+            f"--- a/{rel}\n"
+            f"+++ b/{rel} (rhel-resolved)\n"
+            f"{body}"
+        )
+    if not blocks:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    path = _resolution_patch_path(output_dir, commit_hash)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"# Resolution patch: upstream {commit_hash[:12]} "
+            f"vs RHEL-resolved\n"
+            f"# Review this to decide Accept / Edit / Redo / Skip\n\n"
+        )
+        fh.write("\n".join(blocks))
+        if not blocks[-1].endswith("\n"):
+            fh.write("\n")
+    return path
+
+
 def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
-                      commit_hash=None, upstream_repo=None, subject=None):
+                      commit_hash=None, upstream_repo=None, subject=None,
+                      output_dir=None):
     """Resolve conflicts in the working tree.
 
     Before resolving in-scope markers, captures conflict hunks and runs
     hunk-first prerequisite detection.  Missing-prereq findings are stored
     on ``resolve_conflicts._hunk_prereqs`` for post-resolve review/AI.
+    Conflicted file contents (markers intact) are snapshotted under
+    ``output_dir/conflict-snapshots/<hash>/`` when *output_dir* is set.
 
     Gate returns (before any resolve) use sentinel notes:
       ["skipped by user"], ["prereq-gate:menu"], ["prereq-gate:exit"]
@@ -7164,6 +7456,7 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
     Returns (notes, oos_count, inscope_conflicted).
     """
     resolve_conflicts._hunk_prereqs = {}
+    resolve_conflicts._marker_snapshots = {}
 
     r = git("ls-files --unmerged", cwd=rhel_repo, check=False)
     unmerged_paths = sorted({
@@ -7233,6 +7526,14 @@ def resolve_conflicts(rhel_repo, scope_paths, conflict_policy, rhel_ver,
 
     inscope_conflicted = []
     if in_scope_deferred:
+        # Snapshot markers before any resolve so review/Redo can restore them.
+        if output_dir and commit_hash:
+            n_snap = len(_snapshot_conflict_markers(
+                rhel_repo, in_scope_deferred, output_dir, commit_hash))
+            if n_snap:
+                info(f"  Snapshotted {n_snap} conflicted file(s) "
+                     f"with markers for review/redo")
+
         # Capture hunks + prereqs while markers are still present.
         hunk_prereqs_by_file = {}
         gate_analyses = []
@@ -8405,19 +8706,20 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
     _clear_ai_models()
 
     _redo_resolution = True
+    _skip_resolve = False  # True after redo-from-snapshots (already resolved)
     while _redo_resolution:
         _redo_resolution = False
         resolved_by = None
         resolver_engine = None
 
-        if had_conflict:
+        if had_conflict and not _skip_resolve:
             if conflict_policy in ("patchpal", "edit", "ai"):
                 status("  Resolving conflicts ...")
                 conflict_notes, oos_conflict_count, inscope_conflicted = \
                     resolve_conflicts(
                         rhel_repo, scope_paths, conflict_policy, rhel_ver,
                         commit_hash=commit_hash, upstream_repo=upstream_repo,
-                        subject=subject,
+                        subject=subject, output_dir=output_dir,
                     )
             else:
                 with Spinner("Resolving conflicts ..."):
@@ -8425,7 +8727,7 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                         resolve_conflicts(
                             rhel_repo, scope_paths, conflict_policy, rhel_ver,
                             commit_hash=commit_hash, upstream_repo=upstream_repo,
-                            subject=subject,
+                            subject=subject, output_dir=output_dir,
                         )
 
             # User chose to skip from within patchpal/editor / prereq gate
@@ -8452,75 +8754,18 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
             resolved_by = _infer_resolved_by(
                 conflict_notes, conflict_policy, inscope_conflicted)
 
-        with Spinner("Scoping and indexing ..."):
-            removed = scope_index(rhel_repo, scope_paths, exclude_paths)
-            total_oos = len(removed) + oos_conflict_count
-            categories = getattr(scope_index, '_removed_categories', {})
+        _skip_resolve = False
 
-            if total_oos:
-                scope_label = subsystem or ", ".join(scope_paths)
-                # Name dropped architectures explicitly
-                arch_cats = {k: v for k, v in categories.items()
-                             if k != "_other"}
-                if arch_cats:
-                    dropped_archs = sorted(arch_cats.keys())
-                    conflict_notes.append(
-                        f"dropped {', '.join(dropped_archs)} hunks")
-                other = categories.get("_other", [])
-                if not arch_cats and not other:
-                    # OOS only from conflict resolution, no scope_index files
-                    conflict_notes.append(
-                        f"Limited to {scope_label}")
-                elif other and not arch_cats:
-                    conflict_notes.append(
-                        f"Limited to {scope_label}")
-                elif other:
-                    conflict_notes.append(
-                        f"remaining out-of-scope changes limited "
-                        f"to {scope_label}")
-
-            # Annotate in-scope new files
-            r = git("diff --cached --name-only --diff-filter=A",
-                    cwd=rhel_repo, check=False)
-            new_files = [f for f in r.stdout.strip().split("\n") if f]
-            for nf in new_files:
-                conflict_notes.append(
-                    f"{nf}: new upstream file, included")
-
-            # Annotate in-scope deleted files
-            r = git("diff --cached --name-only --diff-filter=D",
-                    cwd=rhel_repo, check=False)
-            del_files = [f for f in r.stdout.strip().split("\n") if f]
-            if del_files:
-                n = len(del_files)
-                conflict_notes.append(
-                    f"{n} in-scope file(s) removed per upstream"
-                )
-
-            dup_fixes = check_duplicate_definitions(rhel_repo)
-            for hdr, kind, name, kept, _ in dup_fixes:
-                conflict_notes.append(
-                    f"{hdr}: removed duplicate {kind} {name} "
-                    f"definition (artifact of conflict resolution)"
-                )
-
-        # After scoping, verify something remains staged
-        r_post = git("diff --cached --name-only",
-                     cwd=rhel_repo, check=False)
-        if not r_post.stdout.strip():
-            warn(f"  No in-scope changes remain after scoping "
-                 f"for {commit_hash[:12]}.")
-            warn(f"  This commit may already be applied or touches "
-                 f"no in-scope files.")
-            git("reset HEAD", cwd=rhel_repo, check=False)
-            _cherrypick_repo = None
-            return "skip", conflict_notes
-
-        # -- Post-conflict review --
+        # Analyze / report / auto-view BEFORE scoping so the resolved
+        # tree is still intact (empty-after-scope used to skip the
+        # viewer entirely).
+        report_path = None
+        analyses = []
+        ai_explanation = ""
+        review_assisted = None
         if inscope_conflicted:
             n_files = len(inscope_conflicted)
             hunk_map = getattr(resolve_conflicts, "_hunk_prereqs", {}) or {}
-            analyses = []
             with Spinner("Analyzing conflicts") as sp:
                 for fi, cf in enumerate(inscope_conflicted, 1):
                     sp.progress(f"{fi}/{n_files} files · {cf}")
@@ -8551,7 +8796,6 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                                 f"missing commit {h[:12]} "
                                 f"(\"{s}\")")
 
-            ai_explanation = ""
             if ailog:
                 total_hunks = sum(a.get("hunk_count", 0)
                                   for a in analyses)
@@ -8617,15 +8861,132 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 resolved_by=resolved_by,
             )
 
+            # Auto-open resolution patch (resolved vs upstream) when
+            # Config "View resolutions" is on — patch-first review.
+            if get_config("view_resolutions") and report_path:
+                status("  Opening resolution patch ...")
+                _view_resolution_patch(
+                    output_dir, commit_hash, report_path=report_path)
+
+        with Spinner("Scoping and indexing ..."):
+            removed = scope_index(rhel_repo, scope_paths, exclude_paths)
+            total_oos = len(removed) + oos_conflict_count
+            categories = getattr(scope_index, '_removed_categories', {})
+
+            if total_oos:
+                scope_label = subsystem or ", ".join(scope_paths)
+                # Name dropped architectures explicitly
+                arch_cats = {k: v for k, v in categories.items()
+                             if k != "_other"}
+                if arch_cats:
+                    dropped_archs = sorted(arch_cats.keys())
+                    conflict_notes.append(
+                        f"dropped {', '.join(dropped_archs)} hunks")
+                other = categories.get("_other", [])
+                if not arch_cats and not other:
+                    # OOS only from conflict resolution, no scope_index files
+                    conflict_notes.append(
+                        f"Limited to {scope_label}")
+                elif other and not arch_cats:
+                    conflict_notes.append(
+                        f"Limited to {scope_label}")
+                elif other:
+                    conflict_notes.append(
+                        f"remaining out-of-scope changes limited "
+                        f"to {scope_label}")
+
+            # Annotate in-scope new files
+            r = git("diff --cached --name-only --diff-filter=A",
+                    cwd=rhel_repo, check=False)
+            new_files = [f for f in r.stdout.strip().split("\n") if f]
+            for nf in new_files:
+                conflict_notes.append(
+                    f"{nf}: new upstream file, included")
+
+            # Annotate in-scope deleted files
+            r = git("diff --cached --name-only --diff-filter=D",
+                    cwd=rhel_repo, check=False)
+            del_files = [f for f in r.stdout.strip().split("\n") if f]
+            if del_files:
+                n = len(del_files)
+                conflict_notes.append(
+                    f"{n} in-scope file(s) removed per upstream"
+                )
+
+            dup_fixes = check_duplicate_definitions(rhel_repo)
+            for hdr, kind, name, kept, _ in dup_fixes:
+                conflict_notes.append(
+                    f"{hdr}: removed duplicate {kind} {name} "
+                    f"definition (artifact of conflict resolution)"
+                )
+
+        # After scoping, verify something remains staged
+        r_post = git("diff --cached --name-only",
+                     cwd=rhel_repo, check=False)
+        if not r_post.stdout.strip():
+            warn(f"  No in-scope changes remain after scoping "
+                 f"for {commit_hash[:12]}.")
+            warn(f"  This commit may already be applied or touches "
+                 f"no in-scope files.")
+            git("reset HEAD", cwd=rhel_repo, check=False)
+            _cherrypick_repo = None
+            return "skip", conflict_notes
+
+        # -- Post-conflict review (patch already opened if enabled) --
+        if inscope_conflicted and report_path:
             decision = _show_review_menu(
                 commit_hash, subject, analyses, report_path,
                 ai_explanation=ai_explanation,
                 resolved_by=resolved_by,
                 assisted_by=review_assisted or None,
+                output_dir=output_dir,
+                rhel_repo=rhel_repo,
             )
 
             if decision == "redo":
-                # Reset the cherry-pick and re-apply
+                # Prefer restoring marker snapshots + re-resolve in editor;
+                # fall back to a full re-cherry-pick when no snapshots.
+                restored = _restore_marker_snapshots(
+                    rhel_repo, output_dir, commit_hash)
+                if restored:
+                    status("  Restored conflict markers from snapshot; "
+                           "re-resolving ...")
+                    # AI redo → editor so the human drives the second pass
+                    redo_policy = ("edit" if conflict_policy == "ai"
+                                   else conflict_policy)
+                    if redo_policy == "patchpal":
+                        deferred_notes, deferred_files = (
+                            _resolve_inscope_patchpal(
+                                restored, rhel_repo,
+                                commit_hash=commit_hash,
+                                upstream_repo=upstream_repo,
+                            ))
+                    elif redo_policy == "ai":
+                        deferred_notes, deferred_files = (
+                            _resolve_inscope_ai(
+                                restored, rhel_repo,
+                                commit_hash=commit_hash,
+                                upstream_repo=upstream_repo,
+                                hunk_prereqs_by_file=getattr(
+                                    resolve_conflicts, "_hunk_prereqs",
+                                    {}) or {},
+                            ))
+                    else:
+                        deferred_notes, deferred_files = (
+                            _resolve_inscope_edit(
+                                restored, rhel_repo,
+                                commit_hash=commit_hash,
+                                upstream_repo=upstream_repo,
+                            ))
+                    conflict_notes = list(deferred_notes)
+                    inscope_conflicted = list(deferred_files)
+                    if conflict_policy == "ai":
+                        conflict_policy = "edit"
+                    resolver_engine = redo_policy
+                    _skip_resolve = True
+                    _redo_resolution = True
+                    continue
+
                 git("reset --hard HEAD", cwd=rhel_repo, check=False)
                 with Spinner(
                         f"Re-applying {commit_hash[:12]} ..."):
