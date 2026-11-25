@@ -1036,11 +1036,11 @@ _HELP_TOPICS = {
             kernel tree.
 
             Menu key v toggles View resolutions (on/off).  When on,
-            every in-scope conflict resolution auto-opens the
-            resolution patch (resolved vs upstream).  Marker
-            snapshots support Redo; the review menu offers Accept,
-            Edit, Redo, Skip, and v/m/f/r views (patch, markers,
-            full-file, text report).
+            every in-scope conflict resolution auto-opens the net
+            pick view: HEAD→resolved | markers→resolved (or markers
+            alone if HEAD unchanged).  Full-file upstream vs resolved
+            is review key u.  Marker snapshots support Redo; review
+            offers Accept, Edit, Redo, Skip, and v/h/m/u/f/r views.
 
             View current values without editing:  isb status
         """),
@@ -5282,12 +5282,27 @@ def _run_side_by_side_viewer(left, right, left_label, right_label,
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
-def _view_resolution_patch(output_dir, commit_hash, report_path=None):
-    """Open the resolved-vs-upstream patch in the configured editor.
+def _open_readonly_in_editor(path, label="file"):
+    """Open *path* read-only in the configured editor."""
+    if not path or not os.path.isfile(path):
+        warn(f"  No {label} available.")
+        return
+    editor = _get_editor()
+    info(f"  Opening {label}: {path}")
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    argv = _editor_argv()
+    name = os.path.basename(argv[0]) if argv else ""
+    if name in ("vim", "vim.basic", "vim.nox", "nvim", "neovim", "gvim"):
+        cmd = argv + ["-R", path]
+        if name == "gvim":
+            cmd[1:1] = ["-f"]
+        subprocess.run(cmd, check=False)
+    else:
+        subprocess.run(f"{editor} {shlex.quote(path)}", shell=True)
 
-    Prefers ``conflict-resolution-<hash>.diff``; falls back to the text
-    report when the patch file is missing.
-    """
+
+def _view_resolution_patch(output_dir, commit_hash, report_path=None):
+    """Open the resolved-vs-upstream patch in the configured editor."""
     patch = None
     if output_dir and commit_hash:
         cand = _resolution_patch_path(output_dir, commit_hash)
@@ -5295,22 +5310,97 @@ def _view_resolution_patch(output_dir, commit_hash, report_path=None):
             patch = cand
     if not patch and report_path and os.path.isfile(report_path):
         patch = report_path
-    if not patch:
-        warn("  No resolution patch available.")
+    _open_readonly_in_editor(patch, "resolution patch (upstream vs resolved)")
+
+
+def _patch_has_diff_body(path):
+    """True if *path* exists and has unified-diff hunks (not only comments)."""
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                if ln.startswith("@@") or ln.startswith("--- "):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _view_rhel_delta_patch(output_dir, commit_hash):
+    """Open the HEAD→resolved RHEL-delta patch."""
+    patch = None
+    if output_dir and commit_hash:
+        cand = _rhel_delta_patch_path(output_dir, commit_hash)
+        if os.path.isfile(cand):
+            patch = cand
+    _open_readonly_in_editor(
+        patch, "RHEL delta (HEAD before pick vs resolved)")
+
+
+def _view_markers_delta_patch(output_dir, commit_hash):
+    """Open the markers→resolved conflict-edit patch."""
+    patch = None
+    if output_dir and commit_hash:
+        cand = _markers_delta_patch_path(output_dir, commit_hash)
+        if os.path.isfile(cand):
+            patch = cand
+    _open_readonly_in_editor(
+        patch, "conflict edit (markers → resolved)")
+
+
+def _view_resolution_review(output_dir, commit_hash, report_path=None):
+    """Open the net-backport view for conflict review.
+
+    Default (clearest for backport developers):
+      - Left:  HEAD → resolved  (clean merges + resolutions that
+        changed RHEL; excludes pre-existing upstream drift)
+      - Right: markers → resolved  (conflict-site edits only)
+
+    If HEAD delta is empty, open markers → resolved alone.
+    Full upstream-vs-resolved stays on review key ``u``.
+    """
+    head_patch = None
+    markers_patch = None
+    if output_dir and commit_hash:
+        cand = _rhel_delta_patch_path(output_dir, commit_hash)
+        if _patch_has_diff_body(cand):
+            head_patch = cand
+        cand = _markers_delta_patch_path(output_dir, commit_hash)
+        if _patch_has_diff_body(cand):
+            markers_patch = cand
+
+    if head_patch and markers_patch:
+        info("  Side-by-side: left=HEAD→resolved (net pick), "
+             "right=markers→resolved (conflict edits)")
+        _run_side_by_side_viewer(
+            head_patch, markers_patch,
+            "1-HEAD-vs-resolved",
+            "2-markers-vs-resolved",
+            cleanup_dir=None,
+        )
         return
-    editor = _get_editor()
-    info(f"  Opening resolution patch: {patch}")
-    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-    # Prefer read-only when using vim
-    argv = _editor_argv()
-    name = os.path.basename(argv[0]) if argv else ""
-    if name in ("vim", "vim.basic", "vim.nox", "nvim", "neovim", "gvim"):
-        cmd = argv + ["-R", patch]
-        if name == "gvim":
-            cmd[1:1] = ["-f"]
-        subprocess.run(cmd, check=False)
-    else:
-        subprocess.run(f"{editor} {shlex.quote(patch)}", shell=True)
+    if head_patch:
+        info("  Opening HEAD→resolved (net cherry-pick effect)")
+        _open_readonly_in_editor(
+            head_patch, "RHEL delta (HEAD vs resolved)")
+        return
+    if markers_patch:
+        info("  HEAD unchanged — opening markers→resolved "
+             "(conflict edits only)")
+        _open_readonly_in_editor(
+            markers_patch, "conflict edit (markers → resolved)")
+        return
+    # Last resort: empty stubs or archaeology upstream patch
+    if output_dir and commit_hash:
+        cand = _rhel_delta_patch_path(output_dir, commit_hash)
+        if os.path.isfile(cand):
+            _open_readonly_in_editor(cand, "RHEL delta (empty)")
+            return
+    if report_path and os.path.isfile(report_path):
+        _open_readonly_in_editor(report_path, "conflict report")
+        return
+    warn("  No resolution review patches available.")
 
 
 def _view_marker_snapshots(output_dir, commit_hash, analyses=None,
@@ -6356,19 +6446,17 @@ Write the per-file lines, then the RECOMMENDATION line."""
 
 
 def _write_resolution_report(output_dir, commit_hash, subject, analyses,
-                             ai_explanation="", resolved_by=None):
+                             ai_explanation="", resolved_by=None,
+                             rhel_repo=None):
     """Write a detailed conflict resolution report file.
 
-    Also writes ``conflict-resolution-<hash>.diff`` (resolved vs upstream)
-    for patch-first review.  Indexes marker snapshot paths when present.
+    Also writes:
+      - ``conflict-rhel-delta-<hash>.diff`` (HEAD→resolved, net pick)
+      - ``conflict-markers-delta-<hash>.diff`` (markers→resolved)
+      - ``conflict-resolution-<hash>.diff`` (upstream vs resolved)
+      - ``conflict-review-<hash>.diff`` (concatenated, offline cat)
 
-    Args:
-        output_dir: directory for the report file
-        commit_hash: upstream commit hash
-        subject: upstream commit subject line
-        analyses: list of dicts from _analyze_conflict()
-        ai_explanation: optional AI-generated explanation string
-        resolved_by: optional Conflicts stanza Resolved-by value
+    Indexes marker snapshot paths when present.
 
     Returns the path to the written report file.
     """
@@ -6376,7 +6464,15 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
     report_path = os.path.join(
         output_dir, f"conflict-report-{commit_hash[:12]}.txt"
     )
-    patch_path = _write_resolution_patch(output_dir, commit_hash, analyses)
+    head_path = _write_rhel_delta_patch(
+        output_dir, commit_hash, analyses, rhel_repo)
+    markers_path = _write_markers_delta_patch(
+        output_dir, commit_hash, analyses, rhel_repo)
+    upstream_path = _write_resolution_patch(
+        output_dir, commit_hash, analyses)
+    review_path = _write_combined_review_patch(
+        output_dir, commit_hash, head_path, markers_path,
+        upstream_path=upstream_path)
     snaps = _load_marker_snapshots(output_dir, commit_hash)
     snap_root = _marker_snapshot_root(output_dir, commit_hash)
 
@@ -6388,8 +6484,14 @@ def _write_resolution_report(output_dir, commit_hash, subject, analyses,
         fh.write(f"Files with conflicts: {len(analyses)}\n")
         if resolved_by:
             fh.write(f"Resolved-by:     {resolved_by}\n")
-        if patch_path:
-            fh.write(f"Resolution patch: {patch_path}\n")
+        if review_path:
+            fh.write(f"Review (cat):    {review_path}\n")
+        if head_path:
+            fh.write(f"HEAD→resolved:   {head_path}\n")
+        if markers_path:
+            fh.write(f"Markers→resolved:{markers_path}\n")
+        if upstream_path:
+            fh.write(f"Upstream vs res: {upstream_path}\n")
         if snaps:
             fh.write(f"Marker snapshots: {snap_root}\n")
         fh.write("\n")
@@ -6642,10 +6744,16 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
                 print(f"    {DIM}{wl}{OFF}")
 
         print(f"\n  Report: {INF}{report_path}{OFF}")
-        patch = (_resolution_patch_path(output_dir, commit_hash)
-                 if output_dir else None)
-        if patch and os.path.isfile(patch):
-            print(f"  Patch:  {INF}{patch}{OFF}")
+        if output_dir:
+            head_p = _rhel_delta_patch_path(output_dir, commit_hash)
+            mark_p = _markers_delta_patch_path(output_dir, commit_hash)
+            up_p = _resolution_patch_path(output_dir, commit_hash)
+            if os.path.isfile(head_p):
+                print(f"  HEAD→resolved:    {INF}{head_p}{OFF}")
+            if os.path.isfile(mark_p):
+                print(f"  Markers→resolved: {INF}{mark_p}{OFF}")
+            if os.path.isfile(up_p):
+                print(f"  Upstream vs res:  {INF}{up_p}{OFF}")
         print(f"  {'─' * 66}")
         if rec_kind == "skip":
             print(f"  {MNU}s{OFF}  Skip / omit this commit  "
@@ -6658,9 +6766,13 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
         print(f"  {MNU}2{OFF}  Redo resolution "
               f"(restore conflict markers)")
         print(f"  {MNU}3{OFF}  Abort this cherry-pick")
-        print(f"  {MNU}v{OFF}  View resolution patch "
-              f"(resolved vs upstream)")
-        print(f"  {MNU}m{OFF}  View conflict markers vs resolved")
+        print(f"  {MNU}v{OFF}  View net pick "
+              f"(HEAD→resolved | markers→resolved)")
+        print(f"  {MNU}h{OFF}  View HEAD→resolved only")
+        print(f"  {MNU}m{OFF}  View markers→resolved "
+              f"(files or patch)")
+        print(f"  {MNU}u{OFF}  View upstream vs resolved "
+              f"(full-file drift)")
         print(f"  {MNU}f{OFF}  View full-file upstream | resolved")
         print(f"  {MNU}r{OFF}  View text conflict report")
         print(f"\n  {BLD}Choice:{OFF} ", end="", flush=True)
@@ -6684,22 +6796,46 @@ def _show_review_menu(commit_hash, subject, analyses, report_path,
             file_args = " ".join(shlex.quote(p) for p in paths)
             subprocess.run(f"{editor} {file_args}", shell=True,
                            cwd=rhel_repo or None)
-            # Re-stage after edits
+            # Re-stage after edits and refresh review patches
             if rhel_repo:
                 for p in paths:
                     git(f"add -- {shlex.quote(p)}", cwd=rhel_repo,
                         check=False)
+                if output_dir:
+                    hp = _write_rhel_delta_patch(
+                        output_dir, commit_hash, analyses, rhel_repo)
+                    mp = _write_markers_delta_patch(
+                        output_dir, commit_hash, analyses, rhel_repo)
+                    up = _write_resolution_patch(
+                        output_dir, commit_hash, analyses)
+                    _write_combined_review_patch(
+                        output_dir, commit_hash, hp, mp,
+                        upstream_path=up)
             status("  Returning to conflict review after edit.")
             continue
         elif ch == '2':
             return "redo"
         elif ch in ('v', 'V'):
-            _view_resolution_patch(
+            _view_resolution_review(
                 output_dir, commit_hash, report_path=report_path)
             continue
+        elif ch in ('h', 'H'):
+            _view_rhel_delta_patch(output_dir, commit_hash)
+            continue
         elif ch in ('m', 'M'):
-            _view_marker_snapshots(
-                output_dir, commit_hash, analyses=analyses, vs_resolved=True)
+            # Prefer the markers→resolved patch; fall back to file view
+            mark_p = (_markers_delta_patch_path(output_dir, commit_hash)
+                      if output_dir else None)
+            if _patch_has_diff_body(mark_p):
+                _view_markers_delta_patch(output_dir, commit_hash)
+            else:
+                _view_marker_snapshots(
+                    output_dir, commit_hash, analyses=analyses,
+                    vs_resolved=True)
+            continue
+        elif ch in ('u', 'U'):
+            _view_resolution_patch(
+                output_dir, commit_hash, report_path=report_path)
             continue
         elif ch in ('f', 'F'):
             _view_conflict_report_side_by_side(
@@ -7303,9 +7439,30 @@ def _marker_snapshot_root(output_dir, commit_hash):
 
 
 def _resolution_patch_path(output_dir, commit_hash):
-    """Path for the combined resolved-vs-upstream patch file."""
+    """Path for the resolved-vs-upstream patch file."""
     return os.path.join(
         output_dir, f"conflict-resolution-{commit_hash[:12]}.diff",
+    )
+
+
+def _rhel_delta_patch_path(output_dir, commit_hash):
+    """Path for the HEAD→resolved RHEL-delta patch file."""
+    return os.path.join(
+        output_dir, f"conflict-rhel-delta-{commit_hash[:12]}.diff",
+    )
+
+
+def _markers_delta_patch_path(output_dir, commit_hash):
+    """Path for the markers→resolved conflict-edit patch file."""
+    return os.path.join(
+        output_dir, f"conflict-markers-delta-{commit_hash[:12]}.diff",
+    )
+
+
+def _combined_review_patch_path(output_dir, commit_hash):
+    """Path for the concatenated review file (offline cat)."""
+    return os.path.join(
+        output_dir, f"conflict-review-{commit_hash[:12]}.diff",
     )
 
 
@@ -7394,7 +7551,7 @@ def _marker_excerpt(snapshot_path, max_lines=40):
 
 
 def _write_resolution_patch(output_dir, commit_hash, analyses):
-    """Write combined resolved-vs-upstream diffs to a .diff file.
+    """Write resolved-vs-upstream diffs to a .diff file.
 
     Returns the patch path, or None if there is nothing to write.
     """
@@ -7427,12 +7584,151 @@ def _write_resolution_patch(output_dir, commit_hash, analyses):
     path = _resolution_patch_path(output_dir, commit_hash)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(
-            f"# Resolution patch: upstream {commit_hash[:12]} "
+            f"# 1/2 Resolution patch: upstream {commit_hash[:12]} "
             f"vs RHEL-resolved\n"
-            f"# Review this to decide Accept / Edit / Redo / Skip\n\n"
+            f"# (-) upstream hunks   (+) what landed after resolve\n"
+            f"# (patchpal-style: proposed result vs upstream intent)\n\n"
         )
         fh.write("\n".join(blocks))
         if not blocks[-1].endswith("\n"):
+            fh.write("\n")
+    return path
+
+
+def _unified_diff_paths(left_path, right_path, left_label, right_label):
+    """Return unified diff text between two files (may be empty)."""
+    if not (left_path and right_path and os.path.isfile(left_path)
+            and os.path.isfile(right_path)):
+        return ""
+    r = subprocess.run(
+        ["diff", "-u", "--label", left_label, "--label", right_label,
+         left_path, right_path],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    # diff exits 1 when files differ, 0 when identical
+    return (r.stdout or "").strip("\n")
+
+
+def _write_rhel_delta_patch(output_dir, commit_hash, analyses, rhel_repo):
+    """Write HEAD→resolved diff (net cherry-pick effect on RHEL).
+
+    During ``cherry-pick --no-commit``, HEAD is still the pre-pick
+    commit, so ``git diff HEAD`` / ``git diff --cached HEAD`` is the
+    set of clean merges + resolutions that changed RHEL — without
+    pre-existing upstream drift.
+
+    Returns the patch path, or None on failure.
+    """
+    if not output_dir or not commit_hash or not rhel_repo:
+        return None
+    paths = [a.get("file") for a in (analyses or []) if a.get("file")]
+    if not paths:
+        return None
+    quoted = " ".join(shlex.quote(p) for p in paths)
+    r = git(f"diff HEAD -- {quoted}", cwd=rhel_repo, check=False)
+    body = (r.stdout or "").strip("\n")
+    if not body:
+        r2 = git(f"diff --cached HEAD -- {quoted}",
+                 cwd=rhel_repo, check=False)
+        body = (r2.stdout or "").strip("\n")
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = _rhel_delta_patch_path(output_dir, commit_hash)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"# HEAD → resolved (net cherry-pick effect on RHEL)\n"
+            f"# (-) prior RHEL (HEAD)   (+) after this pick/resolve\n"
+            f"# Includes clean upstream merges and conflict fixes that\n"
+            f"# changed RHEL.  Excludes pre-existing RHEL↔upstream "
+            f"drift.\n\n"
+        )
+        if body:
+            fh.write(body)
+            fh.write("\n")
+        else:
+            fh.write(
+                "# (empty) — resolved content matches HEAD.  The\n"
+                "# agent kept prior RHEL; see markers→resolved for\n"
+                "# conflict-site edits (markers removed / sides "
+                "chosen).\n"
+            )
+    return path
+
+
+def _write_markers_delta_patch(output_dir, commit_hash, analyses,
+                               rhel_repo):
+    """Write markers→resolved diffs (conflict-site edits only).
+
+    Returns the patch path, or None if no snapshots / nothing to write.
+    """
+    if not output_dir or not commit_hash or not rhel_repo:
+        return None
+    paths = [a.get("file") for a in (analyses or []) if a.get("file")]
+    if not paths:
+        return None
+    snaps = _load_marker_snapshots(output_dir, commit_hash)
+    if not snaps:
+        return None
+    blocks = []
+    for rel in paths:
+        snap = snaps.get(rel)
+        wt = os.path.join(rhel_repo, rel)
+        if not snap or not os.path.isfile(wt):
+            continue
+        d = _unified_diff_paths(
+            snap, wt,
+            f"a/{rel} (conflict markers)",
+            f"b/{rel} (rhel-resolved)",
+        )
+        if d:
+            blocks.append(d)
+    os.makedirs(output_dir, exist_ok=True)
+    path = _markers_delta_patch_path(output_dir, commit_hash)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"# Markers → resolved (conflict-site edits only)\n"
+            f"# (-) conflicted file with <<<<<<< / ======= / "
+            f">>>>>>> markers\n"
+            f"# (+) after resolution\n\n"
+        )
+        if blocks:
+            fh.write("\n".join(blocks))
+            if not blocks[-1].endswith("\n"):
+                fh.write("\n")
+        else:
+            fh.write("# (empty) — no marker→resolved differences.\n")
+    return path
+
+
+def _write_combined_review_patch(output_dir, commit_hash,
+                                 head_path, markers_path,
+                                 upstream_path=None):
+    """Concatenate review patches for offline reading.
+
+    Order: HEAD→resolved, markers→resolved, optional upstream archaeology.
+    """
+    if not output_dir or not commit_hash:
+        return None
+    usable = []
+    for p in (head_path, markers_path, upstream_path):
+        if p and os.path.isfile(p):
+            with open(p, encoding="utf-8", errors="replace") as rf:
+                usable.append(rf.read().rstrip("\n") + "\n")
+    if not usable:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    path = _combined_review_patch_path(output_dir, commit_hash)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"# Conflict resolution review — {commit_hash[:12]}\n"
+            f"# 1) HEAD→resolved: net cherry-pick effect on RHEL\n"
+            f"# 2) markers→resolved: conflict-site edits only\n"
+            f"# 3) upstream vs resolved: optional full-file drift\n"
+            f"{'=' * 70}\n\n"
+        )
+        fh.write(f"\n{'=' * 70}\n\n".join(usable))
+        if not usable[-1].endswith("\n"):
             fh.write("\n")
     return path
 
@@ -8859,13 +9155,16 @@ def cherry_pick_commit(commit_hash, upstream_repo, rhel_repo, scope_paths,
                 output_dir, commit_hash, subject, analyses,
                 ai_explanation=ai_explanation,
                 resolved_by=resolved_by,
+                rhel_repo=rhel_repo,
             )
 
-            # Auto-open resolution patch (resolved vs upstream) when
-            # Config "View resolutions" is on — patch-first review.
+            # Auto-open net-pick review (HEAD→resolved | markers→resolved)
+            # when View resolutions is on — not the muddy full-file
+            # upstream-vs-resolved drift patch.
             if get_config("view_resolutions") and report_path:
-                status("  Opening resolution patch ...")
-                _view_resolution_patch(
+                status("  Opening resolution review "
+                       "(HEAD→resolved | markers→resolved) ...")
+                _view_resolution_review(
                     output_dir, commit_hash, report_path=report_path)
 
         with Spinner("Scoping and indexing ..."):

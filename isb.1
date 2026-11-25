@@ -294,8 +294,11 @@ Menu key
 toggles
 .B View resolutions
 (on/off).
-When on, every in\-scope conflict resolution auto\-opens the
-resolution patch (resolved vs upstream) in the configured editor.
+When on, every in\-scope conflict resolution auto\-opens the net
+pick view: HEAD\to resolved side\-by\-side with markers\to resolved
+(or markers alone when HEAD was unchanged). Full\-file upstream vs
+resolved drift remains available from the review menu
+.RB ( u ).
 Conflicted files are snapshotted with markers under
 .I conflict\-snapshots/
 for Redo.
